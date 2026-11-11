@@ -1180,6 +1180,14 @@ pub struct SubPlan {
     /// plan.
     #[cfg(feature = "sql")]
     pub mat: u32,
+    /// The result columns a FROM subquery's reader sees with REAL
+    /// affinity (v0.17 review fix, ungated `sql`): the pin's
+    /// `OP_RealAffinity` on a subquery column whose affinity
+    /// (`rules::compound_affinity`) is REAL, so an integer from
+    /// another compound core reads as a real. Empty except on a
+    /// derived table the pin does not flatten (`Connection::plan_derived_source`).
+    #[cfg(feature = "sql")]
+    pub real_cols: AVec<usize>,
     /// The pin's select number of this core (v0.16, `explain`;
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]
@@ -1804,6 +1812,48 @@ pub(crate) fn remap_expr(e: &mut RExpr, m: &dyn Fn(usize, bool) -> usize) {
             }
         }
     }
+}
+
+/// Whether `f` holds for any expression access path `a` evaluates:
+/// its probes, IN-subquery probe sets and bounds, an automatic
+/// index's keys, a MULTI-INDEX OR loop's branch conditions and their
+/// access paths, and the min() / max() early-out's condition (v0.17
+/// review fix; the parts `remap_access` and `walk_access_aggs_mut`
+/// walk).
+#[cfg(all(feature = "expr_index", feature = "vm"))]
+pub(crate) fn any_access_expr(
+    a: &crate::xplan::IdxAccess,
+    f: &mut dyn FnMut(&RExpr) -> bool,
+) -> bool {
+    for p in a.eq.iter() {
+        if p.vals.iter().any(&mut *f) || p.sub.as_ref().is_some_and(&mut *f) {
+            return true;
+        }
+    }
+    if a.lo.iter().chain(a.hi.iter()).any(|b| f(&b.e)) {
+        return true;
+    }
+    #[cfg(feature = "planner")]
+    {
+        if let Some(x) = &a.auto
+            && x.keys.iter().any(|k| f(&k.val))
+        {
+            return true;
+        }
+        if let Some(o) = &a.or {
+            for sub in o.subs.iter() {
+                if f(&sub.cond) || sub.acc.as_ref().is_some_and(|x| any_access_expr(x, f)) {
+                    return true;
+                }
+            }
+        }
+        if let Some(x) = &a.first
+            && f(&x.0)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// `remap_expr` over an access path's probes and bounds (v0.17).
@@ -4070,6 +4120,48 @@ pub(crate) fn walk_aggs_mut(
     }
 }
 
+/// `walk_aggs_mut` over an access path's probes, bounds and the
+/// other expressions it evaluates (v0.17 review fix), as
+/// `remap_access` walks them.
+#[cfg(feature = "expr_index")]
+fn walk_access_aggs_mut(
+    a: &mut crate::xplan::IdxAccess,
+    d: u8,
+    fold: &mut dyn FnMut(&mut RExpr, u8) -> core::result::Result<bool, ()>,
+) -> core::result::Result<(), ()> {
+    for p in a.eq.as_mut_slice() {
+        for v in p.vals.as_mut_slice() {
+            walk_aggs_mut(v, d, fold)?;
+        }
+        if let Some(s) = &mut p.sub {
+            walk_aggs_mut(s, d, fold)?;
+        }
+    }
+    for b in a.lo.iter_mut().chain(a.hi.iter_mut()) {
+        walk_aggs_mut(&mut b.e, d, fold)?;
+    }
+    #[cfg(feature = "planner")]
+    {
+        if let Some(x) = &mut a.auto {
+            for k in x.keys.as_mut_slice() {
+                walk_aggs_mut(&mut k.val, d, fold)?;
+            }
+        }
+        if let Some(o) = &mut a.or {
+            for sub in o.subs.as_mut_slice() {
+                walk_aggs_mut(&mut sub.cond, d, fold)?;
+                if let Some(x) = &mut sub.acc {
+                    walk_access_aggs_mut(x, d, fold)?;
+                }
+            }
+        }
+        if let Some(f) = &mut a.first {
+            walk_aggs_mut(&mut f.0, d, fold)?;
+        }
+    }
+    Ok(())
+}
+
 /// `walk_aggs_mut` over every expression of a plan (v0.16).
 fn walk_plan_aggs_mut(
     p: &mut SubPlan,
@@ -4082,6 +4174,22 @@ fn walk_plan_aggs_mut(
         }
         if let Some(dp) = &mut s.derived {
             walk_plan_aggs_mut(dp, d, fold)?;
+        }
+        // (v0.17 review fix: an enclosing query's aggregate a nested
+        // query uses as an index or rowid bound is substituted there
+        // too; its access path kept the aggregate and failed with
+        // `MisusedAggregate`.)
+        #[cfg(feature = "expr_index")]
+        if let Some(a) = &mut s.access {
+            walk_access_aggs_mut(a, d, fold)?;
+        }
+        #[cfg(feature = "fts5")]
+        if let Some(vt) = &mut s.vt {
+            for (_, _, args, _) in vt.ors.as_mut_slice() {
+                for a in args.as_mut_slice() {
+                    walk_aggs_mut(a, d, fold)?;
+                }
+            }
         }
     }
     for e in p.items.as_mut_slice() {
@@ -7534,14 +7642,16 @@ fn eval_raise<E>(
 /// type, which compiled the whole evaluator twice. The evaluator never
 /// touches storage, so under `window` its body is compiled once, for
 /// `Error<()>`, and its errors are re-typed here (`Storage` cannot
-/// occur). Without `window` there is only one instantiation anyway.
-#[cfg(feature = "window")]
+/// occur). The bytecode VM (hidden `vm`, ADR 0005 Stage 2) evaluates
+/// for `Error<()>` too, so it takes the same shape (v0.17 `vm_shrink`).
+/// Without either there is only one instantiation anyway.
+#[cfg(any(feature = "window", feature = "vm"))]
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     eval_body::<()>(e, ctx).map_err(|x| x.map_storage(|()| Error::Unsupported))
 }
 
 /// Evaluate `e` against `ctx` (see the `window` variant above).
-#[cfg(not(feature = "window"))]
+#[cfg(not(any(feature = "window", feature = "vm")))]
 pub fn eval<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<OwnedValue, E> {
     eval_body(e, ctx)
 }
@@ -7774,16 +7884,16 @@ pub fn cond_false<E>(e: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> {
 
 /// Whether `e` is `want` (true or false; NULL is neither).
 ///
-/// Like `eval`, compiled once under `window` (v0.17 size pass): the
+/// Like `eval`, compiled once under `window` or `vm` (v0.17 size pass): the
 /// evaluator's own conditions (CASE, json, `iif`) run the body for
 /// `Error<()>`, and the executors' calls re-type its errors here.
-#[cfg(feature = "window")]
+#[cfg(any(feature = "window", feature = "vm"))]
 pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     cond_body::<()>(e, ctx, want).map_err(|x| x.map_storage(|()| Error::Unsupported))
 }
 
 /// Whether `e` is `want` (see the `window` variant above).
-#[cfg(not(feature = "window"))]
+#[cfg(not(any(feature = "window", feature = "vm")))]
 pub(crate) fn cond_is<E>(e: &RExpr, ctx: &Ctx<'_>, want: bool) -> Result<bool, E> {
     cond_body(e, ctx, want)
 }

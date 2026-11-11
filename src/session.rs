@@ -292,7 +292,8 @@ pub struct Config {
     /// Refuse a SELECT the bytecode VM does not cover yet with
     /// `Error::VmFallback` instead of running it on today's executor
     /// (ADR 0005 Stage 2, hidden `vm` feature; a test switch, off by
-    /// default).
+    /// default — on by default in a build with `--cfg hipp_vm_strict`
+    /// in `RUSTFLAGS`, which runs a whole test suite strict).
     #[cfg(feature = "vm")]
     pub vm_strict: bool,
     /// Run every SELECT on today's executor, as a build without the
@@ -350,7 +351,7 @@ impl Default for Config {
             #[cfg(feature = "vtab")]
             max_vtab_rows: DEFAULT_VTAB_ROWS,
             #[cfg(feature = "vm")]
-            vm_strict: false,
+            vm_strict: cfg!(hipp_vm_strict),
             #[cfg(feature = "vm")]
             vm_off: false,
         }
@@ -444,7 +445,7 @@ impl Config {
             #[cfg(feature = "vtab")]
             max_vtab_rows: 1 << 16,
             #[cfg(feature = "vm")]
-            vm_strict: false,
+            vm_strict: cfg!(hipp_vm_strict),
             #[cfg(feature = "vm")]
             vm_off: false,
         }
@@ -1042,6 +1043,12 @@ enum Plan {
     /// planned and is never run.
     #[cfg(feature = "explain")]
     Explain(eqp::EqpRows),
+    /// Plain `EXPLAIN` (unit `vm_rest`, `explain` with the hidden
+    /// `vm`; `session::drive`): the listing of the program the
+    /// statement it names compiles to, which was planned and is
+    /// never run.
+    #[cfg(all(feature = "explain", feature = "vm"))]
+    Bytecode(AVec<AVec<OwnedValue>>),
 }
 
 /// One FROM source in a v0.4 query plan: the subquery
@@ -1719,6 +1726,17 @@ impl<S: Storage> Connection<S> {
     pub async fn prepare(&mut self, sql: &str) -> Result<Statement<'_, S>, S::Error> {
         if self.pager.in_commit() {
             return Err(Error::OperationInFlight);
+        }
+        // Plain `EXPLAIN <statement>` (unit `vm_rest`): the program's
+        // listing.
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if let Err(Error::Parse {
+            offset,
+            kind: crate::error::ParseKind::ExplainBytecode,
+        }) = eqp::query_plan_prefix::<S::Error>(sql.as_bytes())
+        {
+            let p: Prep<'_, '_, S> = Box::pin(self.prepare_bytecode(sql, offset.saturating_add(7)));
+            return p.await;
         }
         // `EXPLAIN QUERY PLAN <statement>` (v0.16, `explain`).
         #[cfg(feature = "explain")]
@@ -3184,7 +3202,6 @@ impl<S: Storage> Connection<S> {
         sel: &SelectStmt,
     ) -> Result<Plan, S::Error> {
         use crate::record::Affinity;
-        use crate::rules::item_affinity;
         let plan = self.plan_subquery(sel, arena, &[])?;
         let w = plan.width();
         let mut names = self.result_col_names(&plan, (0, 0))?;
@@ -3194,11 +3211,12 @@ impl<S: Storage> Connection<S> {
             // Demoted across compound cores; a numeric CAST is the
             // pin's FLEXNUM, declared ` NUM`.
             let aff = crate::rules::compound_affinity(
-                item.map_or(Affinity::Blob, item_affinity),
+                item.and_then(crate::query::item_result_affinity),
                 item,
                 plan.compound.iter().map(|(_, t)| &**t),
                 i,
-            );
+            )
+            .unwrap_or(Affinity::Blob);
             affs.push(aff);
         }
         crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
@@ -3725,6 +3743,7 @@ impl<S: Storage> Connection<S> {
                 scalar_col: 0,
                 rec: None,
                 mat: 0,
+                real_cols: AVec::new(),
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
                 #[cfg(feature = "planner")]
@@ -3776,6 +3795,8 @@ impl<S: Storage> Connection<S> {
             rec: None,
             #[cfg(feature = "sql")]
             mat: 0,
+            #[cfg(feature = "sql")]
+            real_cols: AVec::new(),
             #[cfg(feature = "explain")]
             sel: stmt.sel,
             #[cfg(feature = "planner")]
@@ -5709,16 +5730,31 @@ impl<S: Storage> Connection<S> {
         #[cfg(not(feature = "sql"))]
         let mut names = dplan.result_names.clone();
         crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+        // The pin reads a REAL column of a subquery it does not
+        // flatten with `OP_RealAffinity` (v0.17 review fix,
+        // ungated): a compound never is (it would be with equal
+        // affinities, whose REAL items already read as reals); a
+        // plain core is when the flattener's model says so, and
+        // without that model (no `planner`) is taken to be.
+        #[cfg(feature = "planner")]
+        let realify = s.derived.is_some() && (!dplan.compound.is_empty() || !s.flat);
+        #[cfg(not(feature = "planner"))]
+        let realify = s.derived.is_some() && !dplan.compound.is_empty();
+        let mut real_cols = AVec::new();
         for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
             // A compound's column affinity is demoted across
             // its cores, as on the pin (ungated fix: `(SELECT
             // text_col ... UNION ALL SELECT 5)` compared as
             // TEXT).
             let aff = derived_col_affinity(&dplan, i, *aff);
+            if realify && aff == crate::record::Affinity::Real {
+                real_cols.push(i);
+            }
             cols.push((nm.clone(), aff));
             affs.push(crate::record::Affinity::Blob);
             defaults.push(OwnedValue::Null);
         }
+        dplan.real_cols = real_cols;
         let qual = match s.alias {
             Some(a) => copy_vec(handle_bytes(arena, a)),
             // A table-valued function is named by its
@@ -7468,6 +7504,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         if matches!(self.plan, Plan::Explain(_)) {
             return self.step_explain().await;
         }
+        // (Boxed: the step future, which every statement's step
+        // polls, stays as it was.)
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if matches!(self.plan, Plan::Bytecode(_)) {
+            return Box::pin(self.step_bytecode()).await;
+        }
         // What a streamed query dropped part-way kept (v0.17).
         #[cfg(feature = "sql")]
         if self.phase == Phase::Fresh && self.stream.is_none() {
@@ -7629,6 +7671,8 @@ impl<'c, S: Storage> Statement<'c, S> {
         let r = match &self.plan {
             #[cfg(feature = "explain")]
             Plan::Explain(_) => self.step_explain().await,
+            #[cfg(all(feature = "explain", feature = "vm"))]
+            Plan::Bytecode(_) => Box::pin(self.step_bytecode()).await,
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
             #[cfg(feature = "sql")]
@@ -7684,14 +7728,30 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(_) => self.step_instead().await,
             Plan::Rollback => self.step_rollback().await,
         };
-        #[cfg(feature = "json")]
+        #[cfg(all(feature = "json", not(feature = "vm")))]
         if self.stream.is_none()
             && let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut()
         {
             d.truncate(mark);
         }
-        #[cfg(feature = "fts5")]
+        #[cfg(all(feature = "fts5", not(feature = "vm")))]
         if self.stream.is_none()
+            && let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut()
+        {
+            d.truncate(fmark);
+        }
+        // A query running on the VM (ADR 0005 Stage 2, hidden `vm`)
+        // keeps them until its last row, as a stream does.
+        #[cfg(all(feature = "json", feature = "vm"))]
+        if self.stream.is_none()
+            && !self.vm_running()
+            && let Ok(mut d) = self.conn.env.json_docs.try_borrow_mut()
+        {
+            d.truncate(mark);
+        }
+        #[cfg(all(feature = "fts5", feature = "vm"))]
+        if self.stream.is_none()
+            && !self.vm_running()
             && let Ok(mut d) = self.conn.env.fts_rows.try_borrow_mut()
         {
             d.truncate(fmark);
@@ -7805,6 +7865,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         // An EXPLAIN QUERY PLAN never plans again (or runs).
         #[cfg(feature = "explain")]
         if matches!(self.plan, Plan::Explain(_)) {
+            self.binds.stale = false;
+        }
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if matches!(self.plan, Plan::Bytecode(_)) {
             self.binds.stale = false;
         }
         if !self.binds.stale {
@@ -12016,9 +12080,18 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
+        // The flip probe (ADR 0005 Stage 2, unit `vm_shrink`;
+        // build-only, never run: `ci/flip_probe.sh`): with the VM the
+        // only SELECT path, today's read executor is cut off here, so
+        // LTO drops it. Rows a statement loaded itself (PRAGMA,
+        // EXPLAIN QUERY PLAN, plain EXPLAIN) are still served below.
+        #[cfg(all(feature = "vm", hipp_flip_probe))]
+        if !self.query_loaded {
+            return Err(Error::VmFallback);
+        }
         // A plan that streams (v0.17, `sql`) returns each row as its
         // join makes it; a blocking one's rows land in `query_rows`.
-        #[cfg(feature = "sql")]
+        #[cfg(all(feature = "sql", not(all(feature = "vm", hipp_flip_probe))))]
         if !self.query_loaded {
             // Boxed: the step future (re-entered once per trigger
             // level) stays small.
@@ -12046,6 +12119,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
         }
+        #[cfg(not(all(feature = "vm", hipp_flip_probe)))]
         if !self.query_loaded {
             self.run_query().await?;
             self.query_loaded = true;
@@ -12263,7 +12337,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     };
                     let mut rows = AVec::new();
                     for r in inner.iter() {
-                        rows.push((r.clone(), None));
+                        let mut r = r.clone();
+                        crate::rules::real_row(r.as_mut_slice(), d.real_cols.as_slice());
+                        rows.push((r, None));
                     }
                     src_rows.push(rows);
                     continue;
@@ -13028,8 +13104,19 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &'x RowData,
         need: Option<usize>,
     ) -> SubplanFuture<'x, S::Error> {
-        self.conn.sub_execs += 1;
-        alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))
+        // The flip probe (see `step_query`): the subquery executor the
+        // write paths reach today is cut off too; their VM-backed
+        // replacements are not counted (a best case).
+        #[cfg(all(feature = "vm", hipp_flip_probe))]
+        {
+            let _ = (plan, outer, need);
+            alloc::boxed::Box::pin(async { Err(Error::VmFallback) })
+        }
+        #[cfg(not(all(feature = "vm", hipp_flip_probe)))]
+        {
+            self.conn.sub_execs += 1;
+            alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))
+        }
     }
 
     #[cfg(feature = "sql")]
@@ -14316,6 +14403,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             Plan::Instead(ip) => ip.returning_width(),
             #[cfg(feature = "explain")]
             Plan::Explain(_) => 4,
+            #[cfg(all(feature = "explain", feature = "vm"))]
+            Plan::Bytecode(_) => 8,
             #[cfg(feature = "fts5")]
             Plan::Vtab(v) => match &**v {
                 vtab::VtPlan::Fts5Write(w) => w.returning.len(),
@@ -14327,11 +14416,17 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     /// The pin's `sqlite3_stmt_isexplain`: 2 for an `EXPLAIN QUERY
     /// PLAN` statement (v0.16, `explain`), whose four result columns
-    /// are `id`, `parent`, `notused` and `detail`; 0 otherwise.
+    /// are `id`, `parent`, `notused` and `detail`; 1 for a plain
+    /// `EXPLAIN` (with the hidden `vm` feature: `addr`, `opcode`,
+    /// `p1` ... `p5`, `comment`); 0 otherwise.
     pub fn is_explain(&self) -> u8 {
         #[cfg(feature = "explain")]
         if matches!(self.plan, Plan::Explain(_)) {
             return 2;
+        }
+        #[cfg(all(feature = "explain", feature = "vm"))]
+        if matches!(self.plan, Plan::Bytecode(_)) {
+            return 1;
         }
         0
     }
@@ -15911,9 +16006,16 @@ pub(crate) fn rep_minmax<'x>(
     if let Some(h) = having {
         collect_aggs(h, &mut aggs);
     }
-    aggs.iter().rev().find_map(|a| {
+    // (v0.17 review fix: the pin's aggregate list holds each
+    // aggregate once — `analyzeAggregate` reuses an equal earlier one,
+    // whatever query level it was written at — so a repeat does not
+    // move it later: `max(a), min(a), max(a)` decides by min().)
+    let s = aggs.as_slice();
+    s.iter().enumerate().rev().find_map(|(i, a)| {
         let p = crate::query::agg_parts(a)?;
-        if !matches!(p.kind, AggKind::Min | AggKind::Max) {
+        if !matches!(p.kind, AggKind::Min | AggKind::Max)
+            || s.get(..i)?.iter().any(|b| same_agg(&p, b))
+        {
             return None;
         }
         Some(MinMaxRep {
@@ -15922,6 +16024,32 @@ pub(crate) fn rep_minmax<'x>(
             filter: p.filter,
         })
     })
+}
+
+/// Whether aggregate node `b` is the aggregate `p` in the pin's
+/// `sqlite3ExprCompare` sense (`rep_minmax`): the same function,
+/// flags, arguments, ORDER BY keys and FILTER.
+#[cfg(feature = "query")]
+fn same_agg(p: &crate::query::AggParts<'_>, b: &RExpr) -> bool {
+    use crate::query::same_expr;
+    let Some(q) = crate::query::agg_parts(b) else {
+        return false;
+    };
+    let all = |x: &[RExpr], y: &[RExpr]| {
+        x.len() == y.len() && x.iter().zip(y.iter()).all(|(l, r)| same_expr(l, r))
+    };
+    p.kind == q.kind
+        && p.distinct == q.distinct
+        && p.star == q.star
+        && p.unique == q.unique
+        && p.args.len() == q.args.len()
+        && all(p.inputs(), q.inputs())
+        && p.order == q.order
+        && match (p.filter, q.filter) {
+            (None, None) => true,
+            (Some(x), Some(y)) => same_expr(x, y),
+            _ => false,
+        }
 }
 
 /// The min / max aggregate that decides a group's bare columns
@@ -16058,11 +16186,11 @@ fn derived_col_affinity(
     i: usize,
     aff: Option<crate::record::Affinity>,
 ) -> crate::record::Affinity {
-    let a = aff.unwrap_or(crate::record::Affinity::Blob);
     crate::rules::compound_affinity(
-        a,
+        aff,
         plan.items.as_slice().get(i),
         plan.compound.iter().map(|(_, t)| &**t),
         i,
     )
+    .unwrap_or(crate::record::Affinity::Blob)
 }

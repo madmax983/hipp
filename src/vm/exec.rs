@@ -46,6 +46,17 @@ pub(crate) struct Vm {
     /// (`Connection::subquery_executions`).
     #[cfg(feature = "sql")]
     pub(crate) execs: usize,
+    /// The joined-row values lateral table-valued calls cleared, by
+    /// cursor (`Restore` puts them back).
+    #[cfg(feature = "sql")]
+    dead: AVec<(u16, usize, OwnedValue)>,
+    /// The current window unit's call values (`WinNext`, `EVAL_WIN`).
+    #[cfg(feature = "window")]
+    win_vals: AVec<OwnedValue>,
+    /// The side tables' lengths when the program started, and the
+    /// lengths below which entries stay (`SidePin`).
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    side: Option<((usize, usize), (usize, usize))>,
 }
 
 /// A running subquery's error trap: its slot, the instruction its
@@ -120,6 +131,12 @@ impl Vm {
             saved: AVec::new(),
             #[cfg(feature = "sql")]
             execs: 0,
+            #[cfg(feature = "sql")]
+            dead: AVec::new(),
+            #[cfg(feature = "window")]
+            win_vals: AVec::new(),
+            #[cfg(any(feature = "json", feature = "fts5"))]
+            side: None,
         };
         vm.reset();
         vm
@@ -150,6 +167,13 @@ impl Vm {
             }
             self.traps.clear();
             self.saved.clear();
+            self.dead.clear();
+        }
+        #[cfg(feature = "window")]
+        self.win_vals.clear();
+        #[cfg(any(feature = "json", feature = "fts5"))]
+        {
+            self.side = None;
         }
     }
 
@@ -394,6 +418,18 @@ impl Vm {
                 let Some(P4::Expr(e)) = p4_at(&self.prog.p4, op.p4) else {
                     return Err(Error::Unsupported);
                 };
+                // A window template: its calls' values for the current
+                // unit first (`window::fill`).
+                #[cfg(feature = "window")]
+                let filled: Option<crate::query::RExpr> = if op.p5 & super::op::EVAL_WIN != 0 {
+                    let mut w = e.clone();
+                    crate::window::fill(&mut w, self.win_vals.as_slice());
+                    Some(w)
+                } else {
+                    None
+                };
+                #[cfg(feature = "window")]
+                let e: &crate::query::RExpr = filled.as_ref().unwrap_or(e);
                 let ctx = if op.p5 & EVAL_GROUP != 0 {
                     let g = match usize::from(op.p1)
                         .checked_sub(1)
@@ -642,6 +678,8 @@ fn rowid_of(curs: &AVec<Cursor>, p: u32) -> Option<i64> {
         Cursor::Table(t) => t.rowid(),
         Cursor::Sorter(s) => s.rowid,
         Cursor::Eph(e) => e.cur().and_then(|r| r.1),
+        #[cfg(feature = "sql")]
+        Cursor::Host(h) => h.rowid,
         _ => None,
     }
 }
@@ -672,6 +710,8 @@ fn row_at<'a>(
             Some((v, r)) => Ok(Ok((v.as_slice(), *r))),
             None => Err(Error::Unsupported),
         },
+        #[cfg(feature = "sql")]
+        Some(Cursor::Host(h)) => Ok(Ok((h.row.as_slice(), h.rowid))),
         _ => Err(Error::Unsupported),
     }
 }
@@ -906,7 +946,15 @@ impl Vm {
                     Some(Cursor::Agg(a)) => a,
                     _ => return Err(Error::Unsupported),
                 };
-                a.step(&self.acc, env)?;
+                let kept = a.step(&self.acc, env)?;
+                // A kept row (the bare columns') pins what it points
+                // into (`stream::agg_step`).
+                #[cfg(any(feature = "json", feature = "fts5"))]
+                if kept {
+                    let start = self.side_start(env).0;
+                    self.side = Some((start, side_len(env)));
+                }
+                let _ = kept;
                 Flow::Next
             }
             Code::AggFinal => {
@@ -1206,7 +1254,7 @@ impl Vm {
                 jump_if(!skip && !crate::session::bloom_may(e.bloom.as_slice(), probe))
             }
             #[cfg(feature = "sql")]
-            _ => return self.op_sub(op, core),
+            _ => return self.op_sub(op, core, env),
             #[cfg(not(feature = "sql"))]
             _ => return Err(Error::Unsupported),
         })
@@ -1236,7 +1284,12 @@ impl Vm {
     /// The opcodes of unit `vm_subqueries`: subquery slots and traps,
     /// the saved joined rows, aggregates over a group's rows, shared
     /// and growing row lists, compounds and the recursive queue.
-    fn op_sub(&mut self, op: super::op::Op, core: &mut PagerCore<'_>) -> Result<Flow, Error<()>> {
+    fn op_sub(
+        &mut self,
+        op: super::op::Op,
+        core: &mut PagerCore<'_>,
+        env: &Env,
+    ) -> Result<Flow, Error<()>> {
         use super::op::SubKind;
         use crate::query::SubValue;
         let jump_if = |b: bool| if b { Flow::Jump(op.p2) } else { Flow::Next };
@@ -1346,6 +1399,13 @@ impl Vm {
                 e.clear();
                 for (v, r) in rows {
                     e.push(v, r, false);
+                }
+                Flow::Next
+            }
+            Code::EphReal => {
+                let cols = [op.p2 as usize];
+                for (v, _) in eph(&mut self.curs, op.p1)?.rows.as_mut_slice() {
+                    crate::rules::real_row(v.as_mut_slice(), &cols);
                 }
                 Flow::Next
             }
@@ -1535,12 +1595,356 @@ impl Vm {
                 groups(&mut self.curs, op.p1)?.rep_step(kind, coll, v, enc);
                 Flow::Next
             }
-            _ => return Err(Error::Unsupported),
+            _ => return self.op_rest(op, core, env),
         })
     }
 
     /// Subquery-plan executions counted since the last call.
     pub(crate) fn take_execs(&mut self) -> usize {
         core::mem::take(&mut self.execs)
+    }
+}
+
+/// The window set `c`.
+#[cfg(feature = "window")]
+fn winset(curs: &mut AVec<Cursor>, c: u16) -> Result<&mut super::rest::WinSet, Error<()>> {
+    match curs.as_mut_slice().get_mut(usize::from(c)) {
+        Some(Cursor::Win(w)) => Ok(w),
+        _ => Err(Error::Unsupported),
+    }
+}
+
+/// The side tables' lengths (`Env::json_docs`, `Env::fts_rows`).
+#[cfg(any(feature = "json", feature = "fts5"))]
+pub(crate) fn side_len(env: &Env) -> (usize, usize) {
+    #[cfg(feature = "json")]
+    let j = env.json_docs.try_borrow().map_or(0, |d| d.len());
+    #[cfg(not(feature = "json"))]
+    let j = 0;
+    #[cfg(feature = "fts5")]
+    let f = env.fts_rows.try_borrow().map_or(0, |d| d.len());
+    #[cfg(not(feature = "fts5"))]
+    let f = 0;
+    (j, f)
+}
+
+/// Drop the side-table entries past `to`.
+#[cfg(any(feature = "json", feature = "fts5"))]
+pub(crate) fn side_drop(env: &Env, to: (usize, usize)) {
+    #[cfg(feature = "json")]
+    if let Ok(mut d) = env.json_docs.try_borrow_mut() {
+        d.truncate(to.0);
+    }
+    #[cfg(feature = "fts5")]
+    if let Ok(mut d) = env.fts_rows.try_borrow_mut() {
+        d.truncate(to.1);
+    }
+    let _ = to;
+}
+
+#[cfg(feature = "sql")]
+impl Vm {
+    /// The opcodes of unit `vm_rest`: driver-awaited sources, the
+    /// side tables and window functions.
+    #[allow(unused_variables)]
+    fn op_rest(
+        &mut self,
+        op: super::op::Op,
+        core: &mut PagerCore<'_>,
+        env: &Env,
+    ) -> Result<Flow, Error<()>> {
+        Ok(match op.code {
+            Code::HostRows | Code::HostOpen | Code::HostNext => Flow::Stay(Exec::Call),
+            Code::Restore => {
+                let mut i = 0;
+                while let Some((c, slot, _)) = self.dead.as_slice().get(i) {
+                    if *c != op.p1 {
+                        i += 1;
+                        continue;
+                    }
+                    let slot = *slot;
+                    if let Some((_, _, v)) = self.dead.remove_at(i)
+                        && let Some(x) = self.acc.vals.as_mut_slice().get_mut(slot)
+                    {
+                        *x = v;
+                    }
+                }
+                Flow::Next
+            }
+            #[cfg(any(feature = "json", feature = "fts5"))]
+            Code::SideMark => {
+                let (j, f) = side_len(env);
+                *reg_mut(&mut self.regs, u32::from(op.p1))? = OwnedValue::Integer(j as i64);
+                *reg_mut(&mut self.regs, u32::from(op.p1).saturating_add(1))? =
+                    OwnedValue::Integer(f as i64);
+                Flow::Next
+            }
+            #[cfg(any(feature = "json", feature = "fts5"))]
+            Code::SideDrop => {
+                let at = |r: u32| -> Result<usize, Error<()>> {
+                    Ok(int_of(reg(&self.regs, r)?)
+                        .and_then(|i| usize::try_from(i).ok())
+                        .unwrap_or(usize::MAX))
+                };
+                let to = (
+                    at(u32::from(op.p1))?,
+                    at(u32::from(op.p1).saturating_add(1))?,
+                );
+                let pin = self.side_start(env).1;
+                side_drop(env, (to.0.max(pin.0), to.1.max(pin.1)));
+                Flow::Next
+            }
+            #[cfg(any(feature = "json", feature = "fts5"))]
+            Code::SidePin => {
+                let now = side_len(env);
+                let start = self.side_start(env).0;
+                self.side = Some((start, now));
+                Flow::Next
+            }
+            #[cfg(feature = "window")]
+            Code::WinOpen => {
+                let slot = self
+                    .curs
+                    .as_mut_slice()
+                    .get_mut(usize::from(op.p1))
+                    .ok_or(Error::Unsupported)?;
+                *slot = Cursor::Win(alloc::boxed::Box::new(super::rest::WinSet {
+                    info: op.p4,
+                    ..Default::default()
+                }));
+                Flow::Next
+            }
+            #[cfg(feature = "window")]
+            Code::WinRow => {
+                let row = self.acc.clone();
+                winset(&mut self.curs, op.p1)?.rows.push(row);
+                Flow::Next
+            }
+            #[cfg(feature = "window")]
+            Code::WinLoad => {
+                let w = winset(&mut self.curs, op.p1)?;
+                if op.p5 == 1 {
+                    w.pos = 0;
+                }
+                match w.rows.as_slice().get(w.pos) {
+                    None => Flow::Jump(op.p2),
+                    Some(r) => {
+                        self.acc = r.clone();
+                        w.pos = w.pos.saturating_add(1);
+                        Flow::Next
+                    }
+                }
+            }
+            #[cfg(feature = "window")]
+            Code::WinAdd => {
+                let info = winset(&mut self.curs, op.p1)?.info;
+                let Some(P4::Win(calls)) = p4_at(&self.prog.p4, info) else {
+                    return Err(Error::Unsupported);
+                };
+                let mut ins = AVec::with_capacity(calls.len());
+                let mut r = op.p2;
+                for c in calls.iter() {
+                    let n = crate::window::children(c).len();
+                    let mut v = AVec::with_capacity(n);
+                    v.extend_from_slice(regs_at(&self.regs, r, n)?);
+                    r = r.saturating_add(n as u32);
+                    ins.push(v);
+                }
+                let (at, rep) = match op.p3.checked_sub(1) {
+                    Some(gc) => {
+                        let g = groups(&mut self.curs, gc as u16)?;
+                        (g.current(), Some(g.rep.clone()))
+                    }
+                    None => {
+                        let w = winset(&mut self.curs, op.p1)?;
+                        (w.pos.saturating_sub(1), None)
+                    }
+                };
+                winset(&mut self.curs, op.p1)?
+                    .units
+                    .push(super::rest::WinUnit { at, rep, ins });
+                Flow::Next
+            }
+            #[cfg(feature = "window")]
+            Code::WinCompute => {
+                let enc = core.text_enc();
+                let info = winset(&mut self.curs, op.p1)?.info;
+                let Some(P4::Win(calls)) = p4_at(&self.prog.p4, info) else {
+                    return Err(Error::Unsupported);
+                };
+                let refs: AVec<&crate::query::RExpr> = calls.iter().collect();
+                let w = winset(&mut self.curs, op.p1)?;
+                let mut ins = AVec::with_capacity(w.units.len());
+                for u in w.units.as_mut_slice() {
+                    ins.push(core::mem::take(&mut u.ins));
+                }
+                let (order, vals) = crate::window::compute(refs.as_slice(), ins.as_slice(), enc)
+                    .map_err(|kind| Error::Schema { kind })?;
+                w.order = order;
+                w.vals = vals;
+                w.next = 0;
+                Flow::Next
+            }
+            #[cfg(feature = "window")]
+            Code::WinNext => {
+                let w = winset(&mut self.curs, op.p1)?;
+                if op.p5 == 1 {
+                    w.next = 0;
+                }
+                let Some(&u) = w.order.as_slice().get(w.next) else {
+                    return Ok(Flow::Jump(op.p2));
+                };
+                w.next = w.next.saturating_add(1);
+                self.win_vals = w.vals.as_slice().get(u).cloned().unwrap_or_default();
+                let unit = w.units.as_slice().get(u).ok_or(Error::Unsupported)?;
+                match &unit.rep {
+                    Some(rep) => {
+                        let (at, rep) = (unit.at, rep.clone());
+                        let gc = op.p3.checked_sub(1).ok_or(Error::Unsupported)?;
+                        groups(&mut self.curs, gc as u16)?.seek(at, rep);
+                    }
+                    None => {
+                        self.acc = w
+                            .rows
+                            .as_slice()
+                            .get(unit.at)
+                            .cloned()
+                            .unwrap_or_else(RowData::empty);
+                    }
+                }
+                Flow::Next
+            }
+            _ => return Err(Error::Unsupported),
+        })
+    }
+
+    /// The side tables' start and pinned lengths, the start taken now
+    /// on the first call.
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    fn side_start(&mut self, env: &Env) -> ((usize, usize), (usize, usize)) {
+        *self.side.get_or_insert_with(|| {
+            let now = side_len(env);
+            (now, now)
+        })
+    }
+
+    /// The side tables' lengths when the program started (what its
+    /// rows may point into is past them), taken now when it starts.
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    pub(crate) fn side_begin(&mut self, env: &Env) -> (usize, usize) {
+        self.side_start(env).0
+    }
+
+    // ---- the driver's side of driver-awaited opcodes ----
+
+    /// The driver-awaited instruction at `pc` (`Exec::Call`).
+    #[cfg(feature = "sql")]
+    pub(crate) fn call_op(&self) -> Option<super::op::Op> {
+        self.prog.ops.as_slice().get(self.pc).copied()
+    }
+
+    /// The source `P4::Src` entry `at` names.
+    #[cfg(feature = "sql")]
+    pub(crate) fn src_info(&self, at: u32) -> Option<&super::op::SrcInfo> {
+        match p4_at(&self.prog.p4, at) {
+            Some(P4::Src(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The query plan of `P4::Plan` entry `at`.
+    #[cfg(feature = "sql")]
+    pub(crate) fn plan_at(&self, at: u32) -> Option<alloc::rc::Rc<crate::session::QueryPlan>> {
+        plan(&self.prog, at).ok()
+    }
+
+    /// The joined row cut back to source `src` (its values to slot
+    /// `base`): the row a source's arguments and pre-checks read.
+    #[cfg(feature = "sql")]
+    pub(crate) fn acc_before(&self, base: usize, src: usize) -> RowData {
+        prefix_of(&self.acc, base as u32, src as u32)
+    }
+
+    /// The bound in register `p3 - 1` (`p3` 0, or a negative value:
+    /// none).
+    #[cfg(feature = "sql")]
+    pub(crate) fn bound(&self, p3: u32) -> Option<usize> {
+        let r = p3.checked_sub(1)?;
+        let v = int_of(reg(&self.regs, r).ok()?)?;
+        usize::try_from(v).ok()
+    }
+
+    /// Whether the LIMIT capping register `r` holds a negative value
+    /// (no LIMIT in effect).
+    #[cfg(feature = "sql")]
+    pub(crate) fn unlimited(&self, r: u32) -> bool {
+        reg(&self.regs, r)
+            .ok()
+            .and_then(int_of)
+            .is_none_or(|v| v < 0)
+    }
+
+    /// Row list `c` = `rows`.
+    #[cfg(feature = "sql")]
+    pub(crate) fn fill(&mut self, c: u16, rows: AVec<(AVec<OwnedValue>, Option<i64>)>) -> bool {
+        let Ok(e) = eph(&mut self.curs, c) else {
+            return false;
+        };
+        e.clear();
+        for (v, r) in rows {
+            e.push(v, r, false);
+        }
+        true
+    }
+
+    /// Host cursor `c`, opened anew when `fresh`.
+    #[cfg(feature = "sql")]
+    pub(crate) fn host(&mut self, c: u16, fresh: bool) -> Option<&mut super::rest::HostCur> {
+        let slot = self.curs.as_mut_slice().get_mut(usize::from(c))?;
+        if fresh || !matches!(slot, Cursor::Host(_)) {
+            *slot = Cursor::Host(alloc::boxed::Box::default());
+        }
+        match slot {
+            Cursor::Host(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Clear the joined-row slots `slots` (a lateral table-valued
+    /// call's arguments nothing else reads), kept for cursor `c`'s
+    /// `Restore`.
+    #[cfg(any(feature = "json", feature = "vtab"))]
+    pub(crate) fn clear_dead(&mut self, c: u16, slots: &[usize]) {
+        for &slot in slots {
+            if let Some(v) = self.acc.vals.as_mut_slice().get_mut(slot) {
+                let v = core::mem::replace(v, OwnedValue::Null);
+                self.dead.push((c, slot, v));
+            }
+        }
+    }
+
+    /// The driver-awaited instruction completed: on to the next one,
+    /// or to its `p2`.
+    #[cfg(feature = "sql")]
+    pub(crate) fn call_done(&mut self, jump: bool) {
+        let to = match self.call_op() {
+            Some(op) if jump => op.p2 as usize,
+            _ => self.pc.saturating_add(1),
+        };
+        self.pc = to;
+        self.pins.clear();
+    }
+
+    /// A driver-awaited instruction failed with the statement error
+    /// `kind`: inside a running subquery it becomes that subquery's
+    /// value and the program goes on (true); otherwise the statement
+    /// fails (false).
+    #[cfg(feature = "sql")]
+    pub(crate) fn call_trap(&mut self, kind: crate::error::SchemaKind) -> bool {
+        if self.traps.is_empty() {
+            return false;
+        }
+        self.trap(kind);
+        true
     }
 }

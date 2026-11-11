@@ -1158,14 +1158,12 @@ impl<S: Storage> Connection<S> {
                         .first()
                         .and_then(|r| r.as_slice().get(i))
                 });
-                let aff = item.and_then(|e| item_aff(&plan, e)).map(|a| {
-                    crate::rules::compound_affinity(
-                        a,
-                        item,
-                        plan.compound.iter().map(|(_, t)| &**t),
-                        i,
-                    )
-                });
+                let aff = crate::rules::compound_affinity(
+                    item.and_then(|e| item_aff(&plan, e)),
+                    item,
+                    plan.compound.iter().map(|(_, t)| &**t),
+                    i,
+                );
                 let z = item.and_then(|e| self.ztype(&plan, e));
                 let ty: AVec<u8> = match (z, aff) {
                     (Some(z), Some(a)) if crate::record::affinity_of(z.as_slice()) == a => {
@@ -1824,8 +1822,10 @@ fn sql_has_where<E>(sql: &[u8]) -> bool {
 }
 
 /// The affinity a view column's expression has (the pin's
-/// `sqlite3ExprAffinity`, `None` for an expression with none).
-/// `view_aff` looking through a derived table's (an expanded
+/// `sqlite3ExprAffinity`, `None` for an expression with none;
+/// `query::item_result_affinity`, whose scalar subquery is its
+/// rightmost core's — v0.17 review fix: the leftmost's was read)
+/// looking through a derived table's (an expanded
 /// view's or CTE's) column to the item it reads (v0.16): such a
 /// column has its item's affinity, none for a literal — where the
 /// derived source's comparison affinity says BLOB.
@@ -1853,19 +1853,9 @@ fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
                 }
                 base = base.saturating_add(sp.ncols);
             }
-            view_aff(e)
+            crate::query::item_result_affinity(e)
         }
-        _ => view_aff(e),
-    }
-}
-
-fn view_aff(e: &RExpr) -> Option<Affinity> {
-    match e {
-        RExpr::Column(_, a, _) | RExpr::Cast(_, a) => Some(*a),
-        RExpr::Collate(x, _) => view_aff(x),
-        RExpr::Rowid(_) => Some(Affinity::Integer),
-        RExpr::SubScalar(p) => p.items.as_slice().first().and_then(view_aff),
-        _ => None,
+        _ => crate::query::item_result_affinity(e),
     }
 }
 

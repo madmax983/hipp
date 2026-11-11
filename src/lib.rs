@@ -8,6 +8,9 @@
 
 #![no_std]
 #![deny(unsafe_code)]
+// The flip probe (`ci/flip_probe.sh`, build-only) cuts today's read
+// executor off, leaving its helpers without callers.
+#![cfg_attr(all(feature = "vm", hipp_flip_probe), allow(dead_code, unused))]
 
 extern crate alloc;
 

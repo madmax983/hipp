@@ -89,6 +89,7 @@ impl<S: Storage> Connection<S> {
             scalar_col: 0,
             rec: None,
             mat: 0,
+            real_cols: AVec::new(),
             #[cfg(feature = "explain")]
             sel: 0,
             #[cfg(feature = "planner")]

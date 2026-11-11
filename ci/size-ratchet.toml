@@ -31,9 +31,24 @@ justify_over = 4096
 # asks `groups_sorted`, the pin's `orderByGrp` rule). STATUS.md.
 # Merged with main (Bolt, PRs #21/#22): measured 477,484, the sum
 # of both raises.
+# 477,484 -> 477,788 (v0.17 vm_flip review fixes, ungated correctness;
+# STATUS.md): +304 B. A repeated min() / max() no longer moves the
+# bare-column rule's choice (`rep_minmax` skips an aggregate equal to
+# an earlier one, the pin's one AggInfo entry each: a silent wrong
+# answer). (`vm_flip` itself delivered nothing: with the VM as the
+# only SELECT path no profile shrinks, so every ratchet stays up.)
+# 477,788 -> 478,020 (v0.17 vm_flip retry review fix, ungated correctness;
+# STATUS.md): +232 B. A REAL compound column read through a FROM
+# subquery / view / CTE (and a recursive CTE's queue) reads other
+# cores' integers as reals (`SubPlan::real_cols`, the pin's
+# OP_RealAffinity: a silent wrong answer); the compound affinity
+# searches for the first core with one. (The flip itself was not
+# taken: its probe is still over every ratchet.)
 # +184 B (Bolt): index_insert reuses the leaf's validated cell spans
 # (-7.0% instructions on bolt_workload).
-ratchet = 477668
+# Merged with main (Bolt, PR #24): measured 478,220, the sum of
+# both raises +16 B of alignment padding.
+ratchet = 478220
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -54,9 +69,22 @@ justify_over = 16384
 # groups in the ORDER BY's direction). STATUS.md.
 # Merged with main (Bolt, PRs #21/#22): measured 963,572, the sum of
 # both raises +8 B of alignment padding.
+# 963,572 -> 964,076 (v0.17 vm_flip review fixes, ungated
+# correctness; STATUS.md): +504 B — the repeated min() / max() fix
+# above, and an enclosing query's aggregate a nested query uses as an
+# index or rowid bound is substituted into the nested plan's access
+# path too (`walk_access_aggs_mut`; it failed with MisusedAggregate).
+# 964,076 -> 964,684 (v0.17 vm_flip retry review fix, ungated correctness;
+# STATUS.md): +608 B. A REAL compound column read through a FROM
+# subquery / view / CTE (and a recursive CTE's queue) reads other
+# cores' integers as reals (`SubPlan::real_cols`, the pin's
+# OP_RealAffinity: a silent wrong answer); the compound affinity
+# searches for the first core with one. (The flip itself was not
+# taken: its probe is still over every ratchet.)
 # +24 B (Bolt): index_insert reuses the leaf's validated cell spans
 # (-7.0% instructions on bolt_workload).
-ratchet = 963596
+# Merged with main (Bolt, PR #24): measured 964,708, the sum of both raises.
+ratchet = 964708
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -73,9 +101,20 @@ justify_over = 32768
 # the join planner's re-check of the first loop). STATUS.md.
 # Merged with main (Bolt, PRs #21/#22): measured 1,060,496, the sum
 # of both raises -24 B of alignment padding.
+# 1,060,496 -> 1,061,144 (v0.17 vm_flip review fixes, ungated
+# correctness, as for `max` above; STATUS.md): +648 B.
+# 1,061,144 -> 1,061,416 (v0.17 vm_flip retry review fix, ungated correctness;
+# STATUS.md): +272 B. A REAL compound column read through a FROM
+# subquery / view / CTE (and a recursive CTE's queue) reads other
+# cores' integers as reals (`SubPlan::real_cols`, the pin's
+# OP_RealAffinity: a silent wrong answer); the compound affinity
+# searches for the first core with one. (The flip itself was not
+# taken: its probe is still over every ratchet.)
 # +40 B (Bolt): index_insert reuses the leaf's validated cell spans
 # (-7.0% instructions on bolt_workload).
-ratchet = 1060536
+# Merged with main (Bolt, PR #24): measured 1,061,432, the sum of
+# both raises -24 B of alignment padding.
+ratchet = 1061432
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

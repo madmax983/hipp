@@ -5,6 +5,120 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: the flip retry, not taken; REAL affinity through subqueries (wave 14, unit `vm_flip` retry)
+
+- The flip (the VM as the only SELECT path) was not taken: the flip
+  probe is still over every ratchet (full +16,548, max +46,668, xl
+  +53,060 B), so nothing of the legacy executors or the `vm` feature
+  changed (STATUS.md).
+- Fix (ungated, `sql`; both executors): a FROM subquery, view or CTE
+  column whose compound affinity is REAL reads another core's
+  integers as reals, as the pin's `OP_RealAffinity` does (`SELECT x
+  FROM (SELECT real_c x FROM t UNION ALL SELECT 1)` is `1.0`); a
+  recursive CTE's queue reads alike; a plain subquery the pin does not
+  flatten too (with `planner`).
+- Fix: a compound column's affinity comes from the first core whose
+  item has one (`SELECT 1 x UNION SELECT real_c ...` is REAL), in
+  derived tables, CREATE TABLE ... AS, recursive CTEs and PRAGMA
+  table_info of a view.
+- Fix: a scalar subquery's affinity in CREATE TABLE ... AS and PRAGMA
+  table_info is its rightmost core's, as the pin's (and hipp's own
+  comparisons') — hipp read the leftmost.
+- Tests: `tests/compound_affinity_v17.rs` (repros, shapes, 240
+  generated compounds, each engine), `hipp-cli/tests/cli_v17_compound_affinity.rs`.
+- Sizes: tiny +0, full +232 B (478,020), max +608 B (964,684), xl
+  +272 B (1,061,416); ratchets raised to the measured figures.
+
+### The bytecode VM: shrinking it before the flip (unit `vm_shrink`, hidden feature `vm`)
+
+- A reproducible flip probe: `ci/flip_probe.sh` builds full / max /
+  xl with `vm` and `--cfg hipp_flip_probe`, which cuts today's read
+  executor off where wave 13's measurement did, and prints each size
+  next to its ratchet (build-only; not part of CI). STATUS.md records
+  the starting figures and the largest VM, driver and legacy symbols.
+- The expression evaluator is compiled once (for `Error<()>`) in
+  every build with `vm`, as it already was with `window`: the full
+  probe −14,476 B.
+- One code generator for query plans: `vm_core`'s single-table
+  generator is gone, the join generator compiles every SELECT plan
+  (it now also leaves a FROM-less statement's ORDER BY terms
+  uncomputed, as the pin does and the removed generator did; today's
+  executor computes them and fails where a term does). With a
+  subquery anywhere in such a statement the VM now answers as the
+  pin, where base 5b67982's VM raised the term's error (vm-only;
+  tests in `tests/vm_v17.rs`). The builder's
+  common calls stay out of line; the driver awaits its row-list
+  readers through one boxed future. The probe: full 512,764 →
+  494,336 B, max 1,017,176 → 1,010,744 B, xl 1,121,556 → 1,114,204
+  B — still 16.5 / 46.7 / 53.1 KB over the ratchets, so the flip
+  stays out of reach (STATUS.md has the gap per profile).
+- Plain EXPLAIN (with `vm`) lists the join generator's program for a
+  single-table SELECT.
+- Sizes: every shipped profile unchanged.
+
+### The bytecode VM: review fixes of unit `vm_rest` (hidden feature `vm`)
+
+- A window query whose only source is a view, a CTE, a FROM subquery
+  or a table-valued source (json_each, generate_series, fts5 ...)
+  computed its windows over only the rows its LIMIT + OFFSET kept
+  (`SELECT value, count(*) OVER () FROM json_each('[1,2,3,4]') LIMIT
+  2` gave 2 for 4), and inside a scalar subquery over one row: the
+  reader's bound no longer reaches the source of a window query, as
+  in today's executor.
+- `Config::max_vtab_rows` again bounds a generate_series cursor
+  wherever today's executor holds its rows: a materialised CTE, a
+  compound's cores, an IN list, a FROM subquery, a scalar or EXISTS
+  subquery, a RIGHT / FULL join, a window query, a trigger program.
+  The VM read such a cursor row by row, uncounted, and its memory grew
+  with the series; it now reads it whole under the bound, as today's
+  executor does, and fails with `VtabTooManyRows` where it fails.
+- Sizes: every profile unchanged (no profile enables `vm`).
+
+### The bytecode VM flip (ADR 0005 Stage 2, unit `vm_flip`): measured, not taken; review fixes
+
+- The flip was not made: with the VM as the only SELECT path and the
+  legacy read executors deleted, every profile measured larger than
+  its ratchet (best case: full +19,252 B, max +51,500 B, xl +58,540
+  B), and the unit's rule is to stop rather than let a profile grow.
+  The hidden `vm` feature and today's executors stay; STATUS.md has
+  the measurements.
+- Fix (max, xl): an enclosing query's aggregate that a nested
+  aggregate query uses as an index or rowid bound (`SELECT (SELECT
+  count(*) FROM u WHERE u.k <= max(t.a)) FROM t` with an index on
+  `u.k`, `w.id <= max(t.a)` on an INTEGER PRIMARY KEY) is answered
+  like the pin; it failed with `MisusedAggregate`. The folded value
+  now reaches the nested plan's access path too.
+- Fix (every profile with `query`): a repeated min() / max() no
+  longer decides the bare columns (`SELECT max(a), min(a), max(a), a
+  FROM t` read the max() row; the pin reads the min() row, its
+  aggregate list holding each aggregate once).
+- Under the hidden `vm`: such a bound now runs on the VM; one in the
+  arguments of a table-valued, virtual or WITHOUT ROWID source falls
+  back to today's executor (it read as NULL on the VM).
+- Sizes: tiny 76,952 B (unchanged), full 477,788 B (+304), max
+  964,076 B (+504), xl 1,061,144 B (+648).
+
+### The bytecode VM: windows, virtual sources, the rest of SELECT and EXPLAIN (ADR 0005 Stage 2, unit `vm_rest`)
+
+- Under the hidden feature `vm`, every SELECT now runs on the VM:
+  window functions (today's frame engine, `window::compute`, over the
+  kept rows or groups, units output in window order), virtual and
+  table-valued sources (generate_series, dbstat, rtree, fts5,
+  fts5vocab, json_each / json_tree, the `pragma_*` functions) as
+  driver-awaited opcodes over today's readers with the streamed
+  semantics (`Config::max_vtab_rows`, side-table release, an inner
+  virtual table filtered again per outer row), `sqlite_schema`,
+  WITHOUT ROWID tables, TEMP and attached tables, and the SELECTs of
+  trigger programs and foreign-key actions. The one shape still
+  handed to today's executor is one it refuses itself (an enclosing
+  query's aggregate over a subquery argument); a strict run of the
+  whole workspace suite (`RUSTFLAGS="--cfg hipp_vm_strict"`) passes.
+- Plain `EXPLAIN <statement>` (with `explain` and `vm`) lists hipp's
+  own program in the pin's eight columns (`addr`, `opcode`, `p1` ..
+  `p5`, `comment`); without `vm` it is still refused. EXPLAIN QUERY
+  PLAN is unchanged. No profile enables `vm`: every profile's size is
+  unchanged.
+
 ### The bytecode VM: review fixes of unit `vm_subqueries` (hidden feature `vm`)
 
 - min() / max() over a subquery argument or FILTER (the group's

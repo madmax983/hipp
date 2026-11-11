@@ -1160,22 +1160,15 @@ pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
     Ok(())
 }
 
-/// The pin's `sqlite3ExprAffinity` of one resolved result item:
-/// a column's affinity, a CAST's, INTEGER for a rowid, a scalar
-/// subquery's first result item's; none (BLOB) for anything else.
+/// The pin's `sqlite3ExprAffinity` of one resolved result item,
+/// none read as BLOB (`query::item_result_affinity`: a scalar
+/// subquery's is its rightmost core's, as the pin's `pSelect` is
+/// that core — v0.17 review fix, ungated: hipp read the leftmost,
+/// so `CREATE TABLE t2 AS SELECT (SELECT c FROM t UNION ALL SELECT
+/// 1)` declared a REAL column the pin leaves untyped).
 #[cfg(feature = "sql")]
 pub fn item_affinity(e: &RExpr) -> Affinity {
-    match e {
-        RExpr::Column(_, a, _) | RExpr::Cast(_, a) => *a,
-        RExpr::Collate(x, _) => item_affinity(x),
-        RExpr::Rowid(_) => Affinity::Integer,
-        RExpr::SubScalar(p) => p
-            .items
-            .as_slice()
-            .first()
-            .map_or(Affinity::Blob, item_affinity),
-        _ => Affinity::Blob,
-    }
+    crate::query::item_result_affinity(e).unwrap_or(Affinity::Blob)
 }
 
 /// The pin's `sqlite3ExprDataType` bits of one later compound
@@ -1211,40 +1204,72 @@ pub fn item_datatype(e: &RExpr) -> u8 {
 
 /// Column `i`'s affinity as a compound SELECT's result column (the
 /// pin's `sqlite3SubqueryColumnTypes`; v0.16, ungated on the v0.9
-/// derived-table path): the leftmost core's `aff`, demoted to none
-/// (BLOB) when a later core's item can be of the other class — a
-/// TEXT column with a numeric item elsewhere, a numeric one with a
-/// text item — and a numeric CAST becoming NUMERIC (the pin's
-/// FLEXNUM). `head` is the leftmost core's item, `tails` the later
-/// cores.
+/// derived-table path): the leftmost core's `aff` — or, when that
+/// item has none (`None`: a literal, an expression; not a column,
+/// which has at least BLOB), the first later core's item that has
+/// one (v0.17 review fix: `(SELECT 1 x UNION SELECT real_col ...)`
+/// is REAL on the pin) — demoted to BLOB when any core's item can be
+/// of the other class (a TEXT column with a numeric item elsewhere,
+/// a numeric one with a text item), and a numeric CAST in the
+/// leftmost core becoming NUMERIC (the pin's FLEXNUM). `head` is the
+/// leftmost core's item, `tails` the later cores; `None` when no
+/// core's item has an affinity.
 #[cfg(feature = "sql")]
 pub fn compound_affinity<'p>(
-    aff: Affinity,
+    aff: Option<Affinity>,
     head: Option<&RExpr>,
     tails: impl Iterator<Item = &'p crate::query::SubPlan>,
     i: usize,
-) -> Affinity {
+) -> Option<Affinity> {
     let mut any = false;
-    let mut m = 0u8;
+    let mut found = aff;
+    // (Every core's bits: the leftmost's, and the found core's, agree
+    // with the affinity they give, so they never demote it.)
+    let mut m = head.map_or(0, item_datatype);
+    let mut arm = |e: Option<&RExpr>| {
+        if let Some(e) = e {
+            if found.is_none() {
+                found = crate::query::item_result_affinity(e);
+            }
+            m |= item_datatype(e);
+        }
+    };
     for tail in tails {
         any = true;
         if tail.values.is_empty() {
-            m |= tail.items.as_slice().get(i).map_or(0, item_datatype);
+            arm(tail.items.as_slice().get(i));
         }
         for row in tail.values.iter() {
-            m |= row.as_slice().get(i).map_or(0, item_datatype);
+            arm(row.as_slice().get(i));
         }
     }
+    let aff = found?;
     if !any || aff == Affinity::Blob {
-        return aff;
+        return Some(aff);
     }
     let numeric = matches!(aff, Affinity::Numeric | Affinity::Integer | Affinity::Real);
-    if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
-        Affinity::Blob
-    } else if numeric && matches!(head, Some(RExpr::Cast(..))) {
-        Affinity::Numeric
-    } else {
-        aff
+    Some(
+        if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
+            Affinity::Blob
+        } else if numeric && matches!(head, Some(RExpr::Cast(..))) {
+            Affinity::Numeric
+        } else {
+            aff
+        },
+    )
+}
+
+/// A FROM subquery's row as its reader sees it (v0.17 review fix,
+/// ungated `sql`): the integers of its `SubPlan::real_cols` read as
+/// reals (the pin's `OP_RealAffinity`).
+#[cfg(feature = "sql")]
+pub fn real_row(row: &mut [OwnedValue], cols: &[usize]) {
+    for c in cols {
+        if let Some(v) = row.get_mut(*c)
+            && let OwnedValue::Integer(x) = *v
+        {
+            *v = OwnedValue::Real(x as f64);
+        }
     }
 }
 

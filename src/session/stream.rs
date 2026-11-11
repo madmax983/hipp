@@ -842,7 +842,8 @@ impl<S: Storage> Statement<'_, S> {
                     self.exec_subplan_need(dp, &RowData::empty(), need).await?
                 };
                 let mut rows = AVec::new();
-                for r in inner {
+                for mut r in inner {
+                    crate::rules::real_row(r.as_mut_slice(), dp.real_cols.as_slice());
                     rows.push((r, None));
                 }
                 Some(rows)

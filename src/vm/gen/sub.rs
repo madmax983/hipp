@@ -99,7 +99,7 @@ impl G<'_, '_> {
                 } else {
                     None
                 };
-                self.b.emit(Code::AccGroup, gc, 0, 0, 0, 0);
+                self.b.emit2(Code::AccGroup, gc, 0);
                 let slots = self.subs_of(e, at, aggs.is_some())?;
                 (gc.saturating_add(1), EVAL_GROUP, slots, aggs)
             }
@@ -110,8 +110,14 @@ impl G<'_, '_> {
             aggs,
             plain: false,
         })));
-        self.b
-            .emit(Code::Eval, p1, dest, 0, k, mode | flag | EVAL_SUB);
+        self.b.emit(
+            Code::Eval,
+            p1,
+            dest,
+            0,
+            k,
+            mode | flag | EVAL_SUB | self.wflag,
+        );
         Some(())
     }
 
@@ -161,7 +167,7 @@ impl G<'_, '_> {
             let after = self.b.label();
             self.b.jump(Code::SubStart, s, after, 0, info, 0);
             self.b.emit(Code::SubRow, s, r, 1, info, 0);
-            self.b.emit(Code::SubEnd, 0, 0, 0, 0, 0);
+            self.b.emit2(Code::SubEnd, 0, 0);
             self.b.here(after);
             slots.push(s);
         }
@@ -194,8 +200,14 @@ impl G<'_, '_> {
             aggs: None,
             plain: true,
         })));
-        self.b
-            .emit(Code::Eval, p1, dest, 0, k, mode | flag | EVAL_SUB);
+        self.b.emit(
+            Code::Eval,
+            p1,
+            dest,
+            0,
+            k,
+            mode | flag | EVAL_SUB | self.wflag,
+        );
     }
 
     /// One aggregate of a group whose arguments hold a subquery
@@ -205,13 +217,13 @@ impl G<'_, '_> {
     fn agg_rows(&mut self, a: &RExpr, gc: u32) -> Option<u32> {
         let p = crate::query::agg_parts(a)?;
         let list = self.b.cursor();
-        self.b.emit(Code::EphOpen, list, 0, 0, 0, 0);
+        self.b.emit2(Code::EphOpen, list, 0);
         let n = p.inputs().len();
         let regs = self.b.regs(n);
         let top = self.b.label();
         let next = self.b.label();
         let done = self.b.label();
-        self.b.jump(Code::GroupRows, gc, done, 0, 0, 0);
+        self.b.jump_to(Code::GroupRows, gc, done);
         self.b.here(top);
         if let Some(f) = p.filter {
             self.test(f, Cx::Acc, next);
@@ -219,9 +231,9 @@ impl G<'_, '_> {
         for (i, x) in p.inputs().iter().enumerate() {
             self.val(x, Cx::Acc, regs.saturating_add(i as u32));
         }
-        self.b.emit(Code::EphPut, list, regs, n as u32, 0, 0);
+        self.b.emit3(Code::EphPut, list, regs, n as u32);
         self.b.here(next);
-        self.b.jump(Code::GroupRowNext, gc, top, 0, 0, 0);
+        self.b.jump_to(Code::GroupRowNext, gc, top);
         self.b.here(done);
         let dest = self.b.reg();
         let k = self.b.p4(P4::Expr(a.clone()));
@@ -255,7 +267,7 @@ impl G<'_, '_> {
         let top = self.b.label();
         let next = self.b.label();
         let done = self.b.label();
-        self.b.jump(Code::GroupRows, gc, done, 0, 0, 0);
+        self.b.jump_to(Code::GroupRows, gc, done);
         self.b.here(top);
         if let Some(f) = m.filter {
             self.test(f, Cx::Acc, next);
@@ -263,7 +275,7 @@ impl G<'_, '_> {
         self.val(m.arg, Cx::Acc, v);
         self.b.emit(Code::RepStep, gc, v, max, colls, 0);
         self.b.here(next);
-        self.b.jump(Code::GroupRowNext, gc, top, 0, 0, 0);
+        self.b.jump_to(Code::GroupRowNext, gc, top);
         self.b.here(done);
     }
 
@@ -287,7 +299,7 @@ impl G<'_, '_> {
                 let k = self.b.p4(P4::Expr(e.clone()));
                 self.b.emit(Code::Eval, 0, t, 0, k, mode | EVAL_ACC);
             }
-            self.b.jump(Code::IfNot, t, fail, 0, 0, 0);
+            self.b.jump_to(Code::IfNot, t, fail);
             return;
         }
         match e {
@@ -304,7 +316,7 @@ impl G<'_, '_> {
                     let second_l = self.b.label();
                     let pass = self.b.label();
                     self.cond_sub(first, want, second_l);
-                    self.b.jump(Code::Goto, 0, pass, 0, 0, 0);
+                    self.b.jump_to(Code::Goto, 0, pass);
                     self.b.here(second_l);
                     self.cond_sub(second, want, fail);
                     self.b.here(pass);
@@ -322,7 +334,7 @@ impl G<'_, '_> {
                     EVAL_FALSE
                 };
                 self.val_sub(e, Cx::Acc, t, mode);
-                self.b.jump(Code::IfNot, t, fail, 0, 0, 0);
+                self.b.jump_to(Code::IfNot, t, fail);
             }
         }
     }
@@ -412,7 +424,7 @@ fn subs_of(
 /// `eval_row_sub` over the empty row): its value into `dest`, the
 /// joined row saved around it.
 pub(super) fn empty_scope_val(b: &mut Builder, e: &RExpr, gx: Gx<'_>, dest: u32) -> Option<()> {
-    b.emit(Code::AccPush, 0, 0, 0, 0, 0);
+    b.emit2(Code::AccPush, 0, 0);
     let slots = subs_of(b, gx, e, (0, 0), false)?;
     let k = b.p4(P4::SubExpr(Box::new(SubExpr {
         e: e.clone(),
@@ -421,7 +433,7 @@ pub(super) fn empty_scope_val(b: &mut Builder, e: &RExpr, gx: Gx<'_>, dest: u32)
         plain: false,
     })));
     b.emit(Code::Eval, 0, dest, 0, k, EVAL_VALUE | EVAL_ACC | EVAL_SUB);
-    b.emit(Code::AccPop, 0, 0, 0, 0, 0);
+    b.emit2(Code::AccPop, 0, 0);
     Some(())
 }
 
@@ -462,8 +474,8 @@ fn sub_node(
         // The node's code again over the same row: call it.
         let (slot, once) = (h.slot, h.once);
         let done = b.label();
-        b.jump(Code::Once, once, done, 0, 0, 0);
-        b.jump(Code::Gosub, 0, entry, ret, 0, 0);
+        b.jump_to(Code::Once, once, done);
+        b.jump3(Code::Gosub, 0, entry, ret);
         b.here(done);
         return Some(slot);
     }
@@ -490,13 +502,13 @@ fn sub_node(
     };
     let done = b.label();
     if let Some(o) = once {
-        b.jump(Code::Once, o, done, 0, 0, 0);
+        b.jump_to(Code::Once, o, done);
     }
     // Shared code: called here, placed after the call and jumped over.
     let ret_to = match shared {
         Some((entry, ret)) => {
-            b.jump(Code::Gosub, 0, entry, ret, 0, 0);
-            b.jump(Code::Goto, 0, done, 0, 0, 0);
+            b.jump3(Code::Gosub, 0, entry, ret);
+            b.jump_to(Code::Goto, 0, done);
             b.here(entry);
             let back = b.label();
             Some((back, ret))
@@ -513,22 +525,22 @@ fn sub_node(
         col: plan.scalar_col,
     })));
     b.jump(Code::SubStart, slot, after, 0, info, 0);
-    b.emit(Code::Count, 0, 0, 0, 0, 0);
+    b.emit2(Code::Count, 0, 0);
     // A scalar subquery and EXISTS read one row (the pin's implicit
     // LIMIT 1); an IN set all of them.
     let need = match kind {
         SubKind::In => None,
         _ => {
             let r = b.reg();
-            b.emit(Code::Integer, 0, r, 1, 0, 0);
+            b.emit3(Code::Integer, 0, r, 1);
             Some(r)
         }
     };
     subplan(b, plan, gx, at, need, Sink::Sub(slot, info))?;
-    b.emit(Code::SubEnd, 0, 0, 0, 0, 0);
+    b.emit2(Code::SubEnd, 0, 0);
     if let Some((back, ret)) = ret_to {
         b.here(back);
-        b.emit(Code::Return, 0, 0, ret, 0, 0);
+        b.emit3(Code::Return, 0, 0, ret);
     }
     b.here(done);
     Some(slot)
@@ -560,6 +572,7 @@ fn placeholder(id: usize) -> SubPlan {
         scalar_col: 0,
         rec: None,
         mat: 0,
+        real_cols: AVec::new(),
         #[cfg(feature = "explain")]
         sel: 0,
         #[cfg(feature = "planner")]
@@ -576,6 +589,70 @@ fn placeholder(id: usize) -> SubPlan {
 /// The slot of placeholder plan `p` (`G::owned_aggs`), if it is one.
 fn preset_slot(b: &Builder, p: &SubPlan) -> Option<u32> {
     b.preset.iter().find(|(id, _)| *id == p.id).map(|(_, s)| *s)
+}
+
+/// Whether the parts of source `sp` that the driver evaluates with
+/// today's readers (a table-valued or virtual source's arguments and
+/// OR branches, a WITHOUT ROWID table's access path) hold a folded
+/// aggregate's placeholder (`G::owned_aggs`) at any depth: those
+/// readers do not see the placeholders' slots (they would read the
+/// empty placeholder plan as NULL), so such a source falls back
+/// (v0.17 review fix).
+#[cfg(feature = "sql")]
+pub(super) fn host_reads_preset(b: &Builder, sp: &crate::query::SubSource) -> bool {
+    if b.preset.is_empty() {
+        return false;
+    }
+    #[cfg(feature = "expr_index")]
+    if sp
+        .access
+        .as_deref()
+        .is_some_and(|a| crate::query::any_access_expr(a, &mut |e: &RExpr| expr_has_preset(b, e)))
+    {
+        return true;
+    }
+    #[cfg(feature = "fts5")]
+    if let Some(vt) = sp.vt.as_deref()
+        && vt
+            .ors
+            .iter()
+            .any(|(_, _, args, _)| args.iter().any(|e| expr_has_preset(b, e)))
+    {
+        return true;
+    }
+    sp.derived.as_deref().is_some_and(|d| plan_has_preset(b, d))
+}
+
+/// Whether `e` holds a folded aggregate's placeholder, in its own
+/// subquery nodes or nested deeper (`host_reads_preset`).
+#[cfg(feature = "sql")]
+fn expr_has_preset(b: &Builder, e: &RExpr) -> bool {
+    let mut kinds: AVec<crate::query::SubKind<'_>> = AVec::new();
+    crate::query::collect_subs(e, &mut kinds);
+    kinds.iter().any(|k| {
+        let p = match k {
+            crate::query::SubKind::Scalar(p)
+            | crate::query::SubKind::Exists(p)
+            | crate::query::SubKind::In(p) => *p,
+        };
+        preset_slot(b, p).is_some() || plan_has_preset(b, p)
+    })
+}
+
+/// `expr_has_preset` over every expression of plan `p`.
+#[cfg(feature = "sql")]
+fn plan_has_preset(b: &Builder, p: &SubPlan) -> bool {
+    let f = |e: &RExpr| expr_has_preset(b, e);
+    p.sources
+        .iter()
+        .any(|s| s.on.as_ref().is_some_and(f) || host_reads_preset(b, s))
+        || p.items.iter().any(f)
+        || p.filter.as_ref().is_some_and(f)
+        || p.group_by.iter().any(f)
+        || p.having.as_ref().is_some_and(f)
+        || p.order_by.iter().any(|(e, _)| f(e))
+        || p.values.iter().any(|r| r.iter().any(f))
+        || p.compound.iter().any(|(_, t)| plan_has_preset(b, t))
 }
 
 /// Whether `e` holds a subquery node of its own that is not a folded
@@ -611,26 +688,22 @@ pub(super) fn subplan(
     need: Option<u32>,
     sink: Sink,
 ) -> Option<()> {
-    if b.depth >= MAX_NEST || b.over() {
+    // (No nesting cap: plans nest no deeper than the parser's limits
+    // let a statement's text, and the generator's stack per level fits
+    // the budget `Config::stack_budget` gives those limits, measured
+    // by tests/depth_v16.rs in a debug build with debug info.)
+    if b.over() {
         b.fail();
         return None;
     }
-    b.depth = b.depth.saturating_add(1);
-    let r = match p.rec {
+    match p.rec {
         Some(rec) => recursive(b, p, rec, gx, at, need, sink),
         None => {
             let qp = Rc::new(QueryPlan::of_sub(p));
             super::join::select(b, &qp, gx, at, need, sink)
         }
-    };
-    b.depth = b.depth.saturating_sub(1);
-    r
+    }
 }
-
-/// The deepest nesting of subquery plans the generator follows (its
-/// recursion's native stack); a deeper statement runs on today's
-/// executor.
-const MAX_NEST: u32 = 32;
 
 /// A compound or VALUES query (`run_query_compound` /
 /// `exec_subplan_inner`'s compound finish): a UNION ALL chain without
@@ -651,7 +724,7 @@ pub(super) fn compound(
     let (lim, off) = super::join::limits(b, qp.limit.as_ref(), qp.offset.as_ref(), gx, end)?;
     let cnt = need.map(|n| {
         let c = b.reg();
-        b.emit(Code::Copy, n, c, 0, 0, 0);
+        b.emit2(Code::Copy, n, c);
         c
     });
     let mut cores: AVec<Rc<QueryPlan>> = AVec::new();
@@ -679,7 +752,7 @@ pub(super) fn compound(
     }
     for (k, c) in cores.iter().enumerate() {
         let e = first.saturating_add(k as u32);
-        b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+        b.emit2(Code::EphOpen, e, 0);
         let cend = b.label();
         if c.values.is_empty() {
             super::join::core(
@@ -724,7 +797,7 @@ pub(super) fn compound(
         first_row,
     })));
     let r = b.cursor();
-    b.emit(Code::EphOpen, r, 0, 0, 0, 0);
+    b.emit2(Code::EphOpen, r, 0);
     b.emit(Code::Compound, r, first, cores.len() as u32, k, 0);
     let width = qp
         .values
@@ -752,15 +825,15 @@ fn window_rows(
     let top = b.label();
     let next = b.label();
     let regs = b.regs(width);
-    b.jump(Code::EphRewind, r, end, 0, 0, 0);
+    b.jump_to(Code::EphRewind, r, end);
     b.here(top);
     if let Some(o) = off {
-        b.jump(Code::IfPos, o, next, 1, 0, 0);
+        b.jump3(Code::IfPos, o, next, 1);
     }
-    b.emit(Code::EphRow, r, regs, width as u32, 0, 0);
+    b.emit3(Code::EphRow, r, regs, width as u32);
     super::join::emit_row(b, sink, regs, width, 0, lim, cnt, end);
     b.here(next);
-    b.jump(Code::EphNext, r, top, 0, 0, 0);
+    b.jump_to(Code::EphNext, r, top);
 }
 
 /// A recursive CTE (`exec_recursive`): its LIMIT / OFFSET first (a
@@ -781,7 +854,7 @@ fn recursive(
     let (lim, off) = super::join::limits(b, p.limit.as_ref(), p.offset.as_ref(), gx, end)?;
     let cnt = need.map(|n| {
         let c = b.reg();
-        b.emit(Code::Copy, n, c, 0, 0, 0);
+        b.emit2(Code::Copy, n, c);
         c
     });
     let mut setup = p.clone();
@@ -822,21 +895,24 @@ fn recursive(
         union,
     })));
     let q = b.cursor();
-    b.emit(Code::QueueOpen, q, 0, 0, qi, 0);
-    b.emit(Code::Count, 0, 0, 0, 0, 0);
+    b.emit_p4(Code::QueueOpen, q, qi);
+    b.emit2(Code::Count, 0, 0);
     subplan(b, &setup, gx, at, None, Sink::Queue(q))?;
     let cur = b.cursor();
-    b.emit(Code::EphOpen, cur, 0, 0, 0, 0);
+    b.emit2(Code::EphOpen, cur, 0);
     b.recs.push((rec.id, cur));
     let top = b.label();
     let feed = b.label();
     let regs = b.regs(width);
     b.here(top);
-    b.jump(Code::QueuePop, q, end, cur, 0, 0);
-    if let Some(o) = off {
-        b.jump(Code::IfPos, o, feed, 1, 0, 0);
+    b.jump3(Code::QueuePop, q, end, cur);
+    for c in p.real_cols.iter() {
+        b.emit2(Code::EphReal, cur, *c as u32);
     }
-    b.emit(Code::EphRow, cur, regs, width as u32, 0, 0);
+    if let Some(o) = off {
+        b.jump3(Code::IfPos, o, feed, 1);
+    }
+    b.emit3(Code::EphRow, cur, regs, width as u32);
     super::join::emit_row(b, sink, regs, width, 0, lim, cnt, end);
     b.here(feed);
     let mut r = Some(());
@@ -861,7 +937,7 @@ fn recursive(
     }
     b.recs.pop();
     r?;
-    b.jump(Code::Goto, 0, top, 0, 0, 0);
+    b.jump_to(Code::Goto, 0, top);
     b.here(end);
     Some(())
 }

@@ -1693,14 +1693,12 @@ impl<S: Storage> Connection<S> {
             pass += 1;
             let mut demoted = AVec::new();
             for (i, a) in plan.result_affs.iter().enumerate() {
-                demoted.push(a.map(|a| {
-                    crate::rules::compound_affinity(
-                        a,
-                        plan.items.as_slice().get(i),
-                        tails.iter().map(|(_, t): &(CompoundOp, Box<_>)| &**t),
-                        i,
-                    )
-                }));
+                demoted.push(crate::rules::compound_affinity(
+                    *a,
+                    plan.items.as_slice().get(i),
+                    tails.iter().map(|(_, t): &(CompoundOp, Box<_>)| &**t),
+                    i,
+                ));
             }
             if pass > 1 || demoted == affs {
                 break (tails, keys);
@@ -2055,7 +2053,10 @@ impl<S: Storage> Statement<'_, S> {
                 queue.push(row.clone());
             }
         }
-        while let Some(row) = queue.pop() {
+        while let Some(mut row) = queue.pop() {
+            // Read from the queue, a REAL column's integers are reals
+            // (the pin's `OP_RealAffinity`; v0.17 review fix).
+            crate::rules::real_row(row.as_mut_slice(), plan.real_cols.as_slice());
             if skip > 0 {
                 skip -= 1;
             } else {

@@ -34,6 +34,11 @@ sql,vm
 sql,indexes,vm
 sql,indexes,expr_index,vm
 sql,indexes,expr_index,planner,vm
+sql,window,vm
+sql,json,vm
+sql,vtab,vm
+sql,without_rowid,vm
+sql,explain,vm
 indexes,query
 indexes,write
 full

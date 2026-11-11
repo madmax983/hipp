@@ -337,6 +337,13 @@ const OK: &[&str] = &[
     "SELECT abs(-9223372036854775808) LIMIT 0;",
     "SELECT 1 WHERE abs(-9223372036854775808) LIMIT 0;",
     "SELECT 2 AS x ORDER BY x LIMIT 5;",
+    // (Unit `vm_shrink`, regression: the join generator, now the only
+    // one, never computes a FROM-less statement's ORDER BY terms.)
+    "SELECT 1, 2 ORDER BY abs(-9223372036854775808) DESC LIMIT 5;",
+    "SELECT 1 WHERE 1 ORDER BY abs(-9223372036854775808), 1;",
+    "SELECT 1 ORDER BY abs(-9223372036854775808) LIMIT 1 OFFSET 0;",
+    "SELECT 1 ORDER BY abs(-9223372036854775808) LIMIT 1 OFFSET 1;",
+    "SELECT 'a' COLLATE nocase AS c ORDER BY c DESC, abs(-9223372036854775808);",
 ];
 
 /// SELECTs whose statement fails, on the pin and on hipp (the rows
@@ -379,6 +386,39 @@ fn claimed_shapes_match_the_pin() {
     assert!(common::oracle_is_pinned(), "{}", common::oracle_version());
     let base = pin_t("t-ok");
     corpus(&base, "ok", &strict(), OK);
+}
+
+/// FROM-less statements with a subquery somewhere and an ORDER BY term
+/// that would fail (unit `vm_shrink` review): the pin's loop over no
+/// table satisfies the ORDER BY, so its terms are never computed, a
+/// subquery anywhere in the statement or in the term itself
+/// notwithstanding. A deliberate change from base 5b67982, where the
+/// removed single-table generator refused every subquery and the join
+/// generator computed the terms (`IntegerOverflow`, as today's
+/// executor still does for every row of this list).
+#[cfg(feature = "sql")]
+const FREE_ORDER_SUBQUERIES: &[&str] = &[
+    "SELECT 1 ORDER BY (SELECT abs(-9223372036854775808));",
+    "SELECT 1 ORDER BY (SELECT 1/0), abs(-9223372036854775808);",
+    "SELECT 1 WHERE (SELECT 1) ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 WHERE EXISTS (SELECT 1) ORDER BY abs(-9223372036854775808);",
+    "SELECT (SELECT 2) ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 ORDER BY abs(-9223372036854775808) LIMIT (SELECT 1);",
+    "SELECT 1 IN (SELECT 1) ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 ORDER BY 1 IN (SELECT abs(-9223372036854775808));",
+    "SELECT 1 WHERE 0 ORDER BY (SELECT abs(-9223372036854775808));",
+    "SELECT 1 ORDER BY (SELECT 2) LIMIT 1 OFFSET (SELECT 1);",
+    "SELECT 1 ORDER BY (SELECT abs(-9223372036854775808)) LIMIT 1 OFFSET (SELECT 0);",
+    "WITH c AS (SELECT 1) SELECT 1 ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 LIMIT 0 OFFSET abs(-9223372036854775808);",
+    "SELECT 1, 2 ORDER BY 2 DESC, abs(-9223372036854775808);",
+];
+
+#[cfg(feature = "sql")]
+#[test]
+fn from_less_order_by_terms_stay_uncomputed_with_subqueries() {
+    let base = pin_t("t-free-sub");
+    corpus(&base, "free-sub", &strict(), FREE_ORDER_SUBQUERIES);
 }
 
 #[test]
@@ -571,19 +611,24 @@ fn parameters_compile_per_execution() {
 
 // ---------------- fallback ----------------
 
-/// Shapes no unit claims yet: strict mode refuses them
-/// (`VmFallback`), and without it they run on today's executor with
-/// the pin's rows. (Joins, aggregates, DISTINCT, index access and
-/// rowid IN lists moved to `tests/vm_joins_v17.rs` with unit
-/// `vm_joins`, as did an EXISTS term the planner makes a semi-join;
-/// subqueries, compounds, VALUES, FROM subqueries and recursive CTEs to
-/// `tests/vm_subqueries_v17.rs` with unit `vm_subqueries`.)
+/// The shapes that still fall back after unit `vm_rest`: each only to
+/// reproduce today's executor's refusal of it. Strict mode refuses
+/// them (`VmFallback`); without it they run on today's executor and
+/// fail as it does. (Every other shape moved to the suites of the
+/// units that claimed it: `tests/vm_joins_v17.rs`,
+/// `tests/vm_subqueries_v17.rs`, `tests/vm_rest_v17.rs`.)
 const UNCLAIMED: &[&str] = &[
-    "SELECT a, row_number() OVER (ORDER BY a) FROM t;",
-    "SELECT name FROM sqlite_schema;",
-    "SELECT * FROM wr;",
-    "SELECT key FROM json_each('[1,2]');",
-    "SELECT value FROM generate_series(1, 3);",
+    // An enclosing query's aggregate over a subquery argument: today's
+    // `Unsupported` (the pin answers).
+    "SELECT a, (SELECT group_concat((SELECT k FROM u WHERE t.a > 0 LIMIT 1)) FROM t AS t2) FROM t;",
+    // An enclosing query's aggregate inside an inner aggregate: the
+    // pin's misuse error, refused by today's executor.
+    "SELECT (SELECT sum((SELECT max(t.a))) FROM u) FROM t;",
+    // (A nested query's index bound reading an enclosing query's
+    // aggregate, `u.k <= count(t.a)` over an index on u.k, was today's
+    // `MisusedAggregate`; since the `vm_flip` review fixes both engines
+    // answer it like the pin: tests/vm_subqueries_v17.rs,
+    // tests/outer_agg_bound_v17.rs.)
 ];
 
 const U: &str = "CREATE TABLE u(k, v); INSERT INTO u VALUES (1, 'p'), (2, 'q'), (3, 'r'); \
@@ -628,23 +673,29 @@ fn unclaimed_shapes_fall_back_whole() {
             matches!(first, Some(Error::VmFallback)),
             "{q}: hook first: {first:?}"
         );
-        // Default: today's executor, the pin's rows.
-        let h = copy_of(&base, &format!("vm17-uc{i}-h"));
-        let o = copy_of(&base, &format!("vm17-uc{i}-o"));
-        let (hl, on_vm) = block_on(async {
-            let fs = FileStorage::open(&h).expect("fs open");
-            let mut db = Connection::open(fs, Config::default()).await.expect("open");
-            let mut q2 = db.prepare(q).await.expect("prepare");
-            let mut rows = Vec::new();
-            while q2.step().await.expect("step") == Step::Row {
-                rows.push(render(&q2));
-            }
-            (rows, q2.runs_on_vm())
-        });
-        assert!(!on_vm, "unclaimed but on the VM: {q}");
-        let (ook, ol) = oracle_script(&o, q);
-        assert!(ook, "pin failed: {q}");
-        assert_eq!(hl, ol, "{q}");
+        // Default: today's executor and its refusal, whatever the
+        // VM's build (`vm_off` is today's executor alone).
+        let run = |cfg: Config, tag: &str| {
+            let h = copy_of(&base, &format!("vm17-uc{i}-{tag}"));
+            block_on(async {
+                let fs = FileStorage::open(&h).expect("fs open");
+                let mut db = Connection::open(fs, cfg).await.expect("open");
+                let mut q2 = db.prepare(q).await.expect("prepare");
+                let mut rows = Vec::new();
+                loop {
+                    match q2.step().await {
+                        Ok(Step::Row) => rows.push(render(&q2)),
+                        Ok(Step::Done) => return (rows, None, q2.runs_on_vm()),
+                        Err(e) => return (rows, Some(format!("{e:?}")), q2.runs_on_vm()),
+                    }
+                }
+            })
+        };
+        let (hl, he, on_vm) = run(Config::default().vm_strict(false), "h");
+        assert!(!on_vm, "on the VM: {q}");
+        let (tl, te, _) = run(Config::default().vm_off(true), "t");
+        assert_eq!((hl, he.clone()), (tl, te), "{q}");
+        assert!(he.is_some(), "today's executor answers: {q}");
     }
 }
 

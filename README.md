@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 477,484 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 963,572 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,060,496 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 478,020 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 964,684 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,061,416 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -248,6 +248,51 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   min() / max() over a subquery and an enclosing query's aggregates
   inside subqueries, and share an uncorrelated subquery's code so
   nested aliases no longer blow up code generation.
+- **The bytecode VM, fourth unit** (hidden feature `vm`). Every SELECT
+  now runs on the VM: window functions, virtual and table-valued
+  sources (generate_series, dbstat, rtree, fts5, fts5vocab,
+  json_each / json_tree, `pragma_*`), `sqlite_schema`, WITHOUT ROWID,
+  TEMP and attached tables, and the SELECTs of trigger and
+  foreign-key action programs — the source readers as driver-awaited
+  instructions over today's async code — except one shape today's
+  executor refuses. Plain `EXPLAIN` lists hipp's own program in the
+  pin's columns under `vm` (still refused without it). No profile
+  enables `vm`; the stage's last unit turns it on. Review fixes: a
+  window query's LIMIT no longer bounds its view / CTE / FROM
+  subquery / table-valued source (its windows saw only the LIMIT's
+  rows), and `Config::max_vtab_rows` bounds a generate_series cursor
+  wherever today's executor holds its rows (a materialised CTE, a
+  compound, an IN list, a derived table, a subquery, a trigger
+  program), as it did before the VM.
+- **The VM flip, measured and not taken.** Making the VM the only
+  SELECT path and deleting the legacy read executors would grow every
+  profile (full by about 19 KB, max by 51 KB and xl by 59 KB even in a
+  best case), so the stage's last unit stopped; `vm` stays hidden and
+  every profile keeps today's executor (STATUS.md has the figures).
+- **Outer aggregates as index bounds; repeated min() / max()** (fixes).
+  An enclosing query's aggregate that a nested aggregate query uses as
+  an index or rowid bound (`SELECT (SELECT count(*) FROM u WHERE u.k
+  <= max(t.a)) FROM t` over an index on `u.k`) is answered like the
+  pin; it failed with `MisusedAggregate` (max, xl). A repeated min()
+  / max() no longer changes which one picks the bare columns
+  (`SELECT max(a), min(a), max(a), a FROM t` read the max() row; the
+  pin reads the min() row; every profile with aggregates).
+- **Shrinking the VM before the flip** (hidden feature `vm`). A
+  reproducible flip probe (`ci/flip_probe.sh`) measures what full /
+  max / xl would weigh with the VM as the only SELECT path. The VM's
+  evaluator is compiled once, one code generator compiles every
+  SELECT plan and the builder's common calls stay out of line: the
+  probe shrank by 18.4 / 6.4 / 7.4 KB but is still 16.5 / 46.7 /
+  53.1 KB over the full / max / xl ratchets, so the flip stays out of
+  reach. No shipped profile changes (STATUS.md has the figures).
+- **The flip retry, not taken; REAL columns through subqueries**
+  (fix). The flip probe is still over every ratchet, so the VM stays
+  hidden. A FROM subquery, view or CTE column whose compound affinity
+  is REAL reads another core's integers as reals, as on the pin
+  (`SELECT x FROM (SELECT real_c x FROM t UNION ALL SELECT 1)` printed
+  `1`, now `1.0`); the compound's affinity comes from the first core
+  that has one, and a scalar subquery's from its rightmost core (CREATE
+  TABLE ... AS and PRAGMA table_info types; every profile with `sql`).
 
 ## What v0.16 does
 
@@ -1146,7 +1191,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   co-routines, VIRTUAL TABLE INDEX, VALUES and constant rows, and the
   UPDATE / DELETE / INSERT plans — and the CLI prints the shell's
   tree. The statement is planned, never run; plain EXPLAIN (bytecode)
-  is refused. Where hipp's strategy differs (no flattening, join
+  is refused (v0.17: under the hidden `vm` feature it lists hipp's own
+  program in the pin's columns). Where hipp's strategy differs (no flattening, join
   reordering and automatic indexes before v0.17's `planner`,
   MULTI-INDEX OR, min/max lookup) it
   prints what it runs (STATUS.md). Comparing plans fixed access-path
@@ -1478,8 +1524,10 @@ indexes, joins, subqueries, UPDATE / DELETE or views.
 
 Not planned in any profile: multi-process locking or a shared `-shm`
 wal-index (WAL is single-process; one connection per database); a
-shared page cache (a file is attached once); plain EXPLAIN's
-bytecode listing (hipp has no VDBE); loadable
+shared page cache (a file is attached once); the pin's own bytecode
+listing (plain EXPLAIN lists hipp's program, in the pin's columns, under
+the hidden `vm` feature until ADR 0005's last Stage 2 unit turns the VM
+on; its content is hipp's, not the pin's); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

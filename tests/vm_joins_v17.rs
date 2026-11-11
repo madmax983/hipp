@@ -787,7 +787,7 @@ fn corpus_with_fallbacks(base: &Path, tag: &str, qs: &[&str], falls_back: &dyn F
     for (i, q) in off.iter().enumerate() {
         let h = copy_of(base, &format!("vmj17-{tag}f{i}-h"));
         let o = copy_of(base, &format!("vmj17-{tag}f{i}-o"));
-        let (hr, on_vm, he) = hipp_run(&h, Config::default(), q);
+        let (hr, on_vm, he) = hipp_run(&h, Config::default().vm_strict(false), q);
         let or = pin_run(&o, q);
         if on_vm && he.is_none() {
             bad.push(format!("now on the VM (claim it): {q}"));
@@ -840,11 +840,9 @@ fn reused_suites_run_strict_on_the_vm() {
     corpus_with_fallbacks(&pin_file("rm", AGG_MIX), "rm", AGG_MIX_Q, &none);
     corpus_with_fallbacks(&pin_file("rf", AGG_FIN), "rf", AGG_FIN_Q, &none);
     corpus_with_fallbacks(&pin_file("rs", "SELECT 1;"), "rsep", AGG_SEP_Q, &none);
-    // (WITHOUT ROWID sources and `sqlite_schema` fall back until unit
-    // vm_rest.)
-    let later =
-        |q: &str| q.contains("FROM w") || q.contains("JOIN w ") || q.contains("sqlite_schema");
-    corpus_with_fallbacks(&pin_file("re", EQP_S), "re", EQP_Q, &later);
+    // (WITHOUT ROWID sources and `sqlite_schema` run on the VM since
+    // unit vm_rest.)
+    corpus_with_fallbacks(&pin_file("re", EQP_S), "re", EQP_Q, &none);
 }
 
 const AGG_T_Q: &[&str] = &[

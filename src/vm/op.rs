@@ -343,6 +343,11 @@ pub(crate) enum Code {
     /// shared materialization).
     #[cfg(feature = "sql")]
     EphCopy,
+    /// Row list `p1`'s rows: column `p2`'s integers become reals (a
+    /// FROM subquery's REAL column, `SubPlan::real_cols`; the pin's
+    /// `OP_RealAffinity`).
+    #[cfg(feature = "sql")]
+    EphReal,
     /// Row list `p1` to row `p3` (a register); jump to `p2` past its
     /// end (a growing first source read on from where it was).
     #[cfg(feature = "sql")]
@@ -409,6 +414,86 @@ pub(crate) enum Code {
     /// bare-column row.
     #[cfg(feature = "sql")]
     RepStep,
+    // ---- virtual, table-valued and host-read sources (unit
+    // `vm_rest`; ADR: VOpen / VFilter / VColumn / VNext / VRowid,
+    // driver-awaited) ----
+    /// Driver-awaited (`Exec::Call`): row list `p1` = the rows of the
+    /// source `P4::Src` `p4` names, read by today's async source
+    /// reader for its kind (`p5`: `HOST_SCAN`, `HOST_ACCESS`,
+    /// `HOST_AUTO`, `HOST_TVF`) over the joined row so far, at most
+    /// the rows in register `p3 - 1` (`p3` 0: no bound; −1 in the
+    /// register: none). A lateral table-valued source whose
+    /// pre-check fails (`lateral_ok`) jumps to `p2` with no rows.
+    #[cfg(feature = "sql")]
+    HostRows,
+    /// Driver-awaited: open host cursor `p1` on the source `P4::Src`
+    /// `p4` (`p5`: `HOST_VT`, a virtual table's xFilter; `HOST_SCAN`,
+    /// a WITHOUT ROWID table's clustered tree), bound and pre-check
+    /// as `HostRows`.
+    #[cfg(feature = "sql")]
+    #[cfg_attr(
+        not(any(feature = "vtab", feature = "without_rowid")),
+        allow(dead_code)
+    )]
+    HostOpen,
+    /// Driver-awaited: host cursor `p1` to its next row (xColumn /
+    /// xRowid, then xNext; `p5` 1: the first row after `HostOpen`,
+    /// jumping to `p2` when there is none; else jumping to `p2` when
+    /// there is one). `p3`: whether a generate_series cursor counts
+    /// its rows against `Config::max_vtab_rows` (0 never, 1 always,
+    /// `2 + r` while register `r`, the LIMIT, is negative).
+    #[cfg(feature = "sql")]
+    #[cfg_attr(
+        not(any(feature = "vtab", feature = "without_rowid")),
+        allow(dead_code)
+    )]
+    HostNext,
+    /// Put back the joined-row values a lateral table-valued call of
+    /// cursor `p1` cleared (`SourcePlan::tvf_dead`) when its loop
+    /// ends.
+    #[cfg(feature = "sql")]
+    #[cfg_attr(not(any(feature = "json", feature = "vtab")), allow(dead_code))]
+    Restore,
+    /// Registers `p1`, `p1 + 1` = the side tables' lengths
+    /// (`Env::json_docs`, `Env::fts_rows`).
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    SideMark,
+    /// Drop the side-table entries past the lengths in registers
+    /// `p1`, `p1 + 1`, but none below the pinned lengths (what a
+    /// loop that ended, or a row that was dealt with, added).
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    SideDrop,
+    /// Pin the side tables' entries so far (a row list, group or
+    /// bare-column row may point into them).
+    #[cfg(any(feature = "json", feature = "fts5"))]
+    SidePin,
+    // ---- window functions (unit `vm_rest`; ADR: AggInverse /
+    // AggValue + frame ops over `window.rs`) ----
+    /// Open window set `p1` for the calls `P4::Win` `p4`.
+    #[cfg(feature = "window")]
+    WinOpen,
+    /// Keep the joined row in window set `p1` (an input row of a
+    /// query without aggregates).
+    #[cfg(feature = "window")]
+    WinRow,
+    /// The joined row = window set `p1`'s next kept row; jump to `p2`
+    /// past the last (`p5` 1: from the first).
+    #[cfg(feature = "window")]
+    WinLoad,
+    /// One unit of window set `p1`: the calls' children's values in
+    /// registers `p2 ..`; its row is the last one `WinLoad` gave, or
+    /// (`p3` > 0) group set `p3 - 1`'s current group.
+    #[cfg(feature = "window")]
+    WinAdd,
+    /// Compute window set `p1`'s windows (`window::compute`).
+    #[cfg(feature = "window")]
+    WinCompute,
+    /// Window set `p1`'s next unit in window order (`p5` 1: the
+    /// first): its values for `EVAL_WIN`, its row in the joined row
+    /// or its group current in group set `p3 - 1`; jump to `p2` past
+    /// the last.
+    #[cfg(feature = "window")]
+    WinNext,
 }
 
 /// `ResultRow` / `SorterInsert` `p3`: the rowid is the joined row's
@@ -421,8 +506,34 @@ pub(crate) const EVAL_ACC: u8 = 4;
 /// (`GroupNext`; aggregates fold its rows).
 pub(crate) const EVAL_GROUP: u8 = 8;
 
+/// `Code::Eval` `p5` flag: the expression is a window template whose
+/// calls take the current window unit's values first (`window::fill`).
+#[cfg(feature = "window")]
+pub(crate) const EVAL_WIN: u8 = 32;
+
+/// `HostRows` / `HostOpen` `p5`: the source's table rows (a TEMP or
+/// attached table, a WITHOUT ROWID table's clustered tree).
+#[cfg(feature = "sql")]
+pub(crate) const HOST_SCAN: u8 = 0;
+/// `HostRows` `p5`: the rows the source's access path finds.
+#[cfg(feature = "expr_index")]
+pub(crate) const HOST_ACCESS: u8 = 1;
+/// `HostRows` `p5`: the table's rows in automatic-index order.
+#[cfg(feature = "planner")]
+pub(crate) const HOST_AUTO: u8 = 2;
+/// `HostRows` `p5`: a table-valued function's or virtual table's rows.
+#[cfg(any(feature = "json", feature = "vtab"))]
+pub(crate) const HOST_TVF: u8 = 3;
+/// `HostOpen` `p5`: a virtual table's cursor (xFilter).
+#[cfg(feature = "vtab")]
+pub(crate) const HOST_VT: u8 = 4;
+
 /// `Code::Host` `p1`: a SELECT on today's executor.
 pub(crate) const HOST_QUERY: u16 = 1;
+/// `Code::Host` `p1`: any other statement on today's executor (an
+/// `EXPLAIN` listing's only instruction).
+#[cfg(feature = "explain")]
+pub(crate) const HOST_STMT: u16 = 2;
 
 /// `Code::Eval` `p5`: the expression's value.
 pub(crate) const EVAL_VALUE: u8 = 0;
@@ -476,6 +587,30 @@ pub(crate) enum P4 {
     /// A recursive CTE's queue order and UNION collations.
     #[cfg(feature = "sql")]
     Queue(alloc::boxed::Box<QueueInfo>),
+    /// A source a driver-awaited opcode reads (`HostRows` /
+    /// `HostOpen` / `HostNext`).
+    #[cfg(feature = "sql")]
+    Src(alloc::boxed::Box<SrcInfo>),
+    /// A query's window calls (`WinOpen`).
+    #[cfg(feature = "window")]
+    Win(AVec<RExpr>),
+}
+
+/// A source read by the driver (`P4::Src`): source `d` of the
+/// `P4::Plan` entry `plan`, whose values start at slot `base` and
+/// whose rowid is the joined row's `src`th.
+#[cfg(feature = "sql")]
+pub(crate) struct SrcInfo {
+    pub(crate) plan: u32,
+    pub(crate) d: usize,
+    pub(crate) base: usize,
+    pub(crate) src: usize,
+    /// A generate_series cursor is read to its end when it opens
+    /// (`vtab::drain`, under `Config::max_vtab_rows` and the reader's
+    /// bound), as today's materialising executor reads it: every
+    /// core except a top-level query today's executor streams
+    /// (`G::streamed`; a trigger program's too, checked when it runs).
+    pub(crate) drain: bool,
 }
 
 /// An expression whose subquery nodes read slots (`P4::SubExpr`): the
@@ -532,6 +667,189 @@ pub(crate) struct CompInfo {
 pub(crate) struct QueueInfo {
     pub(crate) order: AVec<(usize, crate::sql::SortOrder)>,
     pub(crate) union: Option<AVec<crate::record::Coll>>,
+}
+
+/// Whether `code`'s `p4` indexes the side table (else it is a small
+/// constant, a register or unused).
+#[cfg(feature = "explain")]
+fn p4_is_entry(code: Code) -> bool {
+    !matches!(
+        code,
+        Code::Init
+            | Code::Goto
+            | Code::Halt
+            | Code::Host
+            | Code::If
+            | Code::IfNot
+            | Code::IfPos
+            | Code::DecrJumpZero
+            | Code::Copy
+            | Code::MustBeInt
+            | Code::Rewind
+            | Code::Next
+            | Code::SeekRowid
+            | Code::Column
+            | Code::Rowid
+            | Code::SorterInsert
+            | Code::SorterSort
+            | Code::SorterData
+            | Code::SorterNext
+            | Code::ResultRow
+            | Code::Integer
+            | Code::Once
+            | Code::Load
+            | Code::NullRow
+            | Code::EphOpen
+            | Code::EphRewind
+            | Code::EphNext
+            | Code::EphAdd
+            | Code::EphMatch
+            | Code::AggStep
+            | Code::GroupAdd
+            | Code::GroupSort
+            | Code::GroupNext
+    ) && !p4_is_value(code)
+}
+
+/// The opcodes (past `p4_is_entry`'s list) whose `p4` is a count or a
+/// register, not a side-table entry.
+#[cfg(feature = "explain")]
+fn p4_is_value(code: Code) -> bool {
+    #[cfg(feature = "expr_index")]
+    if matches!(code, Code::IdxSeek) {
+        return true;
+    }
+    #[cfg(feature = "sql")]
+    if matches!(
+        code,
+        Code::Need | Code::MatTest | Code::MatDone | Code::Grow | Code::Gosub | Code::Return
+    ) {
+        return true;
+    }
+    let _ = code;
+    false
+}
+
+/// A short description of side-table entry `e` (an EXPLAIN listing's
+/// `p4`).
+#[cfg(feature = "explain")]
+fn describe(e: &P4, out: &mut alloc::string::String) {
+    use core::fmt::Write;
+    let _ = match e {
+        P4::Value(v) => match v {
+            OwnedValue::Null => write!(out, "NULL"),
+            OwnedValue::Integer(i) => write!(out, "{i}"),
+            OwnedValue::Real(f) => {
+                let mut b = AVec::new();
+                crate::record::render_real(*f, &mut b);
+                write!(
+                    out,
+                    "{}",
+                    alloc::string::String::from_utf8_lossy(b.as_slice())
+                )
+            }
+            OwnedValue::Text(t) => write!(
+                out,
+                "{}",
+                alloc::string::String::from_utf8_lossy(t.as_slice())
+            ),
+            OwnedValue::Blob(b) => {
+                let _ = write!(out, "x'");
+                for x in b.iter() {
+                    let _ = write!(out, "{x:02x}");
+                }
+                write!(out, "'")
+            }
+        },
+        P4::Expr(_) => write!(out, "expr"),
+        #[cfg(feature = "expr_index")]
+        P4::Aff(a) => write!(out, "affinity {a:?}"),
+        P4::Table(t) => write!(out, "table root={} ncols={}", t.root, t.ncols),
+        P4::Sorter(s) => write!(out, "sorter keys={} out={}", s.orders.len(), s.nout),
+        P4::Plan(_) => write!(out, "plan"),
+        P4::Colls(c) => write!(out, "colls n={}", c.len()),
+        #[cfg(feature = "expr_index")]
+        P4::Index(i) => write!(out, "index root={}", i.root),
+        #[cfg(feature = "expr_index")]
+        P4::Walk(_) => write!(out, "walk"),
+        #[cfg(feature = "expr_index")]
+        P4::Probe(_) => write!(out, "probe"),
+        #[cfg(feature = "expr_index")]
+        P4::Cover(_) => write!(out, "cover"),
+        #[cfg(feature = "planner")]
+        P4::Auto(_) => write!(out, "autoindex"),
+        #[cfg(feature = "planner")]
+        P4::BKeys(k) => write!(out, "bloom keys={}", k.len()),
+        #[cfg(feature = "sql")]
+        P4::SubExpr(x) => write!(out, "expr subqueries={}", x.slots.len()),
+        #[cfg(feature = "sql")]
+        P4::Sub(_) => write!(out, "subquery"),
+        #[cfg(feature = "sql")]
+        P4::Comp(c) => write!(out, "compound cores={}", c.cores.len()),
+        #[cfg(feature = "sql")]
+        P4::Queue(_) => write!(out, "queue"),
+        #[cfg(feature = "sql")]
+        P4::Src(s) => write!(out, "source {}", s.d),
+        #[cfg(feature = "window")]
+        P4::Win(w) => write!(out, "windows n={}", w.len()),
+    };
+}
+
+/// A program's listing in the pin's EXPLAIN columns (`addr`, `opcode`,
+/// `p1`, `p2`, `p3`, `p4`, `p5`, `comment`), one row per instruction:
+/// the generic formatter ADR 0005 §"Program representation" calls
+/// for. `p4` is the side-table entry an instruction names, described
+/// (`describe`), else its value when it is not 0, else NULL; the
+/// comment is the pin's "Start at N" on `Init`, NULL elsewhere.
+#[cfg(feature = "explain")]
+pub(crate) fn listing(prog: &super::Program) -> AVec<AVec<OwnedValue>> {
+    use core::fmt::Write;
+    let mut rows = AVec::with_capacity(prog.ops.len());
+    for (addr, op) in prog.ops.iter().enumerate() {
+        let mut name = alloc::string::String::new();
+        let _ = write!(name, "{:?}", op.code);
+        let p4 = if p4_is_entry(op.code) {
+            match p4_at(&prog.p4, op.p4) {
+                Some(e) => {
+                    let mut d = alloc::string::String::new();
+                    describe(e, &mut d);
+                    OwnedValue::Text(text(d))
+                }
+                None => OwnedValue::Null,
+            }
+        } else if op.p4 != 0 {
+            let mut d = alloc::string::String::new();
+            let _ = write!(d, "{}", op.p4);
+            OwnedValue::Text(text(d))
+        } else {
+            OwnedValue::Null
+        };
+        let comment = if op.code == Code::Init {
+            let mut d = alloc::string::String::new();
+            let _ = write!(d, "Start at {}", op.p2);
+            OwnedValue::Text(text(d))
+        } else {
+            OwnedValue::Null
+        };
+        let mut r = AVec::with_capacity(8);
+        r.push(OwnedValue::Integer(addr as i64));
+        r.push(OwnedValue::Text(text(name)));
+        r.push(OwnedValue::Integer(i64::from(op.p1)));
+        r.push(OwnedValue::Integer(i64::from(op.p2)));
+        r.push(OwnedValue::Integer(i64::from(op.p3)));
+        r.push(p4);
+        r.push(OwnedValue::Integer(i64::from(op.p5)));
+        r.push(comment);
+        rows.push(r);
+    }
+    rows
+}
+
+#[cfg(feature = "explain")]
+fn text(s: alloc::string::String) -> AVec<u8> {
+    let mut v = AVec::with_capacity(s.len());
+    v.extend_from_slice(s.as_bytes());
+    v
 }
 
 /// The side table entries as a slice-indexed lookup that never
