@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 478,020 B | 512 KiB |
+| `full` | `--no-default-features --features full` | 478,212 B | 512 KiB |
 | `max` | `--no-default-features --features max` | 964,684 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,061,416 B | 1.25 MiB |
+| `xl` | `--no-default-features --features xl` | 1,061,344 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -301,6 +301,17 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   combined flip 43 / 116 / 127 KB over the ratchets: the verdict is
   stop, and the next step is an owner decision. No shipped profile
   changes (STATUS.md has the figures).
+- **Table-valued functions beside TEMP tables** (fix; the sync
+  readers themselves were not built, as the probe's verdict says). A
+  TEMP write or a query over temp tables reading `generate_series`,
+  `dbstat` or a pragma function now runs as on the pin: INSERT ...
+  SELECT, UPDATE / DELETE with subqueries, CREATE TEMP TABLE ... AS
+  and TEMP views over `generate_series` failed (`UnknownFunction`),
+  `dbstat` ones too (`UnknownTable`), and one reading
+  `pragma_table_info('main_table')` silently read nothing. A temp
+  UPDATE / DELETE reading `dbstat` or a pragma function naming a
+  main table is refused, as one reading main tables is. No profile
+  grows (the routing code it touches got smaller).
 
 ## What v0.16 does
 

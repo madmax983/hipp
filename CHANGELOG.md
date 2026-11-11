@@ -5,6 +5,25 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Table-valued functions beside TEMP tables (wave 15, `sync_readers` review fix)
+
+- The sync source readers (unit `sync_readers`) were not built:
+  `s3_probe`'s verdict is stop.
+- Fix (ungated, `sql`; `generate_series` / `dbstat` with `vtab`): a
+  TEMP write (INSERT ... SELECT, UPDATE / DELETE / INSERT VALUES with a
+  subquery, CREATE TEMP TABLE ... AS, a CTE feeding the INSERT), a
+  query over temp tables or a TEMP view reading `generate_series`
+  failed with `UnknownFunction` (`dbstat`: `UnknownTable`); one
+  reading a pragma function that names a main table
+  (`pragma_table_info('m')`) read nothing. The temp database now
+  computes `generate_series`; `dbstat` and pragma functions are
+  main's (but for a pragma function whose lone argument names a temp
+  object). A temp UPDATE / DELETE / INSERT VALUES reading `dbstat` or
+  such a pragma function is refused (`Unsupported`), as one reading
+  main tables is.
+- Sizes: tiny 76,952 (0), full 478,212 (-8), max 964,684 (-24), xl
+  1,061,344 (-88); ratchets lowered.
+
 ### The bytecode VM: Stage 3 measured first, verdict stop (wave 15, unit `s3_probe`)
 
 - `ci/flip_probe.sh --s3` (`--cfg hipp_s3_probe` with the hidden `vm`

@@ -11,6 +11,97 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### ADR 0005 Stage 3: sync_readers — not built (verdict stop); review fix: table-valued functions beside TEMP tables (2026-11-11)
+
+Wave 15's second unit. **Not built:** `s3_probe`'s verdict (below) is
+STOP in full, max and xl, so the sync restartable source readers, and
+with them `ci/flip_probe.sh` / `--s3` before-and-after figures, do not
+exist; the unit's spec says to commit nothing then. Its review found
+one pre-existing divergence in the source readers it would have
+rewritten, fixed here ungated (a refusal and a silent wrong answer on
+claimed paths), with no shipped profile growing.
+
+**Fixed.** hipp's temp database is a second, private connection, and
+a statement over temp objects only runs there. That connection knew
+no table-valued function main resolves:
+- A TEMP write reading `generate_series` (INSERT ... SELECT, UPDATE
+  SET (subquery), DELETE ... IN (subquery), INSERT VALUES((subquery)),
+  CREATE TEMP TABLE ... AS, a CTE feeding the INSERT), a query
+  joining temp tables to it, and a TEMP view over it failed
+  (`UnknownFunction`); the pin runs them. The temp database now
+  computes `generate_series` itself (`plan_vtab_source`: it reads no
+  file).
+- The same with `dbstat` failed (`UnknownTable`). `dbstat` describes
+  main's file, so it now counts as reading main (`temp::eponymous`):
+  a query runs on main (reading the temp tables there), INSERT ...
+  SELECT and CREATE TEMP TABLE ... AS are fed from main.
+- A pragma function naming a main table (`INSERT INTO tt SELECT name
+  FROM pragma_table_info('m')`, a TEMP view over it, a query over
+  temp tables joined to it) **read nothing** (the temp database has no
+  `m`). A pragma function now reads main (`func_reads_main`), unless
+  its lone argument is a string naming a temp object: the pin looks
+  in temp first, so the temp database still answers that one (an
+  UPDATE of a temp table reading `pragma_table_info('tt')` keeps
+  working).
+- A `main.`-qualified table-valued function (`main.generate_series(1,2)`)
+  reads main (it failed in a TEMP write).
+The PRAGMA / REINDEX / ANALYZE routing's two copies of the `temp.`
+cut became one (`apply_cuts`; the copies also indexed the text
+unchecked), and `temp_taken` replaces five `temp_has(n, false) ||
+temp_has(n, true)` pairs (and a redundant `find_view` in the
+attached-database pragma lookup): that pays for the fix.
+
+**Oracle probing** (the pin, live, 3.54.1, and hipp with and without
+`--features hipp/vm`): the review's six repros; every TEMP write
+shape over `generate_series`, `dbstat`, `pragma_table_info` /
+`pragma_index_list` naming main and temp objects; TEMP views over
+each; a temp table named `generate_series` shadowing the module and
+dropped again; json_each beside temp tables (unchanged). The pin
+accepts `temp.generate_series(1,2)` and `x IN generate_series(1,2)`
+(below).
+
+**Tests.** `tests/temp_tvf_v17.rs`: rows, failing statements and the
+pin's dump and integrity check of both files, live vs the pin —
+every write shape over `generate_series` (bounds, zero / NULL steps,
+too many arguments, RETURNING, upsert, ORDER BY, LIMIT, `main.`),
+`dbstat` (also over an empty main: the review's last repro), pragma
+functions naming main and temp objects, TEMP views and shadowing, a
+generated corpus (hand-rolled xorshift, 6 rounds x 14 statements of
+TEMP writes and joins over random bounds and steps), and
+`refusals_stay_refusals` (a temp UPDATE / DELETE / INSERT VALUES
+reading `dbstat` or a pragma function naming main is `Unsupported`,
+as for main tables). Each of its six tests fails on the base
+commit.
+`hipp-cli/tests/cli_v17_temp_tvf.rs`: one script byte-identical to
+the pin over stdin and one-shot. Also green with `--features vm` and
+in the strict whole-suite run.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (its `--features vm` workspace suite included); the strict
+whole-suite run (`RUSTFLAGS="--cfg hipp_vm_strict" cargo test
+--workspace --no-fail-fast --features vm`): 1,207 passed, 0 failed.
+No recursive or async-nested path changed (routing is a flat token
+scan), so no depth re-measure.
+
+**Size Δ** (shipped profiles, measured): tiny 0 (76,952), full -8
+(478,212), max -24 (964,684), xl -88 (1,061,344); the full / max /
+xl ratchets are lowered to these.
+
+**Honest gaps.**
+- A temp UPDATE / DELETE / INSERT VALUES (or INSERT ... SELECT with
+  a leading WITH, an upsert or RETURNING) reading `dbstat`, or a
+  pragma function that names a main object (or whose argument is not
+  a lone string literal), stays refused (`Unsupported`), as one
+  reading main tables does (the v0.16 TEMP gap): only a whole SELECT
+  is fed across.
+- `temp.generate_series(...)`, `temp.dbstat` and `temp.pragma_*(...)`
+  stay refused (`Unsupported`); the pin resolves them.
+- `x IN generate_series(1,2)` (a table-valued function as IN's right
+  operand, without a SELECT) is a parse error in hipp in every
+  database (`TrailingInput`); pre-existing, not TEMP-specific.
+- The sync readers themselves (the unit's subject) stay unbuilt
+  until the owner decides on `s3_probe`'s figures.
+
 ### ADR 0005 Stage 3: s3_probe (2026-11-11)
 
 Wave 15's first unit (owner decision 2026-11-11: do Stage 3 first,

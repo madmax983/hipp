@@ -1619,14 +1619,10 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             let att = match (&schema, &arg) {
                 (Some(s), _) => self.att_index(s.as_slice()),
                 (None, Some(a)) if prag != Prag::TableList && !self.attached.is_empty() => {
-                    let elsewhere = self.temp_has(a.as_slice(), false)
-                        || self.temp_has(a.as_slice(), true)
+                    // (`main_has` counts views.)
+                    let elsewhere = self.temp_taken(a.as_slice())
                         || self.main_has(a.as_slice(), false)
-                        || self.main_has(a.as_slice(), true)
-                        || self
-                            .catalog
-                            .find_view(&self.catalog_arena, a.as_slice())
-                            .is_some();
+                        || self.main_has(a.as_slice(), true);
                     if elsewhere {
                         None
                     } else {
@@ -1681,9 +1677,7 @@ CAST(NULL AS TEXT) AS tbl_name, CAST(NULL AS INT) AS rootpage, CAST(NULL AS TEXT
             && !self.is_temp
             && match (&schema, &arg) {
                 (Some(_), Some(_)) => temp,
-                (None, Some(a)) => {
-                    self.temp_has(a.as_slice(), false) || self.temp_has(a.as_slice(), true)
-                }
+                (None, Some(a)) => self.temp_taken(a.as_slice()),
                 _ => false,
             };
         let rows = if in_temp {

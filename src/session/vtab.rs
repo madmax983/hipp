@@ -358,7 +358,11 @@ impl<S: Storage> Connection<S> {
         plans: &mut AVec<SourcePlan>,
     ) -> Result<Option<usize>, S::Error> {
         let n = handle_bytes(arena, s.table);
-        if self.is_temp {
+        // The temp database has no virtual tables of its own; it
+        // computes `generate_series` (v0.17 review fix: a TEMP write
+        // reading one failed), and main answers `dbstat`
+        // (`temp::eponymous`).
+        if self.is_temp && !eq_ci(n, b"generate_series") {
             return Ok(None);
         }
         #[cfg(feature = "attach")]
