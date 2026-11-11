@@ -367,9 +367,12 @@ pub(super) struct G<'p, 'b> {
     pub(super) wflag: u8,
     /// The statement's own core reads no table: its one row satisfies
     /// the ORDER BY, whose terms are then never computed (the pin's
-    /// loop over no table; today's executor for a subquery-free,
-    /// non-DISTINCT, non-aggregate query). Unit `vm_core`'s separate
-    /// single-table generator carried this rule until `vm_shrink`.
+    /// loop over no table, a subquery anywhere in the statement
+    /// notwithstanding). Today's executor computes them (and fails
+    /// where a term does). Unit `vm_core`'s separate single-table
+    /// generator carried this rule, for subquery-free statements only,
+    /// until `vm_shrink`; a DISTINCT core and a nested query's own
+    /// ORDER BY still compute their terms (a recorded gap).
     free_order: bool,
 }
 

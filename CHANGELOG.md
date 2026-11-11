@@ -42,7 +42,11 @@ All notable changes to hipp. Versions follow the milestones in
 - One code generator for query plans: `vm_core`'s single-table
   generator is gone, the join generator compiles every SELECT plan
   (it now also leaves a FROM-less statement's ORDER BY terms
-  uncomputed, as today's executor and the pin do); the builder's
+  uncomputed, as the pin does and the removed generator did; today's
+  executor computes them and fails where a term does). With a
+  subquery anywhere in such a statement the VM now answers as the
+  pin, where base 5b67982's VM raised the term's error (vm-only;
+  tests in `tests/vm_v17.rs`). The builder's
   common calls stay out of line; the driver awaits its row-list
   readers through one boxed future. The probe: full 512,764 →
   494,336 B, max 1,017,176 → 1,010,744 B, xl 1,121,556 → 1,114,204

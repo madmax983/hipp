@@ -388,6 +388,39 @@ fn claimed_shapes_match_the_pin() {
     corpus(&base, "ok", &strict(), OK);
 }
 
+/// FROM-less statements with a subquery somewhere and an ORDER BY term
+/// that would fail (unit `vm_shrink` review): the pin's loop over no
+/// table satisfies the ORDER BY, so its terms are never computed, a
+/// subquery anywhere in the statement or in the term itself
+/// notwithstanding. A deliberate change from base 5b67982, where the
+/// removed single-table generator refused every subquery and the join
+/// generator computed the terms (`IntegerOverflow`, as today's
+/// executor still does for every row of this list).
+#[cfg(feature = "sql")]
+const FREE_ORDER_SUBQUERIES: &[&str] = &[
+    "SELECT 1 ORDER BY (SELECT abs(-9223372036854775808));",
+    "SELECT 1 ORDER BY (SELECT 1/0), abs(-9223372036854775808);",
+    "SELECT 1 WHERE (SELECT 1) ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 WHERE EXISTS (SELECT 1) ORDER BY abs(-9223372036854775808);",
+    "SELECT (SELECT 2) ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 ORDER BY abs(-9223372036854775808) LIMIT (SELECT 1);",
+    "SELECT 1 IN (SELECT 1) ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 ORDER BY 1 IN (SELECT abs(-9223372036854775808));",
+    "SELECT 1 WHERE 0 ORDER BY (SELECT abs(-9223372036854775808));",
+    "SELECT 1 ORDER BY (SELECT 2) LIMIT 1 OFFSET (SELECT 1);",
+    "SELECT 1 ORDER BY (SELECT abs(-9223372036854775808)) LIMIT 1 OFFSET (SELECT 0);",
+    "WITH c AS (SELECT 1) SELECT 1 ORDER BY abs(-9223372036854775808);",
+    "SELECT 1 LIMIT 0 OFFSET abs(-9223372036854775808);",
+    "SELECT 1, 2 ORDER BY 2 DESC, abs(-9223372036854775808);",
+];
+
+#[cfg(feature = "sql")]
+#[test]
+fn from_less_order_by_terms_stay_uncomputed_with_subqueries() {
+    let base = pin_t("t-free-sub");
+    corpus(&base, "free-sub", &strict(), FREE_ORDER_SUBQUERIES);
+}
+
 #[test]
 fn row_errors_come_after_the_rows_before_them() {
     let base = pin_t("t-err");

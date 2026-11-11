@@ -11,6 +11,73 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_shrink — review fixes (2026-11-11)
+
+Fixes to unit `vm_shrink` (below); test and documentation only, no
+code path or profile changes.
+
+**Fixed.**
+- **An untested VM behaviour change.** Removing the single-table
+  generator and adding `G::free_order` changed what the VM answers for
+  a FROM-less statement with a subquery anywhere in it and an ORDER BY
+  term that would fail (`SELECT 1 ORDER BY (SELECT
+  abs(-9223372036854775808))`, `SELECT (SELECT 2) ORDER BY abs(..)`,
+  `SELECT 1 WHERE EXISTS (SELECT 1) ORDER BY abs(..)`, `... LIMIT
+  (SELECT 1)`): base 5b67982's VM raised `IntegerOverflow` (the removed
+  generator refused every subquery, and the join generator computed
+  the terms); c2914be's answers the pin's row. Kept, since it is the
+  pin's answer, and recorded as a deliberate vm-only change; the VM
+  has no shipped profile. `tests/vm_v17.rs`
+  `from_less_order_by_terms_stay_uncomputed_with_subqueries`: 14
+  statements (subqueries in the ORDER BY term, the result columns,
+  WHERE, LIMIT / OFFSET, IN, a CTE; `LIMIT 0 OFFSET <overflow>`;
+  a result-column ORDER BY next to an overflowing one) on the strict
+  VM, compared with the pin. It fails at 5b67982.
+- **Docs said today's executor skips a FROM-less ORDER BY.** It does
+  not: today's executor (the default CLI, and the `full` / `sql`
+  profiles through the API) computes the terms and fails, the plain
+  top-level statement included. The `G::free_order` comment,
+  CHANGELOG and the vm_shrink oracle-probing, step-3 and honest-gap
+  text below are corrected (c2914be's commit message keeps the wrong
+  wording; it is not amended).
+
+**Oracle probing** (the pin, live, 20 FROM-less statements against
+the strict VM CLI and the default CLI): the pin never computes the
+terms (one compound, `SELECT 1 UNION ALL SELECT 2 ORDER BY abs(..)`,
+fails at prepare on the pin and hipp alike); the strict VM matches it
+except for `SELECT DISTINCT 1 ORDER BY abs(..)`, `SELECT (SELECT 1
+ORDER BY abs(..))` and `SELECT * FROM (SELECT 1 ORDER BY abs(..))`;
+the default CLI fails on every statement with an overflowing term
+except `SELECT count(*) ORDER BY abs(..)` (a one-row aggregate drops
+its ORDER BY) and `SELECT 1 WHERE 0 ORDER BY (SELECT abs(..))`.
+
+**Not changed (pre-existing, every build, outside this unit).**
+The review's generated fuzzing (about 2,400 single-table, FROM-less
+and rowid-access queries) found no difference between 5b67982 and
+c2914be, and four pin divergences shared by every hipp build, VM and
+today's executor alike, reproduced here and tracked for a parity
+unit (fixing them changes shipped profiles, which a size unit may
+not grow):
+- `hex(NULL)` is NULL; the pin returns `''`.
+- `substr` of an empty blob (`substr(x'', 0)`, `substr(x'', 'NULL')`)
+  is `X''`; the pin returns NULL (`substr('', 'a')` is `''` on both).
+- Contradictory rowid constraints next to an overflowing constant
+  term (`WHERE a = 5 AND a < 5 AND abs(-9223372036854775808)`, `a`
+  the rowid): the pin returns no rows without evaluating the
+  constant; hipp fails with `IntegerOverflow`.
+- `INDEXED BY` an index of another table is accepted; the pin fails
+  with "no such index".
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed; `tests/vm_v17.rs` strict (`--cfg hipp_vm_strict`) too.
+
+**Size Δ.** tiny 0 (76,952), full 0 (478,020), max 0 (964,684), xl 0
+(1,061,416); the probe unchanged (a comment and a test).
+
+**Honest gaps.** The three FROM-less shapes above where the VM still
+computes the ORDER BY terms, and today's executor's (vm_shrink's
+honest gaps); the four evaluator divergences above.
+
 ### VM (ADR 0005 Stage 2): vm_flip retry — not taken; review fixes (2026-11-11)
 
 Wave 14's second unit was to make the VM the only SELECT path, delete
@@ -318,8 +385,13 @@ today's executor's rules), so the single-table one is gone (with
 program. Running the vm suites on it found one difference, now kept
 in the join generator (`G::free_order`): a FROM-less statement's
 ORDER BY terms are never computed (`SELECT 1 ORDER BY
-abs(-9223372036854775808)` answers 1, as on the pin and today's
-executor; the join generator raised the overflow). Plain EXPLAIN
+abs(-9223372036854775808)` answers 1, as on the pin and as the
+removed generator did; the join generator raised the overflow, and
+today's executor still does — corrected by the review fixes above).
+The rule is wider than the removed generator's: that one refused
+every statement with a subquery, so those went to the join generator
+and failed; with `free_order` they answer as the pin (a vm-only
+behaviour change, tested since the review fixes). Plain EXPLAIN
 lists the join generator's program for those statements now (its
 golden in `tests/vm_rest_v17.rs` updated: hipp's own listing, the
 pin's shape unchanged).
@@ -399,12 +471,15 @@ evaluated by the pin at any level (`SELECT 1 ORDER BY
 abs(-9223372036854775808)`, the same in a scalar / IN subquery, a FROM
 subquery, a CTE, with DISTINCT, with a subquery term: all answer 1;
 `... LIMIT 0` returns nothing, `... GROUP BY 1 ORDER BY abs(..)`
-fails with "integer overflow"); today's executor skips it only at
-the top level, without DISTINCT or a subquery term (the others fail
-with `IntegerOverflow`: a pre-existing gap of every profile with
-`sql`, recorded below, not changed here). The VM keeps today's rule
-(`free_order` for the plain statement; a top-level aggregate's one
-group already went through the join generator and is unchanged).
+fails with "integer overflow"); today's executor computes the terms
+in every one of these shapes, the plain top-level statement included,
+and fails with `IntegerOverflow` (corrected by the review fixes
+above: a pre-existing gap of every profile with `sql`, recorded
+below, not changed here). The VM keeps the removed generator's rule,
+which is the pin's (`free_order`: the statement's own core, with or
+without a subquery anywhere in it, not DISTINCT; a top-level
+aggregate's one group already went through the join generator and is
+unchanged).
 
 **Tests.** `tests/vm_v17.rs`' claimed corpus +5 FROM-less ORDER BY
 queries (the regression; also run at the smallest page cache by
@@ -438,12 +513,19 @@ or a `cfg(vm)` shape; no ratchet moved.
   Stage 3 deleting the async readers and the write executors' own
   row loops in the same step).
 - Sync restartable source readers were not built (above).
-- Pre-existing, every profile with `sql` (today's executor, not the
-  VM's): a FROM-less query's ORDER BY terms are computed in
-  subqueries, FROM subqueries / CTEs, with DISTINCT and with a
-  subquery term, where the pin never computes them (`SELECT DISTINCT 1
-  ORDER BY abs(-9223372036854775808)` fails with `IntegerOverflow`,
-  the pin answers 1). The VM matches today's executor there.
+- Pre-existing, every profile with `sql` (today's executor): a
+  FROM-less query's ORDER BY terms are computed wherever they appear
+  (the plain top-level `SELECT 1 ORDER BY abs(-9223372036854775808)`,
+  `SELECT 1 LIMIT 0 OFFSET abs(-9223372036854775808)`, `SELECT 1, 2
+  ORDER BY 2 DESC, abs(-9223372036854775808)`, in subqueries, FROM
+  subqueries / CTEs, with DISTINCT, with a subquery term), where the
+  pin never computes them: they fail with `IntegerOverflow`, the pin
+  answers the row (or nothing for LIMIT 0). The VM answers as the pin
+  for the statement's own non-DISTINCT core (subqueries anywhere in
+  it included) and still fails, as today's executor, for a DISTINCT
+  core and a nested query's own ORDER BY (`SELECT DISTINCT 1 ORDER BY
+  ...`, `SELECT (SELECT 1 ORDER BY ...)`, `SELECT * FROM (SELECT 1
+  ORDER BY ...)`).
 - The probe's figures depend on LTO's inlining: single changes of a
   few hundred bytes moved profiles in opposite directions (the
   "tried and dropped" list); the table is the measured sequence.
