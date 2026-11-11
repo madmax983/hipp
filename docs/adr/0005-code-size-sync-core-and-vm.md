@@ -477,6 +477,30 @@ opcode dispatch, the driver future, sync source readers) before the
 flip. Compiling the evaluator once for `Error<()>` in every VM build
 measured about −14 KB in full on its own.
 
+*Amendment (unit `vm_shrink`, wave 14, 2026-11-11): shrink first,
+measured.* The flip's best case is now a committed, reproducible
+probe (`ci/flip_probe.sh`: `vm` + `--cfg hipp_flip_probe`, cutting
+the legacy read executor at wave 13's cut points; build-only). The
+levers taken — the evaluator compiled once for `Error<()>` under
+`vm`, one code generator for query plans (`vm_core`'s single-table
+generator removed; the join generator covers its shapes), the
+builder's common calls kept out of line so operands pass in
+registers, one await for the driver's row-list readers — moved the
+probe from 512,764 / 1,017,176 / 1,121,556 B to 494,336 / 1,010,744
+/ 1,114,204 B (full / max / xl): still +16,548 / +46,668 / +53,060
+over the ratchets, 20.6 / 50.8 / 57.2 KB short of the unit's
+"4 KB under every ratchet" target. Splitting or outlining the
+dispatch, outlining accessors and re-typing the record decoder
+measured larger and were dropped; sync restartable copies of the
+async source readers (31-35 KB in max / xl, shared with the write
+paths) would add bytes until Stage 3 removes the async ones. The VM
+(codegen, dispatch, cursors, driver: about 41 / 65 / 69 KB) stays
+larger than the read executor it replaces (about 27 / 36 KB in full
+/ xl), so a flip under the "every ratchet lower" rule needs either a
+justified re-baseline or Stage 3's deletions (the async readers and
+the write executors' row loops) in the same step. STATUS.md
+("vm_shrink") has the per-symbol inventory and each step's delta.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,

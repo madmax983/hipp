@@ -279,9 +279,12 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   pin reads the min() row; every profile with aggregates).
 - **Shrinking the VM before the flip** (hidden feature `vm`). A
   reproducible flip probe (`ci/flip_probe.sh`) measures what full /
-  max / xl would weigh with the VM as the only SELECT path; the VM's
-  evaluator is compiled once. No shipped profile changes (STATUS.md
-  has the figures and the remaining gap).
+  max / xl would weigh with the VM as the only SELECT path. The VM's
+  evaluator is compiled once, one code generator compiles every
+  SELECT plan and the builder's common calls stay out of line: the
+  probe shrank by 18.4 / 6.4 / 7.4 KB but is still 16.5 / 46.7 /
+  53.1 KB over the full / max / xl ratchets, so the flip stays out of
+  reach. No shipped profile changes (STATUS.md has the figures).
 
 ## What v0.16 does
 

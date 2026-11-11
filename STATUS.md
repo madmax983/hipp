@@ -177,14 +177,146 @@ entry): probe full 512,764 → 498,288 (−14,476); max and xl
 unchanged (−0: `window` already compiles it once); shipped profiles
 unchanged (no shipped profile has `vm`).
 
-**Gates** (this commit). `cargo fmt --all`; full `ci/local-gates.sh`
-(the `--features vm` workspace suite included): all gates passed;
-`tests/depth_v16.rs` and `tests/triggers_v16.rs` with debug info,
-with and without `vm`: pass.
+**Step 3 — one code generator for a query plan.** `vm_core`'s
+single-table generator (`codegen::select::query`) was tried first for
+every `Plan::Query` and `codegen::join::query` for the rest; the join
+generator covers every shape the single-table one did (the same
+loops, WHERE, ORDER BY, LIMIT / OFFSET and rowid access, written to
+today's executor's rules), so the single-table one is gone (with
+`codegen::expr::evaluable` / `cond`, which only it used);
+`codegen::select` keeps the legacy scan plan's (`Plan::Scan`)
+program. Running the vm suites on it found one difference, now kept
+in the join generator (`G::free_order`): a FROM-less statement's
+ORDER BY terms are never computed (`SELECT 1 ORDER BY
+abs(-9223372036854775808)` answers 1, as on the pin and today's
+executor; the join generator raised the overflow). Plain EXPLAIN
+lists the join generator's program for those statements now (its
+golden in `tests/vm_rest_v17.rs` updated: hipp's own listing, the
+pin's shape unchanged).
+
+**Step 4 — the builder's common calls out of line.** Most of the
+generators' 270 `emit` / `jump` calls pass `p3`, `p4`, `p5` as 0;
+they now call `emit2` / `jump_to` (and `emit3` / `jump3` / `emit_p4`)
+kept out of line, so a call passes every operand in registers instead
+of three on the stack; `Builder::here` / `regs` / `cursor`, which LTO
+inlined at every one of their ~100 call sites, are out of line too.
+
+**Step 5 — one await for the row-list readers.** `vm_call` awaits
+the `HostRows` reader (json_each / json_tree / virtual tables, an
+access path, an automatic index, a TEMP / attached / WITHOUT ROWID
+scan) through one boxed future instead of one state per reader.
+
+**Measured, step by step** (the probe; every shipped profile stays
+at its ratchet throughout, since every change is `vm`-only code or a
+`cfg(vm)` shape):
+
+| step | full | max | xl |
+|---|---:|---:|---:|
+| start (5b67982) | 512,764 | 1,017,176 | 1,121,556 |
+| 2. evaluator once | 498,288 (−14,476) | 1,017,176 (0) | 1,121,556 (0) |
+| 3. one query generator | 495,680 (−2,608) | 1,013,416 (−3,760) | 1,117,748 (−3,808) |
+| 4a. `emit2` / `jump_to` | 495,280 (−400) | 1,012,640 (−776) | 1,116,708 (−1,040) |
+| 4b. `emit3` / `jump3` | 495,216 (−64) | 1,012,520 (−120) | 1,116,604 (−104) |
+| 3'. FROM-less ORDER BY rule | 495,328 (+112) | 1,012,624 (+104) | 1,116,692 (+88) |
+| 4c. `here` / `regs` / `cursor` out of line | 494,224 (−1,104) | 1,010,976 (−1,648) | 1,114,516 (−2,176) |
+| 4d. `emit_p4` | 494,248 (+24) | 1,010,928 (−48) | 1,114,428 (−88) |
+| 5. one reader await | 494,336 (+88) | 1,010,744 (−184) | 1,114,204 (−224) |
+| **final** | **494,336** | **1,010,744** | **1,114,204** |
+| ratchet | 477,788 | 964,076 | 1,061,144 |
+| **probe − ratchet** | **+16,548** | **+46,668** | **+53,060** |
+| target (ratchet − 4,096) | 473,692 | 959,980 | 1,057,048 |
+| **remaining gap** | **20,644** | **50,764** | **57,156** |
+
+`sql` 436,848 → 418,200 and `query` 203,750 → 193,318 (no ratchet;
+for information). After: full VM 32,030 B / driver 8,702 B (was
+33,748 / 10,758), max 48,874 / 15,760 (51,592 / 19,042), xl 52,984 /
+15,706 (56,394 / 19,132); `Vm::op_join` (with `op_sub` / `op_rest`
+inlined) 10.2 / 17.5 / 19.0 KB and the `vm_step` future (with
+`Vm::run` / `Vm::op`, `vm_call`, `vm_host_next` inlined) 8.6 / 12.7 /
+12.6 KB are still the largest.
+
+**Tried and dropped (measured on the probe, full / max / xl).**
+`Vm::op_join` / `op_sub` / `op_rest` kept out of line (+192 / +128 /
++176); `Vm::run` out of line (+64 / −136 / 0); the VM's cursor and
+register accessors out of line (+1,032 / +784 / +1,352); one
+out-of-line register store (`set`) and plan lookups by reference
+(+224 / −160 / +184 together, noise); the codegen's small `G`
+helpers out of line (+72 / +40 / +160); the record decoder compiled
+once for `Error<()>` under `vm`, as the evaluator (+328 / — / +448:
+the re-typing at each caller costs more than the 390 B copy); cutting
+`step_scan`'s legacy scan as well (−312 / +496 / −112, information
+only: the probe keeps wave 13's cut points). Split dispatch: the
+opcode families are already separate functions that LTO inlines once
+each; their size is the opcodes' own code (and helpers inlined once:
+the index walk, probe lists, comparisons), not duplicated decoding.
+
+**Not attempted: sync source readers.** In full the VM reaches only
+TEMP / attached tables through `Exec::Call` (`scan_temp`,
+`scan_source`: 0.8 KB), which read another pager than the one
+`PagerCore` serves. In max / xl the readers it still links
+(`fts5_rows_impl` 8.1 KB, `vtab_rows_of` 6.9 KB, `access_walk`
+4.5-5.5 KB, `access_rows` 1.6-3.2 KB, `dbstat_db` 2.2 KB,
+`rtree_next` 1.6 KB, `json_tvf_rows` 0.7 KB, `lateral_ok` 0.5 KB:
+31-35 KB) are shared with write paths that stay async until Stage 3,
+so a sync restartable copy for the VM would add bytes until the
+async ones go; a sync core with thin async wrappers is Stage 3's
+shape for them (ADR 0005), and even its best case (Stage 1 measured
+sync bodies 8-16% denser than async) is 3-6 KB against a 50-57 KB
+gap.
+
+**Oracle probing** (the pin, live): ORDER BY over no FROM is never
+evaluated by the pin at any level (`SELECT 1 ORDER BY
+abs(-9223372036854775808)`, the same in a scalar / IN subquery, a FROM
+subquery, a CTE, with DISTINCT, with a subquery term: all answer 1;
+`... LIMIT 0` returns nothing, `... GROUP BY 1 ORDER BY abs(..)`
+fails with "integer overflow"); today's executor skips it only at
+the top level, without DISTINCT or a subquery term (the others fail
+with `IntegerOverflow`: a pre-existing gap of every profile with
+`sql`, recorded below, not changed here). The VM keeps today's rule
+(`free_order` for the plain statement; a top-level aggregate's one
+group already went through the join generator and is unchanged).
+
+**Tests.** `tests/vm_v17.rs`' claimed corpus +5 FROM-less ORDER BY
+queries (the regression; also run at the smallest page cache by
+`restart_with_the_smallest_cache` / `restart_with_two_frames`);
+`tests/vm_rest_v17.rs`' EXPLAIN golden updated (above). The `Op` size
+test, the restart and dropped-future tests and every vm suite pass
+strict.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh` (the
+`--features vm` workspace suite included): all gates passed; the
+strict whole-suite run (`RUSTFLAGS="--cfg hipp_vm_strict" cargo test
+--workspace --no-fail-fast --features vm`): 1,194 passed, 0 failed;
+`tests/depth_v16.rs`, `tests/triggers_v16.rs` and
+`tests/depth_tiny_v16.rs` with debug info, with and without `vm`, and
+again strict (with `vm_v17` / `vm_rest_v17`): pass (no `STACK_*`
+change). Both commits of the unit ran the gates.
 
 **Size Δ** (shipped profiles): tiny 0 (76,952), full 0 (477,788),
-max 0 (964,076), xl 0 (1,061,144) — the probe's cuts and the
-evaluator's shape are `vm`-only.
+max 0 (964,076), xl 0 (1,061,144) — every change is `vm`-only code
+or a `cfg(vm)` shape; no ratchet moved.
+
+**Honest gaps.**
+- **The target is not reached.** The probe is +16,548 (full),
+  +46,668 (max) and +53,060 (xl) over the ratchets, 20,644 /
+  50,764 / 57,156 B short of the "4 KB under" target; the listed
+  levers took 18.4 / 6.4 / 7.4 KB. The VM (codegen + dispatch +
+  cursors + driver) is about 41 / 65 / 69 KB (full / max / xl)
+  against the about 27 KB (full) / 36 KB (xl) of read executor it
+  would delete (wave 13's measure), so `vm_flip` would measure
+  and stop again unless the flip's scope changes (a re-baseline, or
+  Stage 3 deleting the async readers and the write executors' own
+  row loops in the same step).
+- Sync restartable source readers were not built (above).
+- Pre-existing, every profile with `sql` (today's executor, not the
+  VM's): a FROM-less query's ORDER BY terms are computed in
+  subqueries, FROM subqueries / CTEs, with DISTINCT and with a
+  subquery term, where the pin never computes them (`SELECT DISTINCT 1
+  ORDER BY abs(-9223372036854775808)` fails with `IntegerOverflow`,
+  the pin answers 1). The VM matches today's executor there.
+- The probe's figures depend on LTO's inlining: single changes of a
+  few hundred bytes moved profiles in opposite directions (the
+  "tried and dropped" list); the table is the measured sequence.
 
 ### VM (ADR 0005 Stage 2): vm_rest — review fixes (2026-11-10)
 

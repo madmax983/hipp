@@ -33,10 +33,10 @@ impl<S: Storage> Statement<'_, S> {
         #[cfg(not(feature = "without_rowid"))]
         let wr = |_: u32| false;
         let prog = match &self.plan {
-            Plan::Query(qp) => codegen::select::query(qp, &wr).or_else(|| {
+            Plan::Query(qp) => {
                 let utf8 = self.conn.pager.text_enc() == crate::record::TextEnc::Utf8;
                 codegen::join::query(qp, &wr, utf8)
-            }),
+            }
             Plan::Scan {
                 root,
                 rowid_alias,
@@ -254,27 +254,33 @@ impl<S: Storage> Statement<'_, S> {
             return Ok(());
         }
         if op.code == Code::HostRows {
-            let rows = match op.p5 {
-                #[cfg(any(feature = "json", feature = "vtab"))]
-                vop::HOST_TVF => self.json_tvf_rows(sp, &padded, need).await?,
-                #[cfg(feature = "expr_index")]
-                vop::HOST_ACCESS => {
-                    let a = sp.access.as_deref().ok_or(Error::Unsupported)?;
-                    self.access_rows(sp, a, &padded).await?
-                }
-                #[cfg(feature = "planner")]
-                vop::HOST_AUTO => {
-                    let ai = sp
-                        .access
-                        .as_deref()
-                        .and_then(|a| a.auto.as_deref())
-                        .ok_or(Error::Unsupported)?;
-                    alloc::boxed::Box::pin(self.auto_rows(sp, ai)).await?
-                }
-                vop::HOST_SCAN if sp.temp => self.scan_temp(sp).await?,
-                vop::HOST_SCAN => self.scan_source(sp).await?,
-                _ => return Err(Error::Unsupported),
-            };
+            // One await for every row-list reader (unit `vm_shrink`):
+            // the reader's future is boxed and awaited through one
+            // state of this future.
+            type Rows<E> = Result<AVec<(AVec<OwnedValue>, Option<i64>)>, E>;
+            let fut: core::pin::Pin<Box<dyn core::future::Future<Output = Rows<S::Error>> + '_>> =
+                match op.p5 {
+                    #[cfg(any(feature = "json", feature = "vtab"))]
+                    vop::HOST_TVF => Box::pin(self.json_tvf_rows(sp, &padded, need)),
+                    #[cfg(feature = "expr_index")]
+                    vop::HOST_ACCESS => {
+                        let a = sp.access.as_deref().ok_or(Error::Unsupported)?;
+                        Box::pin(self.access_rows(sp, a, &padded))
+                    }
+                    #[cfg(feature = "planner")]
+                    vop::HOST_AUTO => {
+                        let ai = sp
+                            .access
+                            .as_deref()
+                            .and_then(|a| a.auto.as_deref())
+                            .ok_or(Error::Unsupported)?;
+                        Box::pin(self.auto_rows(sp, ai))
+                    }
+                    vop::HOST_SCAN if sp.temp => Box::pin(self.scan_temp(sp)),
+                    vop::HOST_SCAN => Box::pin(self.scan_source(sp)),
+                    _ => return Err(Error::Unsupported),
+                };
+            let rows = fut.await?;
             let vm = self.vm.as_deref_mut().ok_or(Error::Unsupported)?;
             if !vm.fill(op.p1, rows) {
                 return Err(Error::Unsupported);

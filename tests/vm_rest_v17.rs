@@ -514,19 +514,36 @@ fn explain_lists_the_program() {
     assert_eq!(text, ["0,'Host',2,0,0,NULL,0,NULL"]);
 }
 
+// (Unit `vm_shrink`: a query plan is compiled by the join generator
+// alone, whose scan loop keeps the joined row, the side-table marks
+// and the per-loop flags; the separate single-table generator of
+// `vm_core`, which made an 11-instruction program here, is gone. The
+// rows are the same: `claimed_shapes_match_the_pin` and the corpora
+// compare them with the pin.)
 const GOLDEN_SCAN: &[&str] = &[
-    "0,'Init',0,11,0,NULL,0,'Start at 11'",
-    "1,'Eval',0,0,0,'expr',2,NULL",
-    "2,'IfNot',0,10,0,NULL,0,NULL",
-    "3,'OpenRead',0,0,0,'table root=2 ncols=2',0,NULL",
-    "4,'Rewind',0,10,0,NULL,0,NULL",
-    "5,'Eval',1,0,0,'expr',1,NULL",
-    "6,'IfNot',0,9,0,NULL,0,NULL",
-    "7,'Eval',1,1,0,'expr',0,NULL",
-    "8,'ResultRow',1,1,1,NULL,0,NULL",
-    "9,'Next',0,5,0,NULL,0,NULL",
-    "10,'Halt',0,0,0,NULL,0,NULL",
-    "11,'Goto',0,1,0,NULL,0,NULL",
+    "0,'Init',0,22,0,NULL,0,'Start at 22'",
+    "1,'Integer',0,0,0,NULL,0,NULL",
+    "2,'OpenRead',0,0,0,'table root=2 ncols=2',0,NULL",
+    "3,'Consts',0,4,0,'plan',0,NULL",
+    "4,'IfNot',4,21,0,NULL,0,NULL",
+    "5,'Integer',0,1,0,NULL,0,NULL",
+    "6,'Integer',0,2,0,NULL,0,NULL",
+    "7,'Integer',0,3,0,NULL,0,NULL",
+    "8,'Rewind',0,20,0,NULL,0,NULL",
+    "9,'Load',0,0,0,NULL,0,NULL",
+    "10,'Integer',0,1,1,NULL,0,NULL",
+    "11,'SideMark',5,0,0,'plan',0,NULL",
+    "12,'Eval',0,4,0,'expr',5,NULL",
+    "13,'IfNot',4,16,0,NULL,0,NULL",
+    "14,'Eval',0,7,0,'expr',4,NULL",
+    "15,'ResultRow',7,1,4294967295,NULL,0,NULL",
+    "16,'SideDrop',5,0,0,'plan',0,NULL",
+    "17,'Goto',0,18,0,NULL,0,NULL",
+    "18,'If',2,20,0,NULL,0,NULL",
+    "19,'Next',0,9,0,NULL,0,NULL",
+    "20,'Goto',0,21,0,NULL,0,NULL",
+    "21,'Halt',0,0,0,NULL,0,NULL",
+    "22,'Goto',0,1,0,NULL,0,NULL",
 ];
 
 // ---------------- restart at the smallest cache ----------------

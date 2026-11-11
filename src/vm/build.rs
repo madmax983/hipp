@@ -145,6 +145,7 @@ impl Builder {
     }
 
     /// `n` consecutive fresh registers; the first one.
+    #[inline(never)]
     pub(crate) fn regs(&mut self, n: usize) -> u32 {
         let first = self.nreg;
         match u32::try_from(n).ok().and_then(|n| self.nreg.checked_add(n)) {
@@ -155,6 +156,7 @@ impl Builder {
     }
 
     /// A fresh cursor.
+    #[inline(never)]
     pub(crate) fn cursor(&mut self) -> u32 {
         let c = self.ncur;
         match self.ncur.checked_add(1) {
@@ -171,6 +173,7 @@ impl Builder {
     }
 
     /// Place `l` at the next instruction.
+    #[inline(never)]
     pub(crate) fn here(&mut self, l: Label) {
         let at = self.addr();
         if let Some(slot) = self.labels.as_mut_slice().get_mut(l.0) {
@@ -215,6 +218,37 @@ impl Builder {
     pub(crate) fn emit(&mut self, code: Code, p1: u32, p2: u32, p3: u32, p4: u32, p5: u8) {
         let op = self.make(code, p1, p2, p3, p4, p5);
         self.ops.push(op);
+    }
+
+    /// `emit` with `p3`, `p4` and `p5` 0: the common case, kept out of
+    /// line so that its callers pass every operand in registers.
+    #[inline(never)]
+    pub(crate) fn emit2(&mut self, code: Code, p1: u32, p2: u32) {
+        self.emit(code, p1, p2, 0, 0, 0);
+    }
+
+    /// `emit` with only `p1` and `p4` (see `emit2`): an opening.
+    #[inline(never)]
+    pub(crate) fn emit_p4(&mut self, code: Code, p1: u32, p4: u32) {
+        self.emit(code, p1, 0, 0, p4, 0);
+    }
+
+    /// `jump` with `p3`, `p4` and `p5` 0 (see `emit2`).
+    #[inline(never)]
+    pub(crate) fn jump_to(&mut self, code: Code, p1: u32, to: Label) {
+        self.jump(code, p1, to, 0, 0, 0);
+    }
+
+    /// `emit` with `p4` and `p5` 0 (see `emit2`).
+    #[inline(never)]
+    pub(crate) fn emit3(&mut self, code: Code, p1: u32, p2: u32, p3: u32) {
+        self.emit(code, p1, p2, p3, 0, 0);
+    }
+
+    /// `jump` with `p4` and `p5` 0 (see `emit2`).
+    #[inline(never)]
+    pub(crate) fn jump3(&mut self, code: Code, p1: u32, to: Label, p3: u32) {
+        self.jump(code, p1, to, p3, 0, 0);
     }
 
     /// Append an instruction whose `p2` jumps to `to`.

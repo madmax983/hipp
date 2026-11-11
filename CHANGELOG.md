@@ -15,6 +15,17 @@ All notable changes to hipp. Versions follow the milestones in
 - The expression evaluator is compiled once (for `Error<()>`) in
   every build with `vm`, as it already was with `window`: the full
   probe −14,476 B.
+- One code generator for query plans: `vm_core`'s single-table
+  generator is gone, the join generator compiles every SELECT plan
+  (it now also leaves a FROM-less statement's ORDER BY terms
+  uncomputed, as today's executor and the pin do); the builder's
+  common calls stay out of line; the driver awaits its row-list
+  readers through one boxed future. The probe: full 512,764 →
+  494,336 B, max 1,017,176 → 1,010,744 B, xl 1,121,556 → 1,114,204
+  B — still 16.5 / 46.7 / 53.1 KB over the ratchets, so the flip
+  stays out of reach (STATUS.md has the gap per profile).
+- Plain EXPLAIN (with `vm`) lists the join generator's program for a
+  single-table SELECT.
 - Sizes: every shipped profile unchanged.
 
 ### The bytecode VM: review fixes of unit `vm_rest` (hidden feature `vm`)

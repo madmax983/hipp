@@ -337,6 +337,13 @@ const OK: &[&str] = &[
     "SELECT abs(-9223372036854775808) LIMIT 0;",
     "SELECT 1 WHERE abs(-9223372036854775808) LIMIT 0;",
     "SELECT 2 AS x ORDER BY x LIMIT 5;",
+    // (Unit `vm_shrink`, regression: the join generator, now the only
+    // one, never computes a FROM-less statement's ORDER BY terms.)
+    "SELECT 1, 2 ORDER BY abs(-9223372036854775808) DESC LIMIT 5;",
+    "SELECT 1 WHERE 1 ORDER BY abs(-9223372036854775808), 1;",
+    "SELECT 1 ORDER BY abs(-9223372036854775808) LIMIT 1 OFFSET 0;",
+    "SELECT 1 ORDER BY abs(-9223372036854775808) LIMIT 1 OFFSET 1;",
+    "SELECT 'a' COLLATE nocase AS c ORDER BY c DESC, abs(-9223372036854775808);",
 ];
 
 /// SELECTs whose statement fails, on the pin and on hipp (the rows

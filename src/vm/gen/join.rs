@@ -365,6 +365,12 @@ pub(super) struct G<'p, 'b> {
     /// `Eval` flags every expression the output computes takes
     /// (`EVAL_WIN` while a window query's units are output).
     pub(super) wflag: u8,
+    /// The statement's own core reads no table: its one row satisfies
+    /// the ORDER BY, whose terms are then never computed (the pin's
+    /// loop over no table; today's executor for a subquery-free,
+    /// non-DISTINCT, non-aggregate query). Unit `vm_core`'s separate
+    /// single-table generator carried this rule until `vm_shrink`.
+    free_order: bool,
 }
 
 /// The program of a general query plan, or `None` when it holds a
@@ -375,7 +381,7 @@ pub(crate) fn query(qp: &Rc<QueryPlan>, wr: &dyn Fn(u32) -> bool, utf8: bool) ->
     let mut b = Builder::new();
     let gx = Gx { wr, utf8 };
     select(&mut b, qp, gx, (0, 0), None, Sink::Result)?;
-    b.emit(Code::Halt, 0, 0, 0, 0, 0);
+    b.emit2(Code::Halt, 0, 0);
     b.finish()
 }
 
@@ -397,7 +403,7 @@ pub(super) fn select(
     let end = b.label();
     let cnt = need.map(|n| {
         let c = b.reg();
-        b.emit(Code::Copy, n, c, 0, 0, 0);
+        b.emit2(Code::Copy, n, c);
         c
     });
     core(b, qp, gx, at, None, need, cnt, sink, end)?;
@@ -522,12 +528,9 @@ pub(super) fn core(
         });
     }
     let tmp = b.reg();
-    let streamed = matches!(sink, Sink::Result)
-        && w0 == 0
-        && n0 == 0
-        && win.is_none()
-        && !windowed
-        && !qp.sources.iter().any(|s| s.kind.pads_left());
+    // The statement's own core (not a subquery's or a compound's).
+    let streamed_top = matches!(sink, Sink::Result) && w0 == 0 && n0 == 0 && win.is_none();
+    let streamed = streamed_top && !windowed && !qp.sources.iter().any(|s| s.kind.pads_left());
     #[cfg(feature = "sql")]
     let streamed = streamed && !qp.sources.iter().any(|s| s.rec != 0);
     let mut g = G {
@@ -558,6 +561,11 @@ pub(super) fn core(
         streamed,
         arm: win.is_some(),
         wflag: 0,
+        free_order: streamed_top
+            && qp.sources.is_empty()
+            && !qp.distinct
+            && !grouped
+            && qp.order_by.iter().all(|(e, _)| evaluable(e, 0, 0, false)),
     };
     match win {
         Some((l, o)) => {
@@ -576,7 +584,7 @@ pub(super) fn core(
         }
         let k = g.b.p4(P4::Win(calls));
         let c = g.b.cursor();
-        g.b.emit(Code::WinOpen, c, 0, 0, k, 0);
+        g.b.emit_p4(Code::WinOpen, c, k);
         g.win = Some(c);
     }
     // The output, the sorter, the accumulators.
@@ -600,14 +608,14 @@ pub(super) fn core(
             (Some(l), Some(sp)) => (l.t, l.built, sp),
             _ => return None,
         };
-        g.b.emit(Code::Integer, 0, built, 0, 0, 0);
+        g.b.emit2(Code::Integer, 0, built);
         #[cfg(feature = "planner")]
         if let Some((_, bb)) = g.lvl(i).and_then(|l| l.bloom) {
-            g.b.emit(Code::Integer, 0, bb, 0, 0, 0);
+            g.b.emit2(Code::Integer, 0, bb);
         }
         if table_source(root, gx.wr) {
             let info = g.b.p4(P4::Table(alloc::boxed::Box::new(table_info(root))));
-            g.b.emit(Code::OpenRead, t, 0, 0, info, 0);
+            g.b.emit_p4(Code::OpenRead, t, info);
         }
     }
     #[cfg(feature = "sql")]
@@ -617,7 +625,7 @@ pub(super) fn core(
     // row joins (an aggregate still has its empty group).
     if qp.filter.is_some() || qp.sources.iter().any(|s| s.on.is_some()) {
         g.b.emit(Code::Consts, 0, tmp, 0, plan, 0);
-        g.b.jump(Code::IfNot, tmp, after, 0, 0, 0);
+        g.b.jump_to(Code::IfNot, tmp, after);
     }
     let main_done = g.b.label();
     g.from(0, main_done, out)?;
@@ -947,13 +955,13 @@ impl<'p> G<'p, '_> {
                 _ if !super::sub::real_sub(self.b, e) => {
                     let t = self.tmp;
                     self.val_preset(e, cx, t, super::super::op::EVAL_COND);
-                    self.b.jump(Code::IfNot, t, skip, 0, 0, 0);
+                    self.b.jump_to(Code::IfNot, t, skip);
                 }
                 Cx::Acc => self.cond_sub(e, true, skip),
                 Cx::Group(_) => {
                     let t = self.tmp;
                     self.val_sub(e, cx, t, EVAL_COND);
-                    self.b.jump(Code::IfNot, t, skip, 0, 0, 0);
+                    self.b.jump_to(Code::IfNot, t, skip);
                 }
             }
             return;
@@ -966,7 +974,7 @@ impl<'p> G<'p, '_> {
         let t = self.tmp;
         self.b
             .emit(Code::Eval, p1, t, 0, k, EVAL_COND | flag | self.wflag);
-        self.b.jump(Code::IfNot, t, skip, 0, 0, 0);
+        self.b.jump_to(Code::IfNot, t, skip);
     }
 
     /// LIMIT, then OFFSET, before the loop (`computeLimitRegisters`:
@@ -999,7 +1007,7 @@ impl<'p> G<'p, '_> {
         let qp = self.qp;
         let distinct = if qp.distinct {
             let e = self.b.cursor();
-            self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, e, 0);
             Some(e)
         } else {
             None
@@ -1015,6 +1023,7 @@ impl<'p> G<'p, '_> {
             )
         } else {
             qp.order_by.is_empty()
+                || self.free_order
                 || (!qp.distinct && matches!(qp.sources.as_slice(), [sp] if rowid_order(sp, qp)))
         };
         if !sorted {
@@ -1032,7 +1041,7 @@ impl<'p> G<'p, '_> {
                     None
                 },
             })));
-            self.b.emit(Code::SorterOpen, s, 0, 0, k, 0);
+            self.b.emit_p4(Code::SorterOpen, s, k);
             return Out::Sort(s, distinct);
         }
         match distinct {
@@ -1065,7 +1074,7 @@ impl<'p> G<'p, '_> {
         match out {
             Out::Plain => {
                 if let Some(o) = self.off {
-                    self.b.jump(Code::IfPos, o, cont, 1, 0, 0);
+                    self.b.jump3(Code::IfPos, o, cont, 1);
                 }
                 compute(self);
                 self.sink_row(items, n, rowid);
@@ -1077,7 +1086,7 @@ impl<'p> G<'p, '_> {
                 )));
                 self.b.jump(Code::Distinct, e, cont, items, colls, 0);
                 if let Some(o) = self.off {
-                    self.b.jump(Code::IfPos, o, cont, 1, 0, 0);
+                    self.b.jump3(Code::IfPos, o, cont, 1);
                 }
                 self.sink_row(items, n, rowid);
             }
@@ -1114,7 +1123,7 @@ impl<'p> G<'p, '_> {
                     )));
                     self.b.jump(Code::Distinct, e, cont, items, colls, 0);
                 }
-                self.b.emit(Code::SorterInsert, s, items, rowid, 0, 0);
+                self.b.emit3(Code::SorterInsert, s, items, rowid);
             }
         }
     }
@@ -1129,7 +1138,7 @@ impl<'p> G<'p, '_> {
         #[cfg(any(feature = "json", feature = "fts5"))]
         let side = self.track_side().then(|| {
             let r = self.b.regs(2);
-            self.b.emit(Code::SideMark, r, 0, 0, 0, 0);
+            self.b.emit2(Code::SideMark, r, 0);
             (r, self.b.label())
         });
         #[cfg(any(feature = "json", feature = "fts5"))]
@@ -1148,17 +1157,17 @@ impl<'p> G<'p, '_> {
                 && let Some(l) = self.lvl(d)
             {
                 let r = l.done;
-                self.b.emit(Code::Integer, 0, r, 1, 0, 0);
+                self.b.emit3(Code::Integer, 0, r, 1);
             }
         }
         match self.fold {
             #[cfg(feature = "window")]
             Fold::Rows if self.win.is_some() => {
                 let w = self.win.unwrap_or(0);
-                self.b.emit(Code::WinRow, w, 0, 0, 0, 0);
+                self.b.emit2(Code::WinRow, w, 0);
             }
             Fold::Rows => self.emit(out, Cx::Acc, None, cont),
-            Fold::Agg(a) => self.b.emit(Code::AggStep, a, 0, 0, 0, 0),
+            Fold::Agg(a) => self.b.emit2(Code::AggStep, a, 0),
             Fold::Groups(gc) => {
                 // The HAVING terms the pin moves into the WHERE clause
                 // (constant or GROUP BY terms, `having_early`): tested
@@ -1174,7 +1183,7 @@ impl<'p> G<'p, '_> {
                 for (i, e) in qp.group_by.iter().enumerate() {
                     self.val(e, Cx::Acc, k.saturating_add(i as u32));
                 }
-                self.b.emit(Code::GroupAdd, gc, 0, k, 0, 0);
+                self.b.emit3(Code::GroupAdd, gc, 0, k);
             }
         }
         #[cfg(any(feature = "json", feature = "fts5"))]
@@ -1183,12 +1192,12 @@ impl<'p> G<'p, '_> {
             // points into.
             // (The streamed fold pins a row it keeps itself, `AggStep`.)
             if matches!(self.fold, Fold::Groups(_)) || self.win.is_some() {
-                self.b.emit(Code::SidePin, 0, 0, 0, 0, 0);
+                self.b.emit2(Code::SidePin, 0, 0);
             }
             self.b.here(l);
-            self.b.emit(Code::SideDrop, r, 0, 0, 0, 0);
+            self.b.emit2(Code::SideDrop, r, 0);
         }
-        self.b.jump(Code::Goto, 0, next, 0, 0, 0);
+        self.b.jump_to(Code::Goto, 0, next);
     }
 
     /// The loops of sources `d ..` (then the body), for the joined row
@@ -1210,16 +1219,16 @@ impl<'p> G<'p, '_> {
         let pad_chk = self.b.label();
         let inner = self.b.label();
         let fin = self.b.label();
-        self.b.emit(Code::Integer, 0, any, 0, 0, 0);
-        self.b.emit(Code::Integer, 0, pad, 0, 0, 0);
-        self.b.emit(Code::Integer, 0, done, 0, 0, 0);
+        self.b.emit2(Code::Integer, 0, any);
+        self.b.emit2(Code::Integer, 0, pad);
+        self.b.emit2(Code::Integer, 0, done);
         // Open: the first row, or `pad_chk` when there is none.
         // A driver-read table-valued or virtual source: the side-table
         // entries its loop adds go when it ends (`Stream::side_drop`).
         #[cfg(any(feature = "json", feature = "fts5"))]
         let side = if self.track_side() && tvf_kind(&self.lvl(d)?.kind) {
             let r = self.b.regs(2);
-            self.b.emit(Code::SideMark, r, 0, 0, 0, 0);
+            self.b.emit2(Code::SideMark, r, 0);
             Some(r)
         } else {
             None
@@ -1228,25 +1237,25 @@ impl<'p> G<'p, '_> {
         self.b.here(top);
         if let Some((code, r)) = adv.stop {
             let tmp = self.tmp;
-            self.b.emit(Code::Rowid, t, tmp, 0, 0, 0);
-            self.b.jump(code, tmp, pad_chk, r, 0, 0);
+            self.b.emit2(Code::Rowid, t, tmp);
+            self.b.jump3(code, tmp, pad_chk, r);
         }
         let src = if adv.list { e } else { t };
         self.b.emit(Code::Load, src, base, self.src(d), 0, 0);
         if let Some(on) = &sp.on {
             self.test(on, Cx::Acc, next);
         }
-        self.b.emit(Code::Integer, 0, any, 1, 0, 0);
+        self.b.emit3(Code::Integer, 0, any, 1);
         if sp.kind.pads_left() {
-            self.b.emit(Code::EphMatch, e, 0, 0, 0, 0);
+            self.b.emit2(Code::EphMatch, e, 0);
         }
         self.b.here(inner);
         self.from(d.saturating_add(1), next, out)?;
         self.b.here(next);
-        self.b.jump(Code::If, pad, fin, 0, 0, 0);
+        self.b.jump_to(Code::If, pad, fin);
         #[cfg(feature = "planner")]
         if sp.exists {
-            self.b.jump(Code::If, done, fin, 0, 0, 0);
+            self.b.jump_to(Code::If, done, fin);
         }
         if let Some((code, c)) = adv.next {
             self.b.jump(code, c, top, adv.p3, adv.p4, 0);
@@ -1262,29 +1271,29 @@ impl<'p> G<'p, '_> {
             let nogrow = self.b.label();
             self.b.jump(Code::Grow, e, nogrow, n, pos, 0);
             self.derived_build(p, e, Some(n))?;
-            self.b.jump(Code::EphSeek, e, pad_chk, pos, 0, 0);
-            self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+            self.b.jump3(Code::EphSeek, e, pad_chk, pos);
+            self.b.jump_to(Code::Goto, 0, top);
             self.b.here(nogrow);
         }
         self.b.here(pad_chk);
         if sp.kind.pads_right() {
-            self.b.jump(Code::If, any, fin, 0, 0, 0);
+            self.b.jump_to(Code::If, any, fin);
             self.b.emit(Code::NullRow, ncols, base, self.src(d), 0, 0);
-            self.b.emit(Code::Integer, 0, pad, 1, 0, 0);
-            self.b.jump(Code::Goto, 0, inner, 0, 0, 0);
+            self.b.emit3(Code::Integer, 0, pad, 1);
+            self.b.jump_to(Code::Goto, 0, inner);
         }
         self.b.here(fin);
         // The values a lateral table-valued call cleared, back.
         #[cfg(any(feature = "json", feature = "vtab"))]
         if sp.tvf & crate::query::TVF_LATERAL != 0 && !sp.tvf_dead.is_empty() {
             let c = if direct(&self.lvl(d)?.kind) { t } else { e };
-            self.b.emit(Code::Restore, c, 0, 0, 0, 0);
+            self.b.emit2(Code::Restore, c, 0);
         }
         #[cfg(any(feature = "json", feature = "fts5"))]
         if let Some(r) = side {
-            self.b.emit(Code::SideDrop, r, 0, 0, 0, 0);
+            self.b.emit2(Code::SideDrop, r, 0);
         }
-        self.b.jump(Code::Goto, 0, exit, 0, 0, 0);
+        self.b.jump_to(Code::Goto, 0, exit);
         Some(())
     }
 
@@ -1302,13 +1311,11 @@ impl<'p> G<'p, '_> {
         self.b.here(top);
         for (j, sp) in qp.sources.iter().enumerate().take(i) {
             let base = self.base(j);
-            self.b.emit(
+            self.b.emit3(
                 Code::NullRow,
                 sp.ncols as u32,
                 base,
                 self.n0.saturating_add(j) as u32,
-                0,
-                0,
             );
         }
         let base = self.base(i);
@@ -1337,9 +1344,9 @@ impl<'p> G<'p, '_> {
             Fold::Groups(gc) => {
                 let top = self.b.label();
                 let done = self.b.label();
-                self.b.emit(Code::GroupSort, gc, 0, 0, 0, 0);
+                self.b.emit2(Code::GroupSort, gc, 0);
                 self.b.here(top);
-                self.b.jump(Code::GroupNext, gc, done, 0, 0, 0);
+                self.b.jump_to(Code::GroupNext, gc, done);
                 #[cfg(feature = "sql")]
                 self.rep_search(gc);
                 let cx = Cx::Group(gc);
@@ -1358,12 +1365,12 @@ impl<'p> G<'p, '_> {
                 #[cfg(feature = "window")]
                 if let Some(w) = self.win {
                     self.win_unit(w, cx, gc.saturating_add(1));
-                    self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                    self.b.jump_to(Code::Goto, 0, top);
                     self.b.here(done);
                     return;
                 }
                 self.emit(out, cx, None, top);
-                self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                self.b.jump_to(Code::Goto, 0, top);
                 self.b.here(done);
             }
         }
@@ -1379,16 +1386,16 @@ impl<'p> G<'p, '_> {
         let regs = self.b.regs(n);
         let more = self.b.label();
         let skip = self.b.label();
-        self.b.jump(Code::SorterSort, s, end, 0, 0, 0);
+        self.b.jump_to(Code::SorterSort, s, end);
         self.b.here(more);
         if let Some(o) = self.off {
-            self.b.jump(Code::IfPos, o, skip, 1, 0, 0);
+            self.b.jump3(Code::IfPos, o, skip, 1);
         }
-        self.b.emit(Code::SorterData, s, regs, 0, 0, 0);
+        self.b.emit2(Code::SorterData, s, regs);
         let rowid = s.saturating_add(1);
         self.sink_row(regs, n, rowid);
         self.b.here(skip);
-        self.b.jump(Code::SorterNext, s, more, 0, 0, 0);
+        self.b.jump_to(Code::SorterNext, s, more);
     }
 }
 
@@ -1430,7 +1437,7 @@ impl G<'_, '_> {
         self.b.emit(Code::Need, r, l, o, n, 0);
         if grow {
             let pos = self.b.reg();
-            self.b.emit(Code::Integer, 0, pos, 0, 0, 0);
+            self.b.emit2(Code::Integer, 0, pos);
             self.grow = Some((r, pos));
         } else {
             self.dneed = Some(r);
@@ -1451,10 +1458,10 @@ impl G<'_, '_> {
     ) -> Option<()> {
         let at = (self.w0, self.n0);
         let gx = self.gx;
-        self.b.emit(Code::AccPush, 0, 0, 0, 0, 0);
+        self.b.emit2(Code::AccPush, 0, 0);
         if p.mat == 0 {
-            self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
-            self.b.emit(Code::Count, 0, 0, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, e, 0);
+            self.b.emit2(Code::Count, 0, 0);
             super::sub::subplan(self.b, p, gx, at, need, Sink::List(e))?;
         } else {
             let (se, flags) = match self.b.mats.iter().find(|m| m.0 == p.mat) {
@@ -1467,21 +1474,21 @@ impl G<'_, '_> {
                 }
             };
             let none = self.b.reg();
-            self.b.emit(Code::Integer, 0, none, -1i32 as u32, 0, 0);
+            self.b.emit3(Code::Integer, 0, none, -1i32 as u32);
             let needr = need.unwrap_or(none);
             let ask = if p.rec.is_some() { need } else { None };
             let skip = self.b.label();
             self.b.jump(Code::MatTest, se, skip, needr, flags, 0);
-            self.b.emit(Code::EphOpen, se, 0, 0, 0, 0);
-            self.b.emit(Code::Count, 0, 0, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, se, 0);
+            self.b.emit2(Code::Count, 0, 0);
             super::sub::subplan(self.b, p, gx, at, ask, Sink::List(se))?;
             self.b
                 .emit(Code::MatDone, se, 0, ask.unwrap_or(none), flags, 0);
             self.b.here(skip);
-            self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
-            self.b.emit(Code::EphCopy, e, se, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, e, 0);
+            self.b.emit2(Code::EphCopy, e, se);
         }
-        self.b.emit(Code::AccPop, 0, 0, 0, 0, 0);
+        self.b.emit2(Code::AccPop, 0, 0);
         Some(())
     }
 }
@@ -1515,20 +1522,20 @@ pub(super) fn emit_row(
     end: Label,
 ) {
     match sink {
-        Sink::Result => b.emit(Code::ResultRow, regs, n as u32, rowid, 0, 0),
+        Sink::Result => b.emit3(Code::ResultRow, regs, n as u32, rowid),
         #[cfg(feature = "sql")]
-        Sink::List(e) => b.emit(Code::EphPut, e, regs, n as u32, 0, 0),
+        Sink::List(e) => b.emit3(Code::EphPut, e, regs, n as u32),
         #[cfg(feature = "sql")]
         Sink::Sub(slot, info) => b.emit(Code::SubRow, slot, regs, n as u32, info, 0),
         #[cfg(feature = "sql")]
-        Sink::Queue(q) => b.emit(Code::QueueAdd, q, regs, n as u32, 0, 0),
+        Sink::Queue(q) => b.emit3(Code::QueueAdd, q, regs, n as u32),
     }
     let _ = rowid;
     if let Some(l) = lim {
-        b.jump(Code::DecrJumpZero, l, end, 0, 0, 0);
+        b.jump_to(Code::DecrJumpZero, l, end);
     }
     if let Some(c) = cnt {
-        b.jump(Code::DecrJumpZero, c, end, 0, 0, 0);
+        b.jump_to(Code::DecrJumpZero, c, end);
     }
 }
 
@@ -1577,6 +1584,7 @@ pub(super) fn values_core(
         streamed: false,
         arm: false,
         wflag: 0,
+        free_order: false,
     };
     for r in qp.values.iter() {
         // A row's window calls run over that row alone, as the pin's
@@ -1609,8 +1617,8 @@ pub(super) fn values_core(
             let n: usize = wins.iter().map(|c| crate::window::children(c).len()).sum();
             let k = g.b.p4(P4::Win(calls));
             let w = g.b.cursor();
-            g.b.emit(Code::WinOpen, w, 0, 0, k, 0);
-            g.b.emit(Code::WinRow, w, 0, 0, 0, 0);
+            g.b.emit_p4(Code::WinOpen, w, k);
+            g.b.emit2(Code::WinRow, w, 0);
             g.b.jump(Code::WinLoad, w, next, 0, 0, 1);
             let kids = g.b.regs(n);
             let mut j = 0u32;
@@ -1620,8 +1628,8 @@ pub(super) fn values_core(
                     j = j.saturating_add(1);
                 }
             }
-            g.b.emit(Code::WinAdd, w, kids, 0, 0, 0);
-            g.b.emit(Code::WinCompute, w, 0, 0, 0, 0);
+            g.b.emit2(Code::WinAdd, w, kids);
+            g.b.emit2(Code::WinCompute, w, 0);
             g.b.jump(Code::WinNext, w, next, 0, 0, 1);
             g.wflag = super::super::op::EVAL_WIN;
             for (i, e) in r.iter().enumerate() {
@@ -1636,7 +1644,7 @@ pub(super) fn values_core(
             }
         }
         if let Some(o) = off {
-            g.b.jump(Code::IfPos, o, next, 1, 0, 0);
+            g.b.jump3(Code::IfPos, o, next, 1);
         }
         g.sink_row(regs, r.len(), 0);
         g.b.here(next);
@@ -1660,13 +1668,13 @@ pub(super) fn limits(
     };
     let r = b.regs(2);
     scope_val(b, l, gx, r)?;
-    b.emit(Code::MustBeInt, r, 0, 0, 0, 0);
-    b.jump(Code::IfNot, r, end, 0, 0, 0);
+    b.emit2(Code::MustBeInt, r, 0);
+    b.jump_to(Code::IfNot, r, end);
     let mut off = None;
     if let Some(o) = offset {
         let ro = r.saturating_add(1);
         scope_val(b, o, gx, ro)?;
-        b.emit(Code::MustBeInt, ro, 0, 0, 0, 0);
+        b.emit2(Code::MustBeInt, ro, 0);
         off = Some(ro);
     }
     Some((Some(r), off))
@@ -1767,9 +1775,9 @@ impl<'p> G<'p, '_> {
             Kind::Host(_, false) => 3,
             #[cfg(feature = "sql")]
             Kind::Host(mode, true) => {
-                self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+                self.b.emit2(Code::EphOpen, e, 0);
                 self.host_rows(d, e, mode, Some(nopad));
-                self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+                self.b.jump_to(Code::EphRewind, e, none);
                 return Some(Adv {
                     next: Some((Code::EphNext, e)),
                     p3: 0,
@@ -1805,7 +1813,7 @@ impl<'p> G<'p, '_> {
         };
         Some(match kind {
             0 => {
-                self.b.jump(Code::Rewind, t, none, 0, 0, 0);
+                self.b.jump_to(Code::Rewind, t, none);
                 Adv {
                     next: Some((Code::Next, t)),
                     p3: 0,
@@ -1823,13 +1831,13 @@ impl<'p> G<'p, '_> {
                 // one rowid (`xindex::access_walk`).
                 let regs = self.bound_vals(bounds);
                 for r in regs.into_iter().flatten() {
-                    self.b.jump(Code::IsNull, r.0, none, 0, 0, 0);
+                    self.b.jump_to(Code::IsNull, r.0, none);
                 }
                 let r = self.b.reg();
                 self.val_mut(pe, Cx::Acc, r);
                 let k = self.b.p4(P4::Aff(aff));
-                self.b.emit(Code::Affinity, r, 0, 0, k, 0);
-                self.b.jump(Code::SeekRowid, t, none, r, 0, 0);
+                self.b.emit_p4(Code::Affinity, r, k);
+                self.b.jump3(Code::SeekRowid, t, none, r);
                 Adv {
                     next: None,
                     p3: 0,
@@ -1853,13 +1861,13 @@ impl<'p> G<'p, '_> {
                 match from {
                     Some(r) => {
                         let whole = self.b.label();
-                        self.b.jump(Code::IsNull, r, whole, 0, 0, 0);
-                        self.b.jump(seek, t, none, r, 0, 0);
-                        self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                        self.b.jump_to(Code::IsNull, r, whole);
+                        self.b.jump3(seek, t, none, r);
+                        self.b.jump_to(Code::Goto, 0, top);
                         self.b.here(whole);
-                        self.b.jump(first, t, none, 0, 0, 0);
+                        self.b.jump_to(first, t, none);
                     }
-                    None => self.b.jump(first, t, none, 0, 0, 0),
+                    None => self.b.jump_to(first, t, none),
                 }
                 Adv {
                     next: Some((if reverse { Code::Prev } else { Code::Next }, t)),
@@ -1871,19 +1879,19 @@ impl<'p> G<'p, '_> {
             }
             3 => {
                 self.build_once(d)?;
-                self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+                self.b.jump_to(Code::EphRewind, e, none);
                 list
             }
             #[cfg(feature = "sql")]
             6 => {
-                self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+                self.b.jump_to(Code::EphRewind, e, none);
                 list
             }
             #[cfg(feature = "expr_index")]
             4 => {
-                self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+                self.b.emit2(Code::EphOpen, e, 0);
                 self.build(d, e)?;
-                self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+                self.b.jump_to(Code::EphRewind, e, none);
                 list
             }
             #[cfg(feature = "planner")]
@@ -1899,9 +1907,9 @@ impl<'p> G<'p, '_> {
                     let r = regs.saturating_add(i as u32);
                     self.val_mut(&k.val, Cx::Acc, r);
                     let a = self.b.p4(P4::Aff(k.aff));
-                    self.b.emit(Code::Affinity, r, 0, 0, a, 0);
+                    self.b.emit_p4(Code::Affinity, r, a);
                     if !k.is {
-                        self.b.jump(Code::IsNull, r, none, 0, 0, 0);
+                        self.b.jump_to(Code::IsNull, r, none);
                     }
                 }
                 let a = self.b.p4(P4::Auto(alloc::boxed::Box::new(ai.clone())));
@@ -1919,14 +1927,14 @@ impl<'p> G<'p, '_> {
             (l.e, l.built)
         };
         let skip = self.b.label();
-        self.b.jump(Code::Once, built, skip, 0, 0, 0);
-        self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+        self.b.jump_to(Code::Once, built, skip);
+        self.b.emit2(Code::EphOpen, e, 0);
         self.build(d, e)?;
         // Its rows stay for the execution: so does what they point
         // into.
         #[cfg(any(feature = "json", feature = "fts5"))]
         if self.track_side() {
-            self.b.emit(Code::SidePin, 0, 0, 0, 0, 0);
+            self.b.emit2(Code::SidePin, 0, 0);
         }
         self.b.here(skip);
         Some(())
@@ -1963,7 +1971,7 @@ impl<'p> G<'p, '_> {
             }
             self.scan_into(d, e);
             let a = self.b.p4(P4::Auto(alloc::boxed::Box::new(ai.clone())));
-            self.b.emit(Code::AutoSort, e, 0, 0, a, 0);
+            self.b.emit_p4(Code::AutoSort, e, a);
             return Some(());
         }
         #[cfg(feature = "expr_index")]
@@ -1982,10 +1990,10 @@ impl<'p> G<'p, '_> {
         };
         let top = self.b.label();
         let done = self.b.label();
-        self.b.jump(Code::Rewind, t, done, 0, 0, 0);
+        self.b.jump_to(Code::Rewind, t, done);
         self.b.here(top);
-        self.b.emit(Code::EphAdd, e, t, 0, 0, 0);
-        self.b.jump(Code::Next, t, top, 0, 0, 0);
+        self.b.emit2(Code::EphAdd, e, t);
+        self.b.jump_to(Code::Next, t, top);
         self.b.here(done);
     }
 
@@ -2007,8 +2015,8 @@ impl<'p> G<'p, '_> {
         let t = self.lvl(d)?.t;
         let kp = self.b.p4(P4::BKeys(keys.clone()));
         let skip = self.b.label();
-        self.b.jump(Code::Once, built, skip, 0, 0, 0);
-        self.b.emit(Code::EphOpen, bl, 0, 0, 0, 0);
+        self.b.jump_to(Code::Once, built, skip);
+        self.b.emit2(Code::EphOpen, bl, 0);
         self.b.emit(Code::BloomAdd, bl, 0, 0, kp, 1);
         let top = self.b.label();
         let done = self.b.label();
@@ -2017,20 +2025,20 @@ impl<'p> G<'p, '_> {
         #[cfg(feature = "sql")]
         if matches!(self.lvl(d)?.kind, Kind::Host(..)) {
             let l = self.b.cursor();
-            self.b.emit(Code::EphOpen, l, 0, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, l, 0);
             self.host_rows(d, l, super::super::op::HOST_SCAN, None);
-            self.b.jump(Code::EphRewind, l, done, 0, 0, 0);
+            self.b.jump_to(Code::EphRewind, l, done);
             self.b.here(top);
             self.b.emit(Code::BloomAdd, bl, l, 0, kp, 0);
-            self.b.jump(Code::EphNext, l, top, 0, 0, 0);
+            self.b.jump_to(Code::EphNext, l, top);
             self.b.here(done);
             self.b.here(skip);
             return self.bloom_probe(a, keys, bl, none);
         }
-        self.b.jump(Code::Rewind, t, done, 0, 0, 0);
+        self.b.jump_to(Code::Rewind, t, done);
         self.b.here(top);
         self.b.emit(Code::BloomAdd, bl, t, 0, kp, 0);
-        self.b.jump(Code::Next, t, top, 0, 0, 0);
+        self.b.jump_to(Code::Next, t, top);
         self.b.here(done);
         self.b.here(skip);
         self.bloom_probe(a, keys, bl, none)
@@ -2057,7 +2065,7 @@ impl<'p> G<'p, '_> {
             let r = regs.saturating_add(i as u32);
             self.val_mut(v, Cx::Acc, r);
             let k = self.b.p4(P4::Aff(p.aff));
-            self.b.emit(Code::Affinity, r, 0, 0, k, 0);
+            self.b.emit_p4(Code::Affinity, r, k);
         }
         // The key is as long as the shorter of the two lists, as
         // `bloom_pass` zips them.
@@ -2079,7 +2087,7 @@ impl<'p> G<'p, '_> {
                 let r = self.b.reg();
                 self.val_mut(&bd.e, Cx::Acc, r);
                 let k = self.b.p4(P4::Aff(bd.aff));
-                self.b.emit(Code::Affinity, r, 0, 0, k, 0);
+                self.b.emit_p4(Code::Affinity, r, k);
                 *slot = Some((r, bd.incl));
             }
         }
@@ -2137,7 +2145,7 @@ impl<'p> G<'p, '_> {
         let fin = self.b.label();
         let regs = self.bound_vals([a.lo.as_ref(), a.hi.as_ref()]);
         for r in regs.iter().flatten() {
-            self.b.jump(Code::IsNull, r.0, fin, 0, 0, 0);
+            self.b.jump_to(Code::IsNull, r.0, fin);
         }
         let mut ends = [None, None];
         for (i, (slot, r)) in ends.iter_mut().zip(regs).enumerate() {
@@ -2147,31 +2155,31 @@ impl<'p> G<'p, '_> {
                 *slot = Some(r);
             }
         }
-        self.b.emit(Code::EphMark, e, 0, 0, 0, 0);
+        self.b.emit2(Code::EphMark, e, 0);
         let top = self.b.label();
         let done = self.b.label();
         match ends[0] {
             Some(r) => {
                 let whole = self.b.label();
-                self.b.jump(Code::IsNull, r, whole, 0, 0, 0);
-                self.b.jump(Code::SeekGE, t, done, r, 0, 0);
-                self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                self.b.jump_to(Code::IsNull, r, whole);
+                self.b.jump3(Code::SeekGE, t, done, r);
+                self.b.jump_to(Code::Goto, 0, top);
                 self.b.here(whole);
-                self.b.jump(Code::Rewind, t, done, 0, 0, 0);
+                self.b.jump_to(Code::Rewind, t, done);
             }
-            None => self.b.jump(Code::Rewind, t, done, 0, 0, 0),
+            None => self.b.jump_to(Code::Rewind, t, done),
         }
         self.b.here(top);
         if let Some(h) = ends[1] {
             let tmp = self.tmp;
-            self.b.emit(Code::Rowid, t, tmp, 0, 0, 0);
-            self.b.jump(Code::Gt, tmp, done, h, 0, 0);
+            self.b.emit2(Code::Rowid, t, tmp);
+            self.b.jump3(Code::Gt, tmp, done, h);
         }
-        self.b.emit(Code::EphAdd, e, t, 0, 0, 0);
-        self.b.jump(Code::Next, t, top, 0, 0, 0);
+        self.b.emit2(Code::EphAdd, e, t);
+        self.b.jump_to(Code::Next, t, top);
         self.b.here(done);
         if a.reverse {
-            self.b.emit(Code::EphReverse, e, 0, 0, 0, 0);
+            self.b.emit2(Code::EphReverse, e, 0);
         }
         self.b.here(fin);
         Some(())
@@ -2191,7 +2199,7 @@ impl<'p> G<'p, '_> {
         #[cfg(feature = "sql")]
         if let Some(e) = &p.sub {
             let l = self.b.cursor();
-            self.b.emit(Code::EphOpen, l, 0, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, l, 0);
             let k = self.b.p4(P4::Probe(alloc::boxed::Box::new(
                 super::super::index::ProbeInfo {
                     n: 0,
@@ -2210,7 +2218,7 @@ impl<'p> G<'p, '_> {
             self.val(v, Cx::Acc, regs.saturating_add(i as u32));
         }
         let l = self.b.cursor();
-        self.b.emit(Code::EphOpen, l, 0, 0, 0, 0);
+        self.b.emit2(Code::EphOpen, l, 0);
         let k = self.b.p4(P4::Probe(alloc::boxed::Box::new(
             super::super::index::ProbeInfo {
                 n: p.vals.len(),
@@ -2233,7 +2241,7 @@ impl<'p> G<'p, '_> {
         let fin = self.b.label();
         let bounds = self.bound_vals([a.lo.as_ref(), a.hi.as_ref()]);
         for r in bounds.iter().flatten() {
-            self.b.jump(Code::IsNull, r.0, fin, 0, 0, 0);
+            self.b.jump_to(Code::IsNull, r.0, fin);
         }
         // A skip-scan: each distinct value of the skipped leading
         // columns, in key order, then the walk with them (its bounds
@@ -2249,27 +2257,27 @@ impl<'p> G<'p, '_> {
             let i = self.b.cursor();
             let pl = self.b.cursor();
             let n = a.skip as u32;
-            self.b.emit(Code::IdxOpen, i, 0, 0, ii, 0);
-            self.b.emit(Code::EphOpen, pl, 0, 0, 0, 0);
+            self.b.emit_p4(Code::IdxOpen, i, ii);
+            self.b.emit2(Code::EphOpen, pl, 0);
             let top = self.b.label();
             let done = self.b.label();
-            self.b.jump(Code::IdxRewind, i, done, 0, 0, 0);
+            self.b.jump_to(Code::IdxRewind, i, done);
             self.b.here(top);
             self.b.emit(Code::SkipAdd, pl, i, n, ii, 0);
-            self.b.jump(Code::IdxNext, i, top, 0, 0, 0);
+            self.b.jump_to(Code::IdxNext, i, top);
             self.b.here(done);
             if a.reverse {
-                self.b.emit(Code::EphReverse, pl, 0, 0, 0, 0);
+                self.b.emit2(Code::EphReverse, pl, 0);
             }
             let ploop = self.b.label();
             let pnext = self.b.label();
-            self.b.jump(Code::EphRewind, pl, fin, 0, 0, 0);
+            self.b.jump_to(Code::EphRewind, pl, fin);
             self.b.here(ploop);
             let pv = self.b.regs(a.skip);
-            self.b.emit(Code::ListValues, pl, pv, n, 0, 0);
+            self.b.emit3(Code::ListValues, pl, pv, n);
             let bounds = self.bound_vals([a.lo.as_ref(), a.hi.as_ref()]);
             for r in bounds.iter().flatten() {
-                self.b.jump(Code::IsNull, r.0, pnext, 0, 0, 0);
+                self.b.jump_to(Code::IsNull, r.0, pnext);
             }
             let mut lists: AVec<PSrc> = AVec::new();
             for j in 0..a.skip {
@@ -2287,7 +2295,7 @@ impl<'p> G<'p, '_> {
             }
             self.combos(t, a, e, lists.as_slice(), bounds, pnext)?;
             self.b.here(pnext);
-            self.b.jump(Code::EphNext, pl, ploop, 0, 0, 0);
+            self.b.jump_to(Code::EphNext, pl, ploop);
             self.b.here(fin);
             return Some(());
         }
@@ -2304,13 +2312,13 @@ impl<'p> G<'p, '_> {
             let top = self.b.label();
             let next = self.b.label();
             let r = self.b.reg();
-            self.b.jump(Code::EphRewind, l, fin, 0, 0, 0);
+            self.b.jump_to(Code::EphRewind, l, fin);
             self.b.here(top);
-            self.b.emit(Code::ListValue, l, r, 0, 0, 0);
-            self.b.jump(Code::SeekRowid, t, next, r, 0, 0);
-            self.b.emit(Code::EphAdd, e, t, 0, 0, 0);
+            self.b.emit2(Code::ListValue, l, r);
+            self.b.jump3(Code::SeekRowid, t, next, r);
+            self.b.emit2(Code::EphAdd, e, t);
             self.b.here(next);
-            self.b.jump(Code::EphNext, l, top, 0, 0, 0);
+            self.b.jump_to(Code::EphNext, l, top);
             self.b.here(fin);
             return Some(());
         }
@@ -2346,7 +2354,7 @@ impl<'p> G<'p, '_> {
             },
         )));
         let i = self.b.cursor();
-        self.b.emit(Code::IdxOpen, i, 0, 0, ii, 0);
+        self.b.emit_p4(Code::IdxOpen, i, ii);
         // The combination's values, then the range's start.
         let pr = self.b.regs(nprefix.saturating_add(1));
         let mut nexts: AVec<(Label, u32)> = AVec::new();
@@ -2357,19 +2365,19 @@ impl<'p> G<'p, '_> {
                 PSrc::List(l) => {
                     let top = self.b.label();
                     let next = self.b.label();
-                    self.b.jump(Code::EphRewind, l, exit, 0, 0, 0);
+                    self.b.jump_to(Code::EphRewind, l, exit);
                     self.b.here(top);
-                    self.b.emit(Code::ListValue, l, dest, 0, 0, 0);
+                    self.b.emit2(Code::ListValue, l, dest);
                     nexts.push((next, l));
                     // (`top` is where its EphNext returns.)
                     nexts.push((top, u32::MAX));
                     exit = next;
                 }
                 #[cfg(feature = "planner")]
-                PSrc::Reg(r) => self.b.emit(Code::Copy, r, dest, 0, 0, 0),
+                PSrc::Reg(r) => self.b.emit2(Code::Copy, r, dest),
             }
         }
-        self.b.emit(Code::EphMark, e, 0, 0, 0, 0);
+        self.b.emit2(Code::EphMark, e, 0);
         let k = nprefix;
         let ko = a.desc.as_slice().get(k).copied().unwrap_or_default();
         let [lo, hi] = bounds;
@@ -2383,7 +2391,7 @@ impl<'p> G<'p, '_> {
         let wtop = self.b.label();
         let wnext = self.b.label();
         match start {
-            None if nprefix == 0 => self.b.jump(Code::IdxRewind, i, walked, 0, 0, 0),
+            None if nprefix == 0 => self.b.jump_to(Code::IdxRewind, i, walked),
             _ => {
                 let mut n = nprefix as u32;
                 if let Some((r, _)) = start {
@@ -2425,16 +2433,16 @@ impl<'p> G<'p, '_> {
             }
             None => {
                 let r = self.b.reg();
-                self.b.emit(Code::IdxRowid, i, r, 0, 0, 0);
-                self.b.jump(Code::SeekRowid, t, wnext, r, 0, 0);
-                self.b.emit(Code::EphAdd, e, t, fl, 0, 0);
+                self.b.emit2(Code::IdxRowid, i, r);
+                self.b.jump3(Code::SeekRowid, t, wnext, r);
+                self.b.emit3(Code::EphAdd, e, t, fl);
             }
         }
         self.b.here(wnext);
-        self.b.jump(Code::IdxNext, i, wtop, 0, 0, 0);
+        self.b.jump_to(Code::IdxNext, i, wtop);
         self.b.here(walked);
         if a.reverse {
-            self.b.emit(Code::EphReverse, e, 0, 0, 0, 0);
+            self.b.emit2(Code::EphReverse, e, 0);
         }
         if let Some((_, first)) = a.bignull {
             self.b.emit(Code::EphNulls, e, 0, 0, 0, u8::from(first));
@@ -2447,9 +2455,9 @@ impl<'p> G<'p, '_> {
         }
         for (next, top, l) in pairs.iter().rev() {
             self.b.here(*next);
-            self.b.jump(Code::EphNext, *l, *top, 0, 0, 0);
+            self.b.jump_to(Code::EphNext, *l, *top);
         }
-        self.b.jump(Code::Goto, 0, fin, 0, 0, 0);
+        self.b.jump_to(Code::Goto, 0, fin);
         Some(())
     }
 
@@ -2479,33 +2487,32 @@ impl<'p> G<'p, '_> {
         let t = self.lvl(d)?.t;
         for (k, sub) in o.subs.iter().enumerate() {
             let tk = self.b.cursor();
-            self.b.emit(Code::EphOpen, tk, 0, 0, 0, 0);
+            self.b.emit2(Code::EphOpen, tk, 0);
             match &sub.acc {
                 Some(a) => self.access_rows(d, a, tk, false)?,
                 None => {
                     let top = self.b.label();
                     let done = self.b.label();
-                    self.b.jump(Code::Rewind, t, done, 0, 0, 0);
+                    self.b.jump_to(Code::Rewind, t, done);
                     self.b.here(top);
-                    self.b.emit(Code::EphAdd, tk, t, 0, 0, 0);
-                    self.b.jump(Code::Next, t, top, 0, 0, 0);
+                    self.b.emit2(Code::EphAdd, tk, t);
+                    self.b.jump_to(Code::Next, t, top);
                     self.b.here(done);
                 }
             }
             let top = self.b.label();
             let next = self.b.label();
             let done = self.b.label();
-            self.b.jump(Code::EphRewind, tk, done, 0, 0, 0);
+            self.b.jump_to(Code::EphRewind, tk, done);
             self.b.here(top);
-            self.b
-                .emit(Code::Load, tk, o.base as u32, o.src as u32, 0, 0);
+            self.b.emit3(Code::Load, tk, o.base as u32, o.src as u32);
             // (Holding a subquery, a branch's condition is its value's
             // truth, `eval_row_sub`, as today.)
             #[cfg(feature = "sql")]
             if super::sub::real_sub(self.b, &sub.cond) {
                 let tmp = self.tmp;
                 self.val_sub(&sub.cond, Cx::Acc, tmp, EVAL_COND);
-                self.b.jump(Code::IfNot, tmp, next, 0, 0, 0);
+                self.b.jump_to(Code::IfNot, tmp, next);
             } else {
                 self.test(&sub.cond, Cx::Acc, next);
             }
@@ -2520,16 +2527,16 @@ impl<'p> G<'p, '_> {
                     } else {
                         self.val_preset(&prev.cond, Cx::Acc, tmp, EVAL_COND);
                     }
-                    self.b.jump(Code::If, tmp, next, 0, 0, 0);
+                    self.b.jump_to(Code::If, tmp, next);
                     continue;
                 }
                 let kk = self.b.p4(P4::Expr(prev.cond.clone()));
                 self.b.emit(Code::Eval, 0, tmp, 0, kk, EVAL_COND | EVAL_ACC);
-                self.b.jump(Code::If, tmp, next, 0, 0, 0);
+                self.b.jump_to(Code::If, tmp, next);
             }
-            self.b.emit(Code::EphAdd, e, tk, 0, 0, 0);
+            self.b.emit2(Code::EphAdd, e, tk);
             self.b.here(next);
-            self.b.jump(Code::EphNext, tk, top, 0, 0, 0);
+            self.b.jump_to(Code::EphNext, tk, top);
             self.b.here(done);
         }
         Some(())
@@ -2543,16 +2550,16 @@ impl<'p> G<'p, '_> {
         let next = self.b.label();
         let none = self.b.label();
         let done = self.b.label();
-        self.b.jump(Code::EphRewind, e, none, 0, 0, 0);
+        self.b.jump_to(Code::EphRewind, e, none);
         self.b.here(top);
-        self.b.emit(Code::Load, e, f.1 as u32, f.2 as u32, 0, 0);
+        self.b.emit3(Code::Load, e, f.1 as u32, f.2 as u32);
         self.test(&f.0, Cx::Acc, next);
-        self.b.emit(Code::EphKeep, e, 0, 0, 0, 0);
-        self.b.jump(Code::Goto, 0, done, 0, 0, 0);
+        self.b.emit2(Code::EphKeep, e, 0);
+        self.b.jump_to(Code::Goto, 0, done);
         self.b.here(next);
-        self.b.jump(Code::EphNext, e, top, 0, 0, 0);
+        self.b.jump_to(Code::EphNext, e, top);
         self.b.here(none);
-        self.b.emit(Code::EphOpen, e, 0, 0, 0, 0);
+        self.b.emit2(Code::EphOpen, e, 0);
         self.b.here(done);
         Some(())
     }
@@ -2643,7 +2650,7 @@ impl G<'_, '_> {
                 i = i.saturating_add(1);
             }
         }
-        self.b.emit(Code::WinAdd, w, regs, gp, 0, 0);
+        self.b.emit3(Code::WinAdd, w, regs, gp);
     }
 
     /// The output of a window query, after its rows or groups: the
@@ -2664,13 +2671,13 @@ impl G<'_, '_> {
                 self.b.jump(Code::WinLoad, w, done, 0, 0, 1);
                 self.b.here(top);
                 self.win_unit(w, Cx::Acc, 0);
-                self.b.jump(Code::WinLoad, w, done, 0, 0, 0);
-                self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+                self.b.jump_to(Code::WinLoad, w, done);
+                self.b.jump_to(Code::Goto, 0, top);
                 self.b.here(done);
                 0
             }
         };
-        self.b.emit(Code::WinCompute, w, 0, 0, 0, 0);
+        self.b.emit2(Code::WinCompute, w, 0);
         let done = self.b.label();
         let top = self.b.label();
         let next = self.b.label();
@@ -2684,8 +2691,8 @@ impl G<'_, '_> {
         self.emit(out, cx, None, next);
         self.wflag = 0;
         self.b.here(next);
-        self.b.jump(Code::WinNext, w, done, gp, 0, 0);
-        self.b.jump(Code::Goto, 0, top, 0, 0, 0);
+        self.b.jump3(Code::WinNext, w, done, gp);
+        self.b.jump_to(Code::Goto, 0, top);
         self.b.here(done);
     }
 }
