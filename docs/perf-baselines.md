@@ -195,3 +195,27 @@ dhat (n=1000): 1,041,475 -> 535,229 blocks (-48.6%); 198,910,292 ->
 
 Size gates: tiny +828 B, full +776 B, max +752 B, xl +744 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## index_insert validates every leaf cell twice (baseline at 0e4687f)
+
+`bolt_workload` (callgrind, release + debuginfo). In the common case
+(the new cell fits), `index_insert_core` computes every leaf cell's
+layout in `index_search_raw` (to validate the page and sum the cell
+lengths) and then again in `write_index_leaf_inserted` (to copy each
+cell into the new image): `index_cell_layout` runs ~2x per cell.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 268,235,071   |
+| 1000 | 626,649,402   |
+| 2000 | 1,526,801,879 |
+
+n=1000 profile: `index_insert_core` inclusive 265,845,678 (42.42%);
+`index_cell_layout` inclusive 99,904,355 (15.94%), of which
+48,768,787 (7.78%, 566,692 calls) from `index_search_raw` and
+48,094,812 (7.67%, 559,242 calls) from `write_index_leaf_inserted`
+(inlined into `index_insert_core`). dhat (n=1000): 535,229 blocks,
+143,513,712 bytes.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
