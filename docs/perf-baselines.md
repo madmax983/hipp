@@ -195,3 +195,55 @@ dhat (n=1000): 1,041,475 -> 535,229 blocks (-48.6%); 198,910,292 ->
 
 Size gates: tiny +828 B, full +776 B, max +752 B, xl +744 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## index_insert validates every leaf cell twice (baseline at 0e4687f)
+
+`bolt_workload` (callgrind, release + debuginfo). In the common case
+(the new cell fits), `index_insert_core` computes every leaf cell's
+layout in `index_search_raw` (to validate the page and sum the cell
+lengths) and then again in `write_index_leaf_inserted` (to copy each
+cell into the new image): `index_cell_layout` runs ~2x per cell.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 268,235,071   |
+| 1000 | 626,649,402   |
+| 2000 | 1,526,801,879 |
+
+n=1000 profile: `index_insert_core` inclusive 265,845,678 (42.42%);
+`index_cell_layout` inclusive 99,904,355 (15.94%), of which
+48,768,787 (7.78%, 566,692 calls) from `index_search_raw` and
+48,094,812 (7.67%, 559,242 calls) from `write_index_leaf_inserted`
+(inlined into `index_insert_core`). dhat (n=1000): 535,229 blocks,
+143,513,712 bytes.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: reuse the leaf's validated cell spans
+
+`index_search_raw` keeps each cell's `(offset, on-page length)` (as
+`u16`s, reserved once per page) while it validates the page, and
+`write_index_leaf_inserted` copies the cells from those spans instead
+of laying every cell out again. Workload checksums identical; an
+index-heavy file (DESC / UNIQUE NOCASE / multi-column indexes, keys
+with overflow, deletes, updates, a late CREATE INDEX, INSERT ...
+SELECT, a WITHOUT ROWID table with a secondary index) at 512 B and
+4096 B pages is byte-identical (cmp) before/after. Test pass/fail set
+identical (1002 tests; failures are the absent `sqlite3` oracle).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 268,235,071   | 250,102,694   | -6.76%  |
+| 1000 | 626,649,402   | 582,822,372   | -6.99%  |
+| 2000 | 1,526,801,879 | 1,425,425,432 | -6.64%  |
+
+n=1000: `index_insert_core` inclusive 265,845,678 -> 221,704,757
+(-16.6%); `index_cell_layout` inclusive 99,904,355 -> 51,809,543
+(-48.1%). dhat (n=1000): 535,229 -> 538,328 blocks (+0.58%, one
+span buffer per index insert), 143,513,712 -> 145,792,820 bytes
+(+1.59%); peak (t-gmax) unchanged at 852,156 B. Storing the spans as
+`usize` pairs measured -7.69% Ir but +6.35% bytes; `u16` was kept.
+
+Size gates: tiny unchanged; full +184 B, max +24 B, xl +40 B;
+ratchets raised by those amounts (each well under `justify_over`).

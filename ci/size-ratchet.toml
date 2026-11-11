@@ -44,7 +44,11 @@ justify_over = 4096
 # OP_RealAffinity: a silent wrong answer); the compound affinity
 # searches for the first core with one. (The flip itself was not
 # taken: its probe is still over every ratchet.)
-ratchet = 478020
+# +184 B (Bolt): index_insert reuses the leaf's validated cell spans
+# (-7.0% instructions on bolt_workload).
+# Merged with main (Bolt, PR #24): measured 478,220, the sum of
+# both raises +16 B of alignment padding.
+ratchet = 478220
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -77,7 +81,10 @@ justify_over = 16384
 # OP_RealAffinity: a silent wrong answer); the compound affinity
 # searches for the first core with one. (The flip itself was not
 # taken: its probe is still over every ratchet.)
-ratchet = 964684
+# +24 B (Bolt): index_insert reuses the leaf's validated cell spans
+# (-7.0% instructions on bolt_workload).
+# Merged with main (Bolt, PR #24): measured 964,708, the sum of both raises.
+ratchet = 964708
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -103,7 +110,11 @@ justify_over = 32768
 # OP_RealAffinity: a silent wrong answer); the compound affinity
 # searches for the first core with one. (The flip itself was not
 # taken: its probe is still over every ratchet.)
-ratchet = 1061416
+# +40 B (Bolt): index_insert reuses the leaf's validated cell spans
+# (-7.0% instructions on bolt_workload).
+# Merged with main (Bolt, PR #24): measured 1,061,432, the sum of
+# both raises -24 B of alignment padding.
+ratchet = 1061432
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
