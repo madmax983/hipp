@@ -311,14 +311,25 @@ AFTER INSERT trigger (`INSERT VALUES`, an upsert with RETURNING,
 `UPDATE ... WHERE`, a parent `DELETE`, `UPDATE ... FROM`, `INSERT OR
 REPLACE ... SELECT`) gives 28-114 instructions each, the trigger as a
 separate `Program` frame (`Init` ... `Halt`, `Param` for NEW). They
-use about 25 write-only opcodes the Stage 2 VM does not have
-(OpenWrite, NewRowid, MakeRecord, Insert, Delete, IdxInsert,
-IdxDelete, NotExists / NoConflict, MustBeInt, SoftNull, Affinity,
-constraint `Halt`s, FkCounter / FkIfZero / FkCheck, Program / Param,
-ResetCount, RowSetAdd / RowSetRead, OpenEphemeral, IntCopy, AddImm,
-Trace, DeferredSeek): each `Insert` / `IdxDelete` maps onto one
-B-tree write call, which is why the probe keeps the B-tree write
-primitives. No behaviour is claimed, so no differential test changes.
+use 22 opcodes the Stage 2 VM has no counterpart for:
+OpenWrite; NewRowid, MakeRecord, Insert, Delete, IdxInsert and
+IdxDelete on a real table (the pin also emits the first five on
+ephemeral cursors in read programs, which the VM's `Eph*` row lists
+already cover); NotExists / NoConflict, SoftNull, constraint `Halt`s,
+FkCounter / FkIfZero / FkCheck, Program / Param, ResetCount,
+RowSetAdd / RowSetRead, IntCopy, AddImm and Trace. Each `Insert` /
+`IdxDelete` maps onto one B-tree write call, which is why the probe
+keeps the B-tree write primitives. The write programs also use
+opcodes that are not write-only, and the VM already has these or
+their equivalents: MustBeInt (the VM's `MustBeInt`), Affinity (the
+VM's `Affinity`, under `expr_index`, which converts only for an index
+comparison today, so a write's column affinity would widen it),
+OpenEphemeral (`EphOpen`) and DeferredSeek (the pin's read programs
+use it for an index-to-table seek too; the VM uses `IdxRowid` +
+`SeekRowid`). Re-checked live against the pin: MustBeInt, Affinity,
+OpenEphemeral and DeferredSeek all appear in read-only `EXPLAIN
+SELECT` programs. No behaviour is claimed, so no differential test
+changes.
 
 **Tests.** None added: the unit changes no behaviour (the cuts exist
 only under `--cfg hipp_s3_probe`, a build that is measured, never
