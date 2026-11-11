@@ -572,6 +572,7 @@ fn placeholder(id: usize) -> SubPlan {
         scalar_col: 0,
         rec: None,
         mat: 0,
+        real_cols: AVec::new(),
         #[cfg(feature = "explain")]
         sel: 0,
         #[cfg(feature = "planner")]
@@ -905,6 +906,9 @@ fn recursive(
     let regs = b.regs(width);
     b.here(top);
     b.jump3(Code::QueuePop, q, end, cur);
+    for c in p.real_cols.iter() {
+        b.emit2(Code::EphReal, cur, *c as u32);
+    }
     if let Some(o) = off {
         b.jump3(Code::IfPos, o, feed, 1);
     }

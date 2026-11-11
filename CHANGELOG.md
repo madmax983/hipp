@@ -5,6 +5,30 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM: the flip retry, not taken; REAL affinity through subqueries (wave 14, unit `vm_flip` retry)
+
+- The flip (the VM as the only SELECT path) was not taken: the flip
+  probe is still over every ratchet (full +16,548, max +46,668, xl
+  +53,060 B), so nothing of the legacy executors or the `vm` feature
+  changed (STATUS.md).
+- Fix (ungated, `sql`; both executors): a FROM subquery, view or CTE
+  column whose compound affinity is REAL reads another core's
+  integers as reals, as the pin's `OP_RealAffinity` does (`SELECT x
+  FROM (SELECT real_c x FROM t UNION ALL SELECT 1)` is `1.0`); a
+  recursive CTE's queue reads alike; a plain subquery the pin does not
+  flatten too (with `planner`).
+- Fix: a compound column's affinity comes from the first core whose
+  item has one (`SELECT 1 x UNION SELECT real_c ...` is REAL), in
+  derived tables, CREATE TABLE ... AS, recursive CTEs and PRAGMA
+  table_info of a view.
+- Fix: a scalar subquery's affinity in CREATE TABLE ... AS and PRAGMA
+  table_info is its rightmost core's, as the pin's (and hipp's own
+  comparisons') — hipp read the leftmost.
+- Tests: `tests/compound_affinity_v17.rs` (repros, shapes, 240
+  generated compounds, each engine), `hipp-cli/tests/cli_v17_compound_affinity.rs`.
+- Sizes: tiny +0, full +232 B (478,020), max +608 B (964,684), xl
+  +272 B (1,061,416); ratchets raised to the measured figures.
+
 ### The bytecode VM: shrinking it before the flip (unit `vm_shrink`, hidden feature `vm`)
 
 - A reproducible flip probe: `ci/flip_probe.sh` builds full / max /

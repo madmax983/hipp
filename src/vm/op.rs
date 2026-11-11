@@ -343,6 +343,11 @@ pub(crate) enum Code {
     /// shared materialization).
     #[cfg(feature = "sql")]
     EphCopy,
+    /// Row list `p1`'s rows: column `p2`'s integers become reals (a
+    /// FROM subquery's REAL column, `SubPlan::real_cols`; the pin's
+    /// `OP_RealAffinity`).
+    #[cfg(feature = "sql")]
+    EphReal,
     /// Row list `p1` to row `p3` (a register); jump to `p2` past its
     /// end (a growing first source read on from where it was).
     #[cfg(feature = "sql")]

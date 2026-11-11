@@ -3202,7 +3202,6 @@ impl<S: Storage> Connection<S> {
         sel: &SelectStmt,
     ) -> Result<Plan, S::Error> {
         use crate::record::Affinity;
-        use crate::rules::item_affinity;
         let plan = self.plan_subquery(sel, arena, &[])?;
         let w = plan.width();
         let mut names = self.result_col_names(&plan, (0, 0))?;
@@ -3212,11 +3211,12 @@ impl<S: Storage> Connection<S> {
             // Demoted across compound cores; a numeric CAST is the
             // pin's FLEXNUM, declared ` NUM`.
             let aff = crate::rules::compound_affinity(
-                item.map_or(Affinity::Blob, item_affinity),
+                item.and_then(crate::query::item_result_affinity),
                 item,
                 plan.compound.iter().map(|(_, t)| &**t),
                 i,
-            );
+            )
+            .unwrap_or(Affinity::Blob);
             affs.push(aff);
         }
         crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
@@ -3743,6 +3743,7 @@ impl<S: Storage> Connection<S> {
                 scalar_col: 0,
                 rec: None,
                 mat: 0,
+                real_cols: AVec::new(),
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
                 #[cfg(feature = "planner")]
@@ -3794,6 +3795,8 @@ impl<S: Storage> Connection<S> {
             rec: None,
             #[cfg(feature = "sql")]
             mat: 0,
+            #[cfg(feature = "sql")]
+            real_cols: AVec::new(),
             #[cfg(feature = "explain")]
             sel: stmt.sel,
             #[cfg(feature = "planner")]
@@ -5727,16 +5730,31 @@ impl<S: Storage> Connection<S> {
         #[cfg(not(feature = "sql"))]
         let mut names = dplan.result_names.clone();
         crate::rules::unique_names::<S::Error>(names.as_mut_slice())?;
+        // The pin reads a REAL column of a subquery it does not
+        // flatten with `OP_RealAffinity` (v0.17 review fix,
+        // ungated): a compound never is (it would be with equal
+        // affinities, whose REAL items already read as reals); a
+        // plain core is when the flattener's model says so, and
+        // without that model (no `planner`) is taken to be.
+        #[cfg(feature = "planner")]
+        let realify = s.derived.is_some() && (!dplan.compound.is_empty() || !s.flat);
+        #[cfg(not(feature = "planner"))]
+        let realify = s.derived.is_some() && !dplan.compound.is_empty();
+        let mut real_cols = AVec::new();
         for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
             // A compound's column affinity is demoted across
             // its cores, as on the pin (ungated fix: `(SELECT
             // text_col ... UNION ALL SELECT 5)` compared as
             // TEXT).
             let aff = derived_col_affinity(&dplan, i, *aff);
+            if realify && aff == crate::record::Affinity::Real {
+                real_cols.push(i);
+            }
             cols.push((nm.clone(), aff));
             affs.push(crate::record::Affinity::Blob);
             defaults.push(OwnedValue::Null);
         }
+        dplan.real_cols = real_cols;
         let qual = match s.alias {
             Some(a) => copy_vec(handle_bytes(arena, a)),
             // A table-valued function is named by its
@@ -12319,7 +12337,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     };
                     let mut rows = AVec::new();
                     for r in inner.iter() {
-                        rows.push((r.clone(), None));
+                        let mut r = r.clone();
+                        crate::rules::real_row(r.as_mut_slice(), d.real_cols.as_slice());
+                        rows.push((r, None));
                     }
                     src_rows.push(rows);
                     continue;
@@ -16166,11 +16186,11 @@ fn derived_col_affinity(
     i: usize,
     aff: Option<crate::record::Affinity>,
 ) -> crate::record::Affinity {
-    let a = aff.unwrap_or(crate::record::Affinity::Blob);
     crate::rules::compound_affinity(
-        a,
+        aff,
         plan.items.as_slice().get(i),
         plan.compound.iter().map(|(_, t)| &**t),
         i,
     )
+    .unwrap_or(crate::record::Affinity::Blob)
 }

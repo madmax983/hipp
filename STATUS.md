@@ -11,6 +11,136 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### VM (ADR 0005 Stage 2): vm_flip retry — not taken; review fixes (2026-11-11)
+
+Wave 14's second unit was to make the VM the only SELECT path, delete
+the legacy read executors and the `vm` feature, and lower every
+ratchet, **only if the flip probe fits**. It does not:
+`ci/flip_probe.sh` at c2914be (vm_shrink) measured full 494,336
+(+16,548 over the 477,788 ratchet), max 1,010,744 (+46,668 over
+964,076) and xl 1,114,204 (+53,060 over 1,061,144) — vm_shrink's own
+final figures, reproduced by the review in a separate target
+directory. So the unit stopped before any deletion, as its rule
+says: the legacy executors, the `vm` feature, `cfg(hipp_flip_probe)`,
+`ci/flip_probe.sh`, `Config::vm_strict` / `vm_off`,
+`Error::VmFallback` and `Statement::runs_on_vm` are all unchanged, no
+CI line changed (the restart-heavy smallest-cache line was not
+added), and no ratchet went down. Even the probe's best case (it
+leaves out the VM-backed replacements writes would need) is 16.5 /
+46.7 / 53.1 KB over, while the read executor the flip deletes is
+about 27 KB (full) and 36 KB (xl): taking the flip needs a change of
+scope (an owner-approved re-baseline, or Stage 3 deleting the async
+source readers and the write executors' row loops in the same step).
+
+**Review fix shipped** (ungated correctness on the `sql` derived-table
+path, both executors — today's and the VM's):
+
+- *A REAL compound column read through a FROM subquery, view or
+  CTE* (wrong answer). The pin reads a REAL column of a subquery it
+  does not flatten with `OP_RealAffinity`, so another core's
+  integers read as reals: `SELECT x, typeof(x) FROM (SELECT c x FROM
+  t UNION ALL SELECT 1)` over a REAL `c` is `1.0|real`; hipp gave
+  `1|integer` (and `max(x)`, `typeof`, `||`, printing alike). The
+  derived plan now carries the columns its reader converts
+  (`SubPlan::real_cols`, set by `plan_derived_source`), applied where
+  today's executor materialises a derived source (`materialise_sources_sub`,
+  the streamed join's level cache) and, on the VM, by a new
+  `EphReal` opcode after a FROM subquery's row list is built. A
+  recursive CTE's queue reads alike (pin-verified: the step's
+  `typeof(x)` of a REAL column is `real`), so `exec_recursive` and the
+  VM's `QueuePop` convert each row they take from it. A compound is
+  never flattened by the pin when its cores' affinities differ (its
+  rule 17h), so a compound always converts; a plain core converts
+  only when the flattener's model (`planner`) says the pin does not
+  flatten it (its GROUP BY, its DISTINCT, an outer DISTINCT over its
+  LIMIT — pin-probed), since a flattened core's item reads as itself.
+- *The compound's affinity comes from the first core whose item has
+  one* (wrong answer, same family). The pin's
+  `sqlite3SubqueryColumnTypes` skips cores whose item has no affinity
+  (a literal, an expression, an aggregate) — `SELECT 1 x UNION SELECT
+  c FROM t` is REAL — and a column (even an untyped one, BLOB), a
+  CAST or a scalar subquery stops the search; the demotion bits count
+  every core, the skipped ones included (`SELECT 'a' x UNION ALL
+  SELECT c ... UNION ALL SELECT 1` is BLOB). hipp read only the
+  leftmost core. `rules::compound_affinity` now takes the head's
+  affinity as an `Option` and searches; CTAS, derived tables, the
+  recursive CTE's column affinities and PRAGMA table_info of a view
+  all go through it (`CREATE VIEW v2 AS SELECT 1 x UNION ALL SELECT c
+  FROM t` now shows `REAL`, as the pin; the recursive CTE `(SELECT 1
+  UNION ALL SELECT c FROM t, r ...)` is REAL).
+- *A scalar subquery's affinity is its rightmost core's* (wrong
+  answer, same pattern elsewhere). `rules::item_affinity` and PRAGMA's
+  `view_aff` read a scalar subquery's leftmost core's first item; the
+  pin's `sqlite3ExprAffinity` reads `pSelect`, the rightmost core,
+  as the comparison path (`query::sub_col_affinity`) already did.
+  Both now delegate to `query::item_result_affinity`: `CREATE TABLE ct
+  AS SELECT (SELECT c FROM t UNION ALL SELECT 1) y` declares no type
+  (hipp declared REAL and stored `1.0`), and `PRAGMA table_info` of
+  such a view prints the pin's type. Two duplicate affinity helpers
+  are gone.
+
+**Oracle-probing notes** (live pin, 3.54.1): EXPLAIN shows the
+reader's `Copy` + `RealAffinity` on each co-routine column read and
+the step's `Column` + `RealAffinity` on the queue; a top-level
+compound (no subquery) is not converted (`SELECT c FROM t UNION ALL
+SELECT 1` prints `1`); `CAST(5 AS REAL) x UNION ALL SELECT 2` is
+FLEXNUM (`2|integer`) because the CAST is in the leftmost core, but
+`SELECT 1 x UNION ALL SELECT CAST(c AS REAL) ...` is REAL; INTEGER
+and NUMERIC compounds leave a `2.0` arm real; the pin pushes a WHERE
+term into each UNION ALL arm even when the arms' affinities differ
+(the v0.16 honest gap below, still open).
+
+**Tests.** `tests/compound_affinity_v17.rs`: the review's repros and
+89 shapes around them, 6 more under `planner` / `window` (every compound operator, NULL / BLOB / TEXT /
+untyped / CAST / scalar-subquery / COLLATE / rowid cores, nested
+derived tables, joins and LEFT JOINs, IN, BETWEEN, aggregates,
+windows, materialized CTEs, views, recursive CTEs and their queue,
+CTAS and PRAGMA table_info types, INSERT ... SELECT, RETURNING,
+UPDATE ... FROM and scalar-subquery UPDATE, 64-bit extremes), plus
+240 generated compounds (hand-rolled xorshift PRNG) read as a FROM
+subquery, a CTE, a view, a CTAS, a join and an aggregate's input;
+each on hipp's default engine and, with `vm`, on the VM (strict) and
+today's executor. Run green on `std,sql`, `std,sql,vm`, `std,full`,
+`std,max`, default (`xl`) and default + `vm`.
+`hipp-cli/tests/cli_v17_compound_affinity.rs`: byte-identical stdout
+in list, column, box, json, quote and insert modes.
+
+**Gates.** Full `ci/local-gates.sh`: all gates passed. depth_v16 /
+triggers_v16 with debug info: green. Perf baselines not re-run: the
+bolt workload has no FROM subquery, and the change adds one empty-list
+check per derived row.
+
+**Size** (thumbv7em, `--profile tiny`, `hipp_thumb_demo`):
+| profile | before | after | Δ |
+|---|---:|---:|---:|
+| tiny | 76,952 | 76,952 | +0 |
+| full | 477,788 | 478,020 | +232 |
+| max | 964,076 | 964,684 | +608 |
+| xl | 1,061,144 | 1,061,416 | +272 |
+
+Ratchets raised to the measured figures (ungated correctness fix;
+no `sql` in tiny, so tiny is unchanged). Each profile stays well
+under its budget (512 KiB / 1 MiB / 1.25 MiB).
+
+**Honest gaps.**
+
+- The flip itself (above): not taken; every figure in vm_shrink's
+  table still stands.
+- Without `planner` (the `full` profile) hipp has no model of which
+  plain FROM subquery the pin flattens, so a plain core never
+  converts: a REAL item that yields an integer there (only a scalar
+  subquery whose rightmost core is REAL, under a GROUP BY or DISTINCT
+  core) still reads as an integer in `full`.
+- WHERE push-down over a compound of mixed affinity (v0.16 gap, still
+  open): the pin pushes `x = '1'` into each UNION ALL arm and compares
+  with that arm's affinity, so `... (SELECT real_c x ... UNION ALL
+  SELECT 1) WHERE x = '1'` has no row on the pin and one (`1.0`) on
+  hipp.
+- Found while testing, out of this unit's scope: hipp-cli's `.dump`
+  prints a real `1.0` as `1.0` and omits the leading `PRAGMA
+  foreign_keys=OFF;`; the pin prints `1` and the PRAGMA line
+  (pre-existing, independent of subqueries).
+
 ### VM (ADR 0005 Stage 2): vm_shrink (2026-11-11)
 
 Wave 14's first unit (owner decision 2026-11-10: shrink the VM
@@ -6726,7 +6856,9 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   demotes it (`sqlite3SubqueryColumnTypes`): TEXT with a numeric
   item in another core, or numeric with a text one, become none;
   a numeric CAST becomes NUMERIC. Shared with CTAS and the PRAGMA
-  type derivation (`rules::compound_affinity`).
+  type derivation (`rules::compound_affinity`) (completed in v0.17, vm_flip
+  retry review fix: the first core whose item has an affinity gives
+  it, and a REAL column reads other cores' integers as reals).
 - *Declared types in PRAGMA table_info* (v16, PRAGMA unit): a
   type that is one of the pin's standard names (INT, INTEGER,
   REAL, TEXT, BLOB, ANY, any case) prints in its spelling

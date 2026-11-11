@@ -1180,6 +1180,14 @@ pub struct SubPlan {
     /// plan.
     #[cfg(feature = "sql")]
     pub mat: u32,
+    /// The result columns a FROM subquery's reader sees with REAL
+    /// affinity (v0.17 review fix, ungated `sql`): the pin's
+    /// `OP_RealAffinity` on a subquery column whose affinity
+    /// (`rules::compound_affinity`) is REAL, so an integer from
+    /// another compound core reads as a real. Empty except on a
+    /// derived table the pin does not flatten (`Connection::plan_derived_source`).
+    #[cfg(feature = "sql")]
+    pub real_cols: AVec<usize>,
     /// The pin's select number of this core (v0.16, `explain`;
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]

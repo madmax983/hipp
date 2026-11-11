@@ -1402,6 +1402,13 @@ impl Vm {
                 }
                 Flow::Next
             }
+            Code::EphReal => {
+                let cols = [op.p2 as usize];
+                for (v, _) in eph(&mut self.curs, op.p1)?.rows.as_mut_slice() {
+                    crate::rules::real_row(v.as_mut_slice(), &cols);
+                }
+                Flow::Next
+            }
             Code::EphSeek => {
                 let at = usize::try_from(bound_of(&self.regs, op.p3)).unwrap_or(0);
                 let e = eph(&mut self.curs, op.p1)?;

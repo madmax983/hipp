@@ -1488,6 +1488,9 @@ impl G<'_, '_> {
             self.b.emit2(Code::EphOpen, e, 0);
             self.b.emit2(Code::EphCopy, e, se);
         }
+        for c in p.real_cols.iter() {
+            self.b.emit2(Code::EphReal, e, *c as u32);
+        }
         self.b.emit2(Code::AccPop, 0, 0);
         Some(())
     }

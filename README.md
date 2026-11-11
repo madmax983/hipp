@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 477,788 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 964,076 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,061,144 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 478,020 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 964,684 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,061,416 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -285,6 +285,14 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   probe shrank by 18.4 / 6.4 / 7.4 KB but is still 16.5 / 46.7 /
   53.1 KB over the full / max / xl ratchets, so the flip stays out of
   reach. No shipped profile changes (STATUS.md has the figures).
+- **The flip retry, not taken; REAL columns through subqueries**
+  (fix). The flip probe is still over every ratchet, so the VM stays
+  hidden. A FROM subquery, view or CTE column whose compound affinity
+  is REAL reads another core's integers as reals, as on the pin
+  (`SELECT x FROM (SELECT real_c x FROM t UNION ALL SELECT 1)` printed
+  `1`, now `1.0`); the compound's affinity comes from the first core
+  that has one, and a scalar subquery's from its rightmost core (CREATE
+  TABLE ... AS and PRAGMA table_info types; every profile with `sql`).
 
 ## What v0.16 does
 

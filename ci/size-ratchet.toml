@@ -37,7 +37,14 @@ justify_over = 4096
 # an earlier one, the pin's one AggInfo entry each: a silent wrong
 # answer). (`vm_flip` itself delivered nothing: with the VM as the
 # only SELECT path no profile shrinks, so every ratchet stays up.)
-ratchet = 477788
+# 477,788 -> 478,020 (v0.17 vm_flip retry review fix, ungated correctness;
+# STATUS.md): +232 B. A REAL compound column read through a FROM
+# subquery / view / CTE (and a recursive CTE's queue) reads other
+# cores' integers as reals (`SubPlan::real_cols`, the pin's
+# OP_RealAffinity: a silent wrong answer); the compound affinity
+# searches for the first core with one. (The flip itself was not
+# taken: its probe is still over every ratchet.)
+ratchet = 478020
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -63,7 +70,14 @@ justify_over = 16384
 # above, and an enclosing query's aggregate a nested query uses as an
 # index or rowid bound is substituted into the nested plan's access
 # path too (`walk_access_aggs_mut`; it failed with MisusedAggregate).
-ratchet = 964076
+# 964,076 -> 964,684 (v0.17 vm_flip retry review fix, ungated correctness;
+# STATUS.md): +608 B. A REAL compound column read through a FROM
+# subquery / view / CTE (and a recursive CTE's queue) reads other
+# cores' integers as reals (`SubPlan::real_cols`, the pin's
+# OP_RealAffinity: a silent wrong answer); the compound affinity
+# searches for the first core with one. (The flip itself was not
+# taken: its probe is still over every ratchet.)
+ratchet = 964684
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -82,7 +96,14 @@ justify_over = 32768
 # of both raises -24 B of alignment padding.
 # 1,060,496 -> 1,061,144 (v0.17 vm_flip review fixes, ungated
 # correctness, as for `max` above; STATUS.md): +648 B.
-ratchet = 1061144
+# 1,061,144 -> 1,061,416 (v0.17 vm_flip retry review fix, ungated correctness;
+# STATUS.md): +272 B. A REAL compound column read through a FROM
+# subquery / view / CTE (and a recursive CTE's queue) reads other
+# cores' integers as reals (`SubPlan::real_cols`, the pin's
+# OP_RealAffinity: a silent wrong answer); the compound affinity
+# searches for the first core with one. (The flip itself was not
+# taken: its probe is still over every ratchet.)
+ratchet = 1061416
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
