@@ -16,7 +16,13 @@ description = "A little no_std database that reads and writes SQLite database fi
 # `--cfg hipp_flip_probe` (with `vm`; build-only, never run): the flip
 # probe of ADR 0005 Stage 2 (`ci/flip_probe.sh`) cuts today's read
 # executor off so LTO drops it, measuring the flip's best case.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hipp_vm_strict)', 'cfg(hipp_flip_probe)'] }
+# `--cfg hipp_s3_probe` (with `vm`; build-only, never run): the Stage 3
+# probe (`ci/flip_probe.sh --s3`) keeps those cuts and also cuts the
+# write executors, the trigger / foreign-key runners and the VM's async
+# source readers: the combined Stage 2 + 3 flip's best case. With a
+# value (`hipp_s3_probe="readers"` / `"triggers"` / `"fk"` /
+# `"writes"`, next to `hipp_flip_probe`) it cuts that category only.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hipp_vm_strict)', 'cfg(hipp_flip_probe)', 'cfg(hipp_s3_probe, values(none(), "readers", "triggers", "fk", "writes"))'] }
 
 [features]
 default = ["std", "xl"]

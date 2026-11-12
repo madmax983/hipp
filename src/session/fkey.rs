@@ -2065,6 +2065,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         excl: Option<i64>,
         changed: Option<(&[bool], bool)>,
     ) -> Result<(), S::Error> {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // foreign-key runner, cut (Stage 3 compiles FK checks to VM code).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "fk")))]
+        return Ok(());
         let Some(tg) = self.fk.clone() else {
             return Ok(());
         };
@@ -2093,6 +2097,10 @@ impl<'c, S: Storage> Statement<'c, S> {
         rowid: i64,
         changed: Option<(&[bool], bool)>,
     ) -> Result<(), S::Error> {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // foreign-key runner, cut (Stage 3 compiles FK checks to VM code).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "fk")))]
+        return Ok(());
         let Some(tg) = self.fk.clone() else {
             return Ok(());
         };
@@ -2320,6 +2328,11 @@ impl<'c, S: Storage> Statement<'c, S> {
         new: Option<&[OwnedValue]>,
         changed: Option<(&[bool], bool)>,
     ) -> Result<(), S::Error> {
+        // The Stage 3 probe (`ci/flip_probe.sh --s3`; build-only): the
+        // foreign-key runner, cut (Stage 3 compiles FK actions to VM
+        // subprograms).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "fk")))]
+        return Ok(());
         let Some(tg) = self.fk.clone() else {
             return Ok(());
         };
@@ -2533,6 +2546,12 @@ impl<'c, S: Storage> Statement<'c, S> {
     /// Replay the pin's compile of this top-level write (`Sim`) when
     /// some key has a SET NULL action — no other key is ever skipped.
     fn fk_sim(&mut self) {
+        // The Stage 3 probe (ADR 0005, unit `s3_probe`; build-only,
+        // never run: `ci/flip_probe.sh --s3`): the replay serves only
+        // today's write executors' foreign-key sites, which the probe
+        // cuts; a VM write program's sites come from its codegen.
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "fk")))]
+        return;
         let write = match &self.plan {
             Plan::Insert { .. } | Plan::Update { .. } | Plan::Delete { .. } => true,
             #[cfg(feature = "triggers")]

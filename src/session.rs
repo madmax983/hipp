@@ -8906,7 +8906,44 @@ impl<'c, S: Storage> Statement<'c, S> {
         delete_row_completely
     );
 
+    /// The Stage 3 probe (ADR 0005, unit `s3_probe`; build-only,
+    /// never run): B-tree writes stay async in Stage 3, so the VM's
+    /// write opcodes (Insert, Delete, NewRowid, IdxInsert, IdxDelete)
+    /// still call today's B-tree write primitives. The probe cuts the
+    /// write executors that call them today, so this keeps every
+    /// primitive they call reachable (its operands read from the
+    /// statement, so LTO cannot fold it away): only the executors'
+    /// own row loops are measured as deletable. Its glue (a few
+    /// hundred bytes) stays in the probe, a pessimistic error.
+    #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "writes")))]
+    async fn s3_write_primitives(&mut self) -> Result<Step, S::Error> {
+        let root = self.conn.cfg.cache_pages as u32;
+        let rec = copy_vec(handle_bytes(&self.arena, self.sql_text));
+        let pager = &mut self.conn.pager;
+        let rowid = btree::new_rowid(pager, root).await?;
+        btree::btree_insert(pager, root, rowid, rec.as_slice()).await?;
+        #[cfg(feature = "wal")]
+        btree::btree_overwrite(pager, root, rowid, rec.as_slice()).await?;
+        btree::btree_delete(pager, root, rowid).await?;
+        #[cfg(feature = "indexes")]
+        {
+            let desc = [crate::record::KeyOrder::default()];
+            btree::index_insert(pager, root, rec.as_slice(), &desc).await?;
+            btree::index_delete(pager, root, rec.as_slice(), &desc).await?;
+        }
+        Err(Error::VmFallback)
+    }
+
     async fn step_insert(&mut self) -> Result<Step, S::Error> {
+        // The Stage 3 probe (ADR 0005, unit `s3_probe`; build-only,
+        // never run: `ci/flip_probe.sh --s3`): with writes compiled to
+        // VM programs, today's INSERT executor (VALUES, SELECT, upsert,
+        // RETURNING, OR-conflict handling, its trigger and FK firing) is cut off here,
+        // so LTO drops what only it reaches (DDL keeps what it calls);
+        // the B-tree write primitives a VM write opcode calls stay
+        // (`s3_write_primitives`).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "writes")))]
+        return self.s3_write_primitives().await;
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
@@ -10597,6 +10634,13 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "write")]
     async fn step_update(&mut self) -> Result<Step, S::Error> {
+        // The Stage 3 probe (ADR 0005, unit `s3_probe`; build-only,
+        // never run: `ci/flip_probe.sh --s3`): with writes compiled to
+        // VM programs, today's UPDATE executor (incl. FROM, RETURNING,
+        // OR-conflict handling, its trigger and FK firing) is cut off here,
+        // so LTO drops what only it reaches (DDL keeps what it calls).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "writes")))]
+        return Err(Error::VmFallback);
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
@@ -10626,6 +10670,13 @@ impl<'c, S: Storage> Statement<'c, S> {
 
     #[cfg(feature = "write")]
     async fn step_delete(&mut self) -> Result<Step, S::Error> {
+        // The Stage 3 probe (ADR 0005, unit `s3_probe`; build-only,
+        // never run: `ci/flip_probe.sh --s3`): with writes compiled to
+        // VM programs, today's DELETE executor (RETURNING, its trigger
+        // and FK firing) is cut off here,
+        // so LTO drops what only it reaches (DDL keeps what it calls).
+        #[cfg(all(feature = "vm", any(hipp_s3_probe, hipp_s3_probe = "writes")))]
+        return Err(Error::VmFallback);
         if self.phase == Phase::Done {
             return Ok(Step::Done);
         }
@@ -12085,13 +12136,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         // only SELECT path, today's read executor is cut off here, so
         // LTO drops it. Rows a statement loaded itself (PRAGMA,
         // EXPLAIN QUERY PLAN, plain EXPLAIN) are still served below.
-        #[cfg(all(feature = "vm", hipp_flip_probe))]
+        #[cfg(all(feature = "vm", any(hipp_flip_probe, hipp_s3_probe)))]
         if !self.query_loaded {
             return Err(Error::VmFallback);
         }
         // A plan that streams (v0.17, `sql`) returns each row as its
         // join makes it; a blocking one's rows land in `query_rows`.
-        #[cfg(all(feature = "sql", not(all(feature = "vm", hipp_flip_probe))))]
+        #[cfg(all(
+            feature = "sql",
+            not(all(feature = "vm", any(hipp_flip_probe, hipp_s3_probe)))
+        ))]
         if !self.query_loaded {
             // Boxed: the step future (re-entered once per trigger
             // level) stays small.
@@ -12119,7 +12173,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
         }
-        #[cfg(not(all(feature = "vm", hipp_flip_probe)))]
+        #[cfg(not(all(feature = "vm", any(hipp_flip_probe, hipp_s3_probe))))]
         if !self.query_loaded {
             self.run_query().await?;
             self.query_loaded = true;
@@ -13107,12 +13161,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         // The flip probe (see `step_query`): the subquery executor the
         // write paths reach today is cut off too; their VM-backed
         // replacements are not counted (a best case).
-        #[cfg(all(feature = "vm", hipp_flip_probe))]
+        #[cfg(all(feature = "vm", any(hipp_flip_probe, hipp_s3_probe)))]
         {
             let _ = (plan, outer, need);
             alloc::boxed::Box::pin(async { Err(Error::VmFallback) })
         }
-        #[cfg(not(all(feature = "vm", hipp_flip_probe)))]
+        #[cfg(not(all(feature = "vm", any(hipp_flip_probe, hipp_s3_probe))))]
         {
             self.conn.sub_execs += 1;
             alloc::boxed::Box::pin(self.exec_subplan_inner(plan, outer, need))

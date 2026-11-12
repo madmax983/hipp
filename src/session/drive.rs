@@ -154,7 +154,17 @@ impl<S: Storage> Statement<'_, S> {
                     }
                 }
                 Ok(Exec::Host(_)) => return None,
-                #[cfg(feature = "sql")]
+                // The Stage 3 probe (ADR 0005, unit `s3_probe`;
+                // build-only, never run: `ci/flip_probe.sh --s3`):
+                // with sync source readers in the VM, today's async
+                // readers it reaches here (`vm_call`, `vm_host_next`)
+                // are cut off, so LTO drops what only they reach.
+                #[cfg(all(feature = "sql", any(hipp_s3_probe, hipp_s3_probe = "readers")))]
+                Ok(Exec::Call) => {
+                    self.vm_fail();
+                    return Some(Err(Error::VmFallback));
+                }
+                #[cfg(all(feature = "sql", not(any(hipp_s3_probe, hipp_s3_probe = "readers"))))]
                 // (Boxed: the readers' futures stay out of the step
                 // future.)
                 Ok(Exec::Call) => match Box::pin(self.vm_call()).await {
