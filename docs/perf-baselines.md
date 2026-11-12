@@ -272,3 +272,28 @@ t-gmax 852,164 B.
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: one zeroed allocation per page image
+
+`vec_zeroed(n)` is `AVec::filled(0, n)` (a new `AVec` constructor in
+`arena.rs` over `vec![v; n]`), so each page image is one zeroed
+allocation instead of `n` pushes and ~10 regrowths. Every image
+builder that calls it benefits; the workload exercises the table
+INSERT fast path. Workload checksum identical (657610). Test pass/fail
+set identical before/after (1022 tests; the 893 failures are the
+absent `sqlite3` oracle, `expect("oracle runs")`, same on the
+baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 249,920,143   | 215,916,996   | -13.6%  |
+| 1000 | 582,896,114   | 511,583,798   | -12.2%  |
+| 2000 | 1,425,375,525 | 1,276,264,443 | -10.5%  |
+
+n=1000: `build_leaf_image_inserted` inclusive 88,174,993 ->
+22,614,443 (-74.4%; 44.2k -> 11.3k Ir per call). dhat (n=1000):
+538,328 -> 519,770 blocks (-3.4%), 145,799,068 -> 137,369,612 bytes
+(-5.8%); t-gmax unchanged at 852,164 B.
+
+Size gates: tiny -48 B, full -48 B, max -40 B, xl -32 B; ratchets
+lowered by those amounts.

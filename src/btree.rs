@@ -368,11 +368,7 @@ fn content_code(content: usize) -> u16 {
 }
 
 fn vec_zeroed(n: usize) -> AVec<u8> {
-    let mut a = AVec::new();
-    for _ in 0..n {
-        a.push(0);
-    }
-    a
+    AVec::filled(0, n)
 }
 
 fn copy_bytes(b: &[u8]) -> AVec<u8> {
