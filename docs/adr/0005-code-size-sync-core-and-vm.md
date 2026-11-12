@@ -534,7 +534,8 @@ measured — stop.* After the owner asked for a much smaller VM (a
 redesign), its four levers were prototyped and measured on both
 probes (ADR 0007, proposed). Coarse write ops over today's per-row
 cores measured 0.94-1.04x the INSERT executor they replace (not the
-1.9x assumed above, but nowhere near the 0.29-0.34x needed); a sync
+1.9x assumed above, but nowhere near `s3_probe`'s 0.29-0.34x
+break-even, readers at 1.0x); a sync
 step alone saves nothing; index access as one coarse op over the
 shared access core saves 10.4 / 12.0 KB in max / xl; dispatch
 outlining is noise. The combined flip still projects +22.1 / +43.6 /

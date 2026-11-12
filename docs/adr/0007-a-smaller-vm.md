@@ -224,7 +224,7 @@ as today's executor leaves them after a dropped future, which the
 tests prove against today's executor on cloned `MemStorage` images
 (dropped futures at every await, the smallest page cache,
 `tests/crash.rs`). The pin compiles a multi-row VALUES as a coroutine
-feeding one insert loop (41 instructions for two rows, 31 for one);
+feeding one insert loop (39 instructions for two rows, 29 for one);
 hipp's listing is its own (ADR 0005: the shape, not the content, is
 the claim).
 

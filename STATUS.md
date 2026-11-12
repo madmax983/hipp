@@ -156,8 +156,9 @@ or re-baseline.
 VALUES(1,'x',1),(2,'y',2)` over an INTEGER PRIMARY KEY, a UNIQUE and a
 CHECK column compiles the VALUES rows as a coroutine
 (`InitCoroutine` / `Yield` / `EndCoroutine`) feeding one insert loop
-(`NotExists`, `NoConflict`, `MakeRecord`, `Insert`, `IdxInsert`): 41
-instructions for two rows, 31 for one; hipp's coarse program differs
+(`NotExists`, `NoConflict`, `MakeRecord`, `Insert`, `IdxInsert`): 39
+instructions for two rows (addr 0-38), 29 for one (addr 0-28; the
+CLI's two header lines are not instructions); hipp's coarse program differs
 in content, as ADR 0005 allows (the listing's shape is the claim). A
 multi-row INSERT whose second row breaks the UNIQUE leaves no row
 (ABORT undoes the first); OR FAIL keeps the rows before the failing
@@ -179,9 +180,12 @@ passed.
 - The write ratio is measured for one write shape (INSERT with folded
   VALUES) and extrapolated to every write kind; UPDATE / DELETE /
   trigger / FK cores were not split out and measured. Their structure
-  is the same (a loop around a per-row core), and the verdict holds
-  for any write ratio above 0.37 (full) even with the readers replaced
-  by nothing.
+  is the same (a loop around a per-row core), and the full verdict
+  holds for any write ratio above 0.42 even with the readers replaced
+  by nothing ((room + the fold core's 72 B) / `W` = 12,380 / 29,360),
+  or above 0.29 with the readers at 1.0x ((12,308 − 3,920 + 72) /
+  29,360); the measured ratio is 0.94-1.04. (0.37 in the tables is
+  the joint ratio on `W` + `Rd`, not a write-only threshold.)
 - No sync reader was prototyped: the readers are replaced at 1.0x
   (0.84x optimistic), argued from lever 1's measurement, not measured
   per reader.
@@ -197,6 +201,11 @@ passed.
   stop, and its spec starts it only on go. Its review corrected the
   re-baseline figure here, in ADR 0007 and in README (the go-target
   distances already include the 4 KB headroom).
+- `slim_design`'s second review corrected two figures here and in
+  ADR 0007: the pin's two-row / one-row INSERT VALUES programs are 39
+  / 29 instructions (41 / 31 had counted the EXPLAIN header and
+  separator lines), and the write-only threshold in the first gap
+  above (0.42, not the joint 0.37). The verdict is unchanged.
 - Found by `slim_core`'s review, outside this architecture unit and
   pre-existing: an empty statement (`select 1;; select 2;`, or a lone
   `;` line) is refused with `Parse { kind: UnsupportedStatement }`
