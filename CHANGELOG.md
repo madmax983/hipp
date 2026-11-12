@@ -5,6 +5,22 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### A smaller VM: measured design, verdict stop (wave 16, unit `slim_design`)
+
+- ADR 0007 "A smaller VM" (proposed): the four levers of a smaller
+  VM prototyped in scratch builds and measured on the flip and s3
+  probes. A sync step alone saves nothing; INSERT VALUES as coarse
+  write ops over today's per-row cores costs 0.94-1.04x the INSERT
+  executor it replaces; routing index access through one coarse op
+  over the shared access core saves 10.4 / 12.0 KB (max / xl);
+  outlining rare opcodes is noise.
+- Verdict: stop in full, max and xl. The projected flip stays +22.1 /
+  +43.6 / +49.2 KB over the go target (ratchet − 4 KB; +18.6 / +24.9
+  / +28.9 KB optimistic), so `slim_core` does not start. STATUS.md
+  ("A smaller VM: slim_design") has the figures and the method.
+- No behaviour or shipped size change: tiny 76,952, full 478,212, max
+  964,684, xl 1,061,344.
+
 ### Table-valued functions beside TEMP tables (wave 15, `sync_readers` review fix)
 
 - The sync source readers (unit `sync_readers`) were not built:

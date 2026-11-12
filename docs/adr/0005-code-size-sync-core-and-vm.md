@@ -529,6 +529,19 @@ with headroom, max only after moving leaves to `xl`) or a decision to
 continue it for reasons other than size. STATUS.md ("ADR 0005 Stage
 3: s3_probe") has the per-category inventory and the estimate.
 
+*Amendment (unit `slim_design`, wave 16, 2026-11-12): a smaller VM,
+measured — stop.* After the owner asked for a much smaller VM (a
+redesign), its four levers were prototyped and measured on both
+probes (ADR 0007, proposed). Coarse write ops over today's per-row
+cores measured 0.94-1.04x the INSERT executor they replace (not the
+1.9x assumed above, but nowhere near the 0.29-0.34x needed); a sync
+step alone saves nothing; index access as one coarse op over the
+shared access core saves 10.4 / 12.0 KB in max / xl; dispatch
+outlining is noise. The combined flip still projects +22.1 / +43.6 /
++49.2 KB over the full / max / xl go targets (optimistic +18.6 /
++24.9 / +28.9), so Stages 2-3 stay unflipped. STATUS.md ("A smaller
+VM: slim_design") has the figures.
+
 **`tiny` must not grow.** Tiny's programs need Init, Transaction,
 OpenRead / OpenWrite, Rewind, Next, Column, Rowid, SeekRowid, Eq / Ne,
 the constant loads, MakeRecord, NewRowid, Insert, CreateBtree, SetCookie,
