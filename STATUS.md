@@ -137,10 +137,12 @@ budget, max included.)
 - **xl: stop.** Central +49,242 B; optimistic +28,925. Read VM
   allowed 27.5 KB (57.4 KB after coarse access).
 
-*What would close it:* a re-baseline of about +22.1 / +43.6 / +49.2 KB
-(central) plus the 4 KB headroom, which now fits every budget, max
-included; or a read VM at 45-55% of today's, which no measured lever
-approaches; or Tier B (one unified executor, no bytecode), which the
+*What would close it:* a re-baseline of the ratchets by about +22.1 /
++43.6 / +49.2 KB (central; the distance from the go target, so the
+4 KB headroom is already included — against the ratchets themselves
+the central projection is +18,037 / +39,468 / +45,146 B), which now
+fits every budget, max included; or a read VM at 45-55% of today's,
+which no measured lever approaches; or Tier B (one unified executor, no bytecode), which the
 measurements now favour as the next study (the bytecode layer is the
 cost: read VM 1.5-2.8x the executor it replaces, coarse writes ~1.0x)
 but which needs its own probe first. ADR 0007 has the design (one
@@ -191,6 +193,16 @@ passed.
 - LTO moves bytes between symbols: single prototypes of a few hundred
   bytes moved profiles in opposite directions (levers 1 and 4); the
   tables are measured builds, not symbol sums.
+- `slim_core` (wave 16 unit 2) did not start: the verdict above is
+  stop, and its spec starts it only on go. Its review corrected the
+  re-baseline figure here, in ADR 0007 and in README (the go-target
+  distances already include the 4 KB headroom).
+- Found by `slim_core`'s review, outside this architecture unit and
+  pre-existing: an empty statement (`select 1;; select 2;`, or a lone
+  `;` line) is refused with `Parse { kind: UnsupportedStatement }`
+  (CLI exits 1 after printing `1`); the pin skips it and prints `1`,
+  `2`. Left for a parity unit: the parser is on tiny's path and this
+  unit may not grow any profile.
 
 ### ADR 0005 Stage 3: sync_readers — not built (verdict stop); review fix: table-valued functions beside TEMP tables (2026-11-11)
 

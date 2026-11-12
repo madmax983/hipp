@@ -267,10 +267,14 @@ write ratio and readers at 1.0 the read VM would have to fit in
 
 ## What would close the gap
 
-- **A re-baseline** of about +22.1 / +43.6 / +49.2 KB (central; +18.6
-  / +24.9 / +28.9 optimistic) over the full / max / xl ratchets, plus
-  the 4 KB headroom. Unlike `s3_probe`'s projection, this one fits
-  every budget, max included (1,004,152 < 1,048,576 B).
+- **A re-baseline** of the full / max / xl ratchets by about +22.1 /
+  +43.6 / +49.2 KB (central; +18.6 / +24.9 / +28.9 optimistic). These
+  are the projections' distances from the go target, so they already
+  include the 4 KB headroom; against the ratchets themselves the
+  central projection is +18.0 / +39.5 / +45.1 KB (+18,037 / +39,468 /
+  +45,146 B; optimistic +14.5 / +20.8 / +24.8 KB). Unlike `s3_probe`'s
+  projection, this one fits every budget, max included (re-baselined
+  max ratchet 1,008,248 < 1,048,576 B).
 - **A read VM at 45-55% of today's** (full: 21.3 KB or less against
   39.9 KB): nothing measured supports it — `vm_shrink`'s levers took
   18.4 / 6.4 / 7.4 KB (14.5 KB of full's by compiling the evaluator

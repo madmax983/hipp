@@ -318,9 +318,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   op over the shared access core, a slimmer dispatch — were built and
   measured. Coarse writes cost about as much as the executor they
   replace and only the index lever saves real bytes (10-12 KB in max /
-  xl), so the combined flip would still be 22 / 44 / 49 KB over the
-  full / max / xl ratchets: the VM stays hidden. No shipped profile
-  changes (STATUS.md has the figures).
+  xl), so the combined flip would still be 18 / 39 / 45 KB over the
+  full / max / xl ratchets (22 / 44 / 49 KB over the go targets, the
+  ratchets minus 4 KB of headroom): the VM stays hidden. No shipped
+  profile changes (STATUS.md has the figures).
 
 ## What v0.16 does
 
