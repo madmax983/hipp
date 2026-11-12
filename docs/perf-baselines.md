@@ -247,3 +247,28 @@ span buffer per index insert), 143,513,712 -> 145,792,820 bytes
 
 Size gates: tiny unchanged; full +184 B, max +24 B, xl +40 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+## vec_zeroed builds page images a byte at a time (baseline at c261574)
+
+`bolt_workload` (callgrind, release + debuginfo). `vec_zeroed(n)`, the
+zeroed buffer behind every page image `build_leaf_image`,
+`build_leaf_image_inserted`, `build_interior_image` and
+`build_index_image` start from, pushes `n` zero bytes one by one into
+an empty `AVec`: ~4 instructions of capacity check per byte plus ~10
+`RawVec<u8>::grow_one` reallocations (8 -> 4096 B) per page.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 249,920,143   |
+| 1000 | 582,896,114   |
+| 2000 | 1,425,375,525 |
+
+n=1000 profile: `build_leaf_image_inserted` (the table-INSERT fast
+path, 1,996 calls) inclusive 88,174,993 (15.13%), ~44.2k Ir per call
+for a 4096 B page; its inlined `Vec::push` loop 42,146,318 (7.23%)
+inclusive, and 19,960 `grow_one` calls (10 per image) costing
+9,383,974 (1.61%). dhat (n=1000): 538,328 blocks, 145,799,068 bytes;
+t-gmax 852,164 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
