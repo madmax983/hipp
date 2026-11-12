@@ -9,8 +9,14 @@
 #![no_std]
 #![deny(unsafe_code)]
 // The flip probe (`ci/flip_probe.sh`, build-only) cuts today's read
-// executor off, leaving its helpers without callers.
-#![cfg_attr(all(feature = "vm", hipp_flip_probe), allow(dead_code, unused))]
+// executor off, leaving its helpers without callers; the Stage 3
+// probe (`--cfg hipp_s3_probe`, `ci/flip_probe.sh --s3`) also cuts the
+// write executors, the trigger and foreign-key runners and the VM's
+// async source readers.
+#![cfg_attr(
+    all(feature = "vm", any(hipp_flip_probe, hipp_s3_probe)),
+    allow(dead_code, unused)
+)]
 
 extern crate alloc;
 

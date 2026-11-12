@@ -108,8 +108,8 @@ pub(super) enum Kind {
     Qual,
     /// A table-valued function's name (`FROM f(...)`): no object of
     /// a database, though a view or trigger may not qualify it with
-    /// another's name (v0.16, `attach`).
-    #[cfg(feature = "attach")]
+    /// another's name (v0.16, `attach`), and one main resolves reads
+    /// main (`func_reads_main`).
     Func,
 }
 
@@ -174,10 +174,7 @@ fn from_names(
         match &f.derived {
             Some(d) => select_names(d, out, ctes),
             None if f.args.is_none() => out.push((f.table, Kind::Object)),
-            #[cfg(feature = "attach")]
             None => out.push((f.table, Kind::Func)),
-            #[cfg(not(feature = "attach"))]
-            None => {}
         }
         if let Some(args) = &f.args {
             for e in args.iter() {
@@ -467,6 +464,13 @@ fn token_end(src: &[u8], a: usize) -> usize {
     e
 }
 
+/// `n` names the eponymous virtual table that reads main's file
+/// (`dbstat`; v0.17 review fix). The temp database computes
+/// `generate_series` itself (`plan_vtab_source`).
+fn eponymous(n: &[u8]) -> bool {
+    cfg!(feature = "vtab") && eq_ci(n, b"dbstat")
+}
+
 pub(super) fn is_temp_schema_name(n: &[u8]) -> bool {
     eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master")
 }
@@ -630,75 +634,60 @@ impl<S: Storage> Connection<S> {
             return Ok(Route::Main);
         }
         // PRAGMA temp.x runs there; an unqualified table pragma
-        // follows its table.
-        if let Ast::Pragma {
-            schema,
-            name,
-            value,
-            ..
-        } = &ast
-        {
-            // A connection-wide setting is the main connection's
-            // (the temp database runs with a copy, `sync_temp`).
-            if super::pragma::lookup::<S::Error>(handle_bytes(arena, *name))
-                .ok()
-                .flatten()
-                .is_some_and(|p| p.connection_wide())
-            {
-                return Ok(Route::Main);
+        // follows its table. REINDEX / ANALYZE: `temp.x` and a temp
+        // object's name run there; `ANALYZE temp` analyzes the whole
+        // temp database (creating it, as on the pin). A REINDEX name
+        // is a collation's first.
+        let target = match &ast {
+            Ast::Pragma {
+                schema,
+                name,
+                value,
+                ..
+            } => {
+                // A connection-wide setting is the main connection's
+                // (the temp database runs with a copy, `sync_temp`).
+                if super::pragma::lookup::<S::Error>(handle_bytes(arena, *name))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.connection_wide())
+                {
+                    return Ok(Route::Main);
+                }
+                Some((
+                    schema,
+                    value.is_some_and(|v| self.temp_taken(handle_bytes(arena, v))),
+                ))
             }
-            let mut out = AVec::new();
-            match schema {
+            Ast::Reindex { schema, name } | Ast::Analyze { schema, name } => {
+                let analyze = matches!(ast, Ast::Analyze { .. });
+                let n = name.map(|h| handle_bytes(arena, h));
+                if analyze && schema.is_none() && n.is_some_and(|n| eq_ci(n, b"temp")) {
+                    return Ok(Route::Temp(copy_vec(b"ANALYZE")));
+                }
+                Some((
+                    schema,
+                    n.is_some_and(|n| {
+                        (analyze || crate::record::Coll::named(n).is_none()) && self.temp_taken(n)
+                    }),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((schema, own)) = target {
+            return match schema {
                 Some(h) if eq_ci(handle_bytes(arena, *h), b"temp") => {
-                    let i = tok_index(t, *h).unwrap_or(0);
-                    let (a, b) = match (t.get(i), t.get(i + 2)) {
-                        (Some(a), Some(b)) => (a.offset, b.offset),
-                        _ => return Err(Error::Unsupported),
+                    // The text without its `temp.`.
+                    let Some(c) = qual_cut(t, tok_index(t, *h).unwrap_or(0) + 2) else {
+                        return Err(Error::Unsupported);
                     };
-                    out.extend_from_slice(&text.as_slice()[..a]);
-                    out.extend_from_slice(&text.as_slice()[b.min(text.len())..]);
+                    let mut cuts = AVec::new();
+                    cuts.push(c);
+                    Ok(Route::Temp(apply_cuts(text.as_slice(), &mut cuts)))
                 }
-                None if value.is_some_and(|v| {
-                    let n = handle_bytes(arena, v);
-                    self.temp_has(n, false) || self.temp_has(n, true)
-                }) =>
-                {
-                    out.extend_from_slice(text.as_slice());
-                }
-                _ => return Ok(Route::Main),
-            }
-            return Ok(Route::Temp(out));
-        }
-        // REINDEX / ANALYZE: `temp.x` and a temp object's name run
-        // there; `ANALYZE temp` analyzes the whole temp database
-        // (creating it, as on the pin). A REINDEX name is a
-        // collation's first.
-        if let Ast::Reindex { schema, name } | Ast::Analyze { schema, name } = &ast {
-            let analyze = matches!(ast, Ast::Analyze { .. });
-            let n = name.map(|h| handle_bytes(arena, h));
-            if analyze && schema.is_none() && n.is_some_and(|n| eq_ci(n, b"temp")) {
-                return Ok(Route::Temp(copy_vec(b"ANALYZE")));
-            }
-            let mut out = AVec::new();
-            match (schema, n) {
-                (Some(h), _) if eq_ci(handle_bytes(arena, *h), b"temp") => {
-                    let i = tok_index(t, *h).unwrap_or(0);
-                    let (a, b) = match (t.get(i), t.get(i + 2)) {
-                        (Some(a), Some(b)) => (a.offset, b.offset),
-                        _ => return Err(Error::Unsupported),
-                    };
-                    out.extend_from_slice(&text.as_slice()[..a]);
-                    out.extend_from_slice(&text.as_slice()[b.min(text.len())..]);
-                }
-                (None, Some(n))
-                    if (analyze || crate::record::Coll::named(n).is_none())
-                        && (self.temp_has(n, false) || self.temp_has(n, true)) =>
-                {
-                    out.extend_from_slice(text.as_slice());
-                }
-                _ => return Ok(Route::Main),
-            }
-            return Ok(Route::Temp(out));
+                None if own => Ok(Route::Temp(text)),
+                _ => Ok(Route::Main),
+            };
         }
         let mut names = AVec::new();
         let mut ctes = AVec::new();
@@ -725,8 +714,11 @@ impl<S: Storage> Connection<S> {
                         && !routed.as_slice().contains(&k)
                 })
             });
-            #[cfg(feature = "attach")]
             if *kind == Kind::Func {
+                main += usize::from(
+                    i.and_then(|i| qualifier(t, i, arena)) == Some(false)
+                        || self.func_reads_main(t, i, n, arena),
+                );
                 continue;
             }
             if *kind == Kind::Qual {
@@ -764,7 +756,7 @@ impl<S: Storage> Connection<S> {
             }
             if in_temp {
                 temp += 1;
-            } else if q.is_some() || self.main_has(n, *kind == Kind::Index) {
+            } else if q.is_some() || self.main_has(n, *kind == Kind::Index) || eponymous(n) {
                 main += 1;
             }
             // A name in neither database binds to neither: the
@@ -1070,14 +1062,14 @@ impl<S: Storage> Connection<S> {
         select_names(&select, &mut names, &mut ctes);
         let (mut reads_temp, mut reads_main) = (false, false);
         for (h, kind) in names.iter() {
-            #[cfg(feature = "attach")]
+            let n = handle_bytes(arena, *h);
             if *kind == Kind::Func {
+                reads_main |= self.func_reads_main(t, tok_index(t, *h), n, arena);
                 continue;
             }
             if *kind == Kind::Qual {
                 continue;
             }
-            let n = handle_bytes(arena, *h);
             let q = tok_index(t, *h).and_then(|i| qualifier(t, i, arena));
             if q.is_none() && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n)) {
                 continue;
@@ -1221,6 +1213,24 @@ impl<S: Storage> Connection<S> {
             }
     }
 
+    /// The table-valued function `n` (its name token `i`) is main's
+    /// (v0.17 review fix: a TEMP write or a query over temp tables
+    /// reading `dbstat` failed, and one reading a pragma function
+    /// that names a main table read nothing): `dbstat`, or a pragma
+    /// function but for one whose lone argument names a temp object
+    /// (the pin looks in temp first; the temp database answers it).
+    fn func_reads_main(&self, t: &[Token], i: Option<usize>, n: &[u8], arena: &Arena) -> bool {
+        let temp_arg = || {
+            i.is_some_and(|i| {
+                matches!(
+                    (t.get(i + 2).map(|x| x.tok), t.get(i + 3).map(|x| x.tok)),
+                    (Some(Tok::Text(h)), Some(Tok::RParen)) if self.temp_taken(handle_bytes(arena, h))
+                )
+            })
+        };
+        eponymous(n) || (n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_")) && !temp_arg())
+    }
+
     /// Whether a write statement's target (an INSERT / UPDATE /
     /// DELETE table, a CREATE TABLE's new table) is a main table, or
     /// the statement writes none (v0.16): `main.x`, or an unqualified
@@ -1250,6 +1260,14 @@ impl<S: Storage> Connection<S> {
                 c.catalog.taken(ca, name) == Some(false)
             }
         })
+    }
+
+    /// The temp database has an object (a table, view or index) named
+    /// so.
+    pub(super) fn temp_taken(&self, name: &[u8]) -> bool {
+        self.temp
+            .as_ref()
+            .is_some_and(|c| c.catalog.taken(&c.catalog_arena, name).is_some())
     }
 
     /// The temp database, created (and brought into the open
