@@ -312,6 +312,16 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   UPDATE / DELETE reading `dbstat` or a pragma function naming a
   main table is refused, as one reading main tables is. No profile
   grows (the routing code it touches got smaller).
+- **A smaller VM, measured first: stop** (hidden feature `vm`; ADR
+  0007). Prototypes of a much smaller VM — a sync step, writes as
+  coarse ops over today's per-row cores, index access as one coarse
+  op over the shared access core, a slimmer dispatch — were built and
+  measured. Coarse writes cost about as much as the executor they
+  replace and only the index lever saves real bytes (10-12 KB in max /
+  xl), so the combined flip would still be 18 / 39 / 45 KB over the
+  full / max / xl ratchets (22 / 44 / 49 KB over the go targets, the
+  ratchets minus 4 KB of headroom): the VM stays hidden. No shipped
+  profile changes (STATUS.md has the figures).
 
 ## What v0.16 does
 
@@ -1547,7 +1557,8 @@ shared page cache (a file is attached once); the pin's own bytecode
 listing (plain EXPLAIN lists hipp's program, in the pin's columns, under
 the hidden `vm` feature, which no profile enables: turning the VM on
 measured larger in every profile, Stage 2 alone and with Stage 3,
-ADR 0005; its content is hipp's, not the pin's); loadable
+ADR 0005, and as a redesigned smaller VM, ADR 0007; its content is
+hipp's, not the pin's); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

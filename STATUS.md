@@ -11,6 +11,208 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### A smaller VM: slim_design (2026-11-12)
+
+Wave 16's first unit (owner decision 2026-11-12, after `s3_probe`
+said stop: try a much smaller VM, a redesign, not a trim). An
+architecture / size unit: measure the redesign's four levers before
+building anything, write the design down (ADR 0007, "A smaller VM",
+proposed; the wave plan's "ADR 0006" number is taken), decide go /
+stop. No shipped behaviour or size change.
+
+**Verdict: STOP, in full, max and xl** (full binding). No lever,
+alone or combined, brings the flip under a ratchet: the central
+projection is +22,133 / +43,564 / +49,242 B over the go target
+(ratchet − 4,096), the optimistic one +18,589 / +24,891 / +28,925,
+the pessimistic one +31,477 / +55,940 / +61,478. `slim_core` should
+commit nothing (its spec: start only on go).
+
+**Step 1 — the budget, re-measured** (bfb1582; thumbv7em, `--profile
+tiny`, `hipp_thumb_demo`, `.text + .rodata`; flip probe
+`ci/flip_probe.sh`, s3 probe `--s3`, write side only
+`--s3=triggers,fk,writes`; the read VM by `llvm-nm -S -C`: `hipp::vm::*`
+plus the driver symbols of `session/drive.rs`):
+
+| bytes | full | max | xl |
+|---|---:|---:|---:|
+| ratchet | 478,212 | 964,684 | 1,061,344 |
+| go target (ratchet − 4,096) | 474,116 | 960,588 | 1,057,248 |
+| flip probe | 495,088 | 1,011,444 | 1,115,124 |
+| s3 probe | 461,808 | 868,708 | 962,248 |
+| s3 probe, write side only cut | 465,728 | 934,588 | 1,033,460 |
+| write side W (flip − write-side-only) | 29,360 | 76,856 | 81,664 |
+| readers' own Rd (write-side-only − s3) | 3,920 | 65,880 | 71,212 |
+| room (go target − s3) | 12,308 | 91,880 | 95,000 |
+| largest replacement ratio on W + Rd | 0.37 | 0.64 | 0.62 |
+| read VM in the s3 probe | 39,978 | 64,658 | 69,450 |
+| … codegen + builder / dispatch | 15,728 / 11,480 | 22,046 / 22,512 | 24,692 / 24,592 |
+| … cursors, row lists / driver / glue | 4,488 / 7,018 / 1,264 | 7,550 / 10,894 / 1,656 | 7,538 / 10,950 / 1,678 |
+
+Also measured: the s3 probe with one legacy write executor left alive
+(its cut in `step_insert` / `step_update` / `step_delete` removed):
+INSERT +16,664 / +24,136 / +25,432, UPDATE +16,376 / +84,440 /
++94,500 (it keeps the access-path readers alive), DELETE +5,152 /
++14,376 / +17,512 B.
+
+**Step 2 — the levers, prototyped** (scratch worktrees at bfb1582,
+not committed; the patches are in the session scratchpad,
+`slim/l1-sync-step.patch`, `l2w-insert-values.patch`,
+`l2r-agg-core.patch`, `l3-coarse-access.patch`, `l4-rare-ops.patch`,
+`combo.patch`, with the measuring scripts `measure.sh`, `kinds.sh`,
+`vmbuild.sh`, `cat.py`, `calc.py` and every ELF under `slim/m/`).
+Each builds the flip and s3 probes for full / max / xl; deltas
+against the probes above:
+
+| lever | prototype | flip Δ (full / max / xl) | s3 Δ (full / max / xl) |
+|---|---|---:|---:|
+| 1. sync VM | `vm_step` = sync `vm_enter` + `vm_turn` (out of line) + an async loop servicing only I/O and `Exec::Call` | +536 / +148 / +232 | −40 / −160 / −192 |
+| 2. coarse writes over shared cores | INSERT with folded VALUES rows as `Write` ops (begin / one per row over registers / end) the driver runs through `exec_insert_row` and two statement cores split out of `exec_insert` (`insert_begin` / `insert_end`, which `exec_insert` calls too) | +2,336 / +1,768 / +1,748 | +17,360 / +23,728 / +24,004 |
+| 2. a read shape over a shared core | the streamed executor folds aggregates through the VM's `AggRun` (one copy of `stream::agg_step`) | −80 / −88 / −112 | −72 / −72 / −112 |
+| 3. smaller codegen | every index access path as one coarse row-list op over the access core (`HOST_ACCESS`); the VM's index-walk codegen and 11 index opcodes go (max / xl) | — / −8,280 / −10,776 | — / −10,448 / −11,952 |
+| 4. smaller dispatch | 17 once-per-statement / per-group opcodes out of `op_join` into one out-of-line slow path | +568 / −240 / +128 | +32 / −440 / −728 |
+| 2 + 2 + 3 combined | | +2,256 / −7,392 / −9,332 | +17,272 / +13,728 / +12,332 |
+
+The combination composes within ±520 B of the sum of its parts. The
+`<profile>,vm` builds (no probe) with the shared fold core: full,vm
+519,812 (−1,364), xl,vm 1,138,696 (−2,012): sharing a read core with
+the legacy read path pays only until the flip deletes the legacy copy.
+Reproduction: the INSERT VALUES s3 figure (full 479,168) and the
+coarse-access s3 figure (max 858,260) rebuilt in a fresh target
+directory gave the same bytes.
+
+*Do the prototypes work?* The INSERT VALUES prototype passes
+`tests/write_side.rs`, `write_side_v07.rs`, `autoinc_v16.rs`,
+`insert_balance_v15.rs`, `insert_select_v08.rs` and `vm_v17.rs` with
+`--features vm` against the pin. The coarse-access prototype passes
+`vm_v17`, `vm_joins_v17` and `vm_rest_v17` strict and fails two
+queries of `vm_subqueries_v17` (in three tests): an access bound that
+reads a VM subquery slot or an enclosing query's aggregate (`SELECT
+(SELECT count(*) FROM u WHERE u.k <= max(t.a)) FROM t`, `... JOIN w ON
+w.p = (SELECT min(k) FROM u WHERE k >= t.a)`) returns no rows, because
+the legacy reader evaluates the bounds itself; ADR 0007's design
+passes bound values in registers (the VM computes them today).
+
+*What they taught.* (1) The step future was the sync VM inlined
+(`vm_turn` is 5,776 of the old future's 6,224 B in full): a sync step
+alone saves nothing. (2) A coarse write op costs about what it
+replaces: INSERT VALUES on the VM with its shared cores is
+**1.04x / 0.98x / 0.94x** today's whole INSERT executor on the s3
+probe (the per-row core is the executor; the VM deletes only the
+loop and adds 1.7-2.3 KB of glue). (3) Coarse sources over the reader
+cores the probe already counts are the one lever worth more than
+noise (−10.4 / −12.0 KB, max / xl). (4) Dispatch outlining is noise,
+as in `vm_shrink`.
+
+**Step 3 — extrapolation** (method): projected flip = s3 + r × W + ρ
+× Rd + the taken levers' measured s3 savings (shared fold core, and
+coarse access in max / xl; not scaled up — each prototype is the
+whole lever). r is the INSERT prototype's measured ratio, applied to
+every write kind (each is a loop around a per-row core the VM would
+share): central 1.042 (the worst profile's) in every profile;
+pessimistic central plus the measured INSERT VALUES glue once per
+write shape the prototype does not cover (4 in full, 7 in max / xl);
+optimistic 0.944. ρ (readers): 1.0, optimistic 0.84 (ADR 0005's
+async-inflation upper bound): lever 1 and Stage 1's sync islands
+saved next to nothing by taking sync code out of async bodies, and no
+sync reader was prototyped.
+
+| projected flip | full | max | xl |
+|---|---:|---:|---:|
+| optimistic | 492,705 (+18,589) | 985,479 (+24,891) | 1,086,173 (+28,925) |
+| central | 496,249 (+22,133) | 1,004,152 (+43,564) | 1,106,490 (+49,242) |
+| pessimistic | 505,593 (+31,477) | 1,016,528 (+55,940) | 1,118,726 (+61,478) |
+| best ratio reached (central / optimistic) | 1.03 / 0.93 | 0.95 / 0.82 | 0.94 / 0.81 |
+| ratio needed | 0.37 | 0.64 | 0.62 |
+
+(± against the go target; every projection is under its profile's
+budget, max included.)
+
+**Step 4 — verdict per profile.**
+- **full: stop.** Central +22,133 B over the go target; even
+  optimistic +18,589. Going needs the read VM at 21.3 KB or less
+  (today 39.9 KB): nothing measured cuts it by more than a few
+  percent in full.
+- **max: stop.** Central +43,564 B; optimistic +24,891. The read VM
+  would have to fit in 28.6 KB (54.1 KB after coarse access).
+- **xl: stop.** Central +49,242 B; optimistic +28,925. Read VM
+  allowed 27.5 KB (57.4 KB after coarse access).
+
+*What would close it:* a re-baseline of the ratchets by about +22.1 /
++43.6 / +49.2 KB (central; the distance from the go target, so the
+4 KB headroom is already included — against the ratchets themselves
+the central projection is +18,037 / +39,468 / +45,146 B), which now
+fits every budget, max included; or a read VM at 45-55% of today's,
+which no measured lever approaches; or Tier B (one unified executor, no bytecode), which the
+measurements now favour as the next study (the bytecode layer is the
+cost: read VM 1.5-2.8x the executor it replaces, coarse writes ~1.0x)
+but which needs its own probe first. ADR 0007 has the design (one
+sync step and one driver; writes as coarse `Write` ops over today's
+per-row cores; sources as coarse row-list ops over shared sync reader
+cores with bounds in registers), its per-profile byte budget and its
+migration order, should the owner continue the VM for other reasons
+or re-baseline.
+
+**Oracle probing** (the pin, live, 3.54.1): `EXPLAIN INSERT INTO t
+VALUES(1,'x',1),(2,'y',2)` over an INTEGER PRIMARY KEY, a UNIQUE and a
+CHECK column compiles the VALUES rows as a coroutine
+(`InitCoroutine` / `Yield` / `EndCoroutine`) feeding one insert loop
+(`NotExists`, `NoConflict`, `MakeRecord`, `Insert`, `IdxInsert`): 39
+instructions for two rows (addr 0-38), 29 for one (addr 0-28; the
+CLI's two header lines are not instructions); hipp's coarse program differs
+in content, as ADR 0005 allows (the listing's shape is the claim). A
+multi-row INSERT whose second row breaks the UNIQUE leaves no row
+(ABORT undoes the first); OR FAIL keeps the rows before the failing
+one; OR IGNORE skips only the failing row; OR REPLACE deletes the
+conflicting row (`changes()` 1, `last_insert_rowid()` the new rowid).
+The INSERT VALUES prototype keeps these by construction (the same
+cores, `write_failed`) and passes the suites that check them.
+
+**Tests.** None added: no behaviour changes (the prototypes are not
+committed). The existing suites are untouched and green.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed.
+
+**Size Δ** (shipped profiles): tiny 0 (76,952), full 0 (478,212), max
+0 (964,684), xl 0 (1,061,344). No ratchet moved.
+
+**Honest gaps.**
+- The write ratio is measured for one write shape (INSERT with folded
+  VALUES) and extrapolated to every write kind; UPDATE / DELETE /
+  trigger / FK cores were not split out and measured. Their structure
+  is the same (a loop around a per-row core), and the full verdict
+  holds for any write ratio above 0.42 even with the readers replaced
+  by nothing ((room + the fold core's 72 B) / `W` = 12,380 / 29,360),
+  or above 0.29 with the readers at 1.0x ((12,308 − 3,920 + 72) /
+  29,360); the measured ratio is 0.94-1.04. (0.37 in the tables is
+  the joint ratio on `W` + `Rd`, not a write-only threshold.)
+- No sync reader was prototyped: the readers are replaced at 1.0x
+  (0.84x optimistic), argued from lever 1's measurement, not measured
+  per reader.
+- The coarse-access prototype mis-answers two shapes (bounds reading a
+  VM subquery slot or an enclosing aggregate; above); passing bounds
+  in registers would add a little to its −10.4 / −12.0 KB.
+- The prototype write driver is a second loop beside `vm_step`'s
+  (counted in its glue, a pessimistic error); the design has one.
+- LTO moves bytes between symbols: single prototypes of a few hundred
+  bytes moved profiles in opposite directions (levers 1 and 4); the
+  tables are measured builds, not symbol sums.
+- `slim_core` (wave 16 unit 2) did not start: the verdict above is
+  stop, and its spec starts it only on go. Its review corrected the
+  re-baseline figure here, in ADR 0007 and in README (the go-target
+  distances already include the 4 KB headroom).
+- `slim_design`'s second review corrected two figures here and in
+  ADR 0007: the pin's two-row / one-row INSERT VALUES programs are 39
+  / 29 instructions (41 / 31 had counted the EXPLAIN header and
+  separator lines), and the write-only threshold in the first gap
+  above (0.42, not the joint 0.37). The verdict is unchanged.
+- Found by `slim_core`'s review, outside this architecture unit and
+  pre-existing: an empty statement (`select 1;; select 2;`, or a lone
+  `;` line) is refused with `Parse { kind: UnsupportedStatement }`
+  (CLI exits 1 after printing `1`); the pin skips it and prints `1`,
+  `2`. Left for a parity unit: the parser is on tiny's path and this
+  unit may not grow any profile.
+
 ### ADR 0005 Stage 3: sync_readers — not built (verdict stop); review fix: table-valued functions beside TEMP tables (2026-11-11)
 
 Wave 15's second unit. **Not built:** `s3_probe`'s verdict (below) is
