@@ -331,7 +331,9 @@ payload ends on the page, the cell's length is `child + 1 + b`, which
 is exactly what `index_cell_layout` would return. Every other cell,
 and every error, still goes through `index_cell_layout`, so corrupt
 pages fail with the same error as before. Workload checksums identical
-(176089 / 657610 / 4083309 at n=500/1000/2000).
+(176089 / 657610 / 4083309 at n=500/1000/2000). Test pass/fail set
+identical before/after (1157 tests; the 1027 failures are the absent
+`sqlite3` oracle, same on the baseline commit).
 
 | n    | total before  | total after   | Δ total |
 |------|---------------|---------------|---------|
