@@ -11,7 +11,9 @@
 [tiny]
 # .text + .rodata, bytes.
 # +828 B (Bolt): table-leaf insert fast path in btree_insert.
-ratchet = 76952
+# 76,952 -> 76,904 (Bolt): vec_zeroed builds page images with one
+# zeroed allocation (-12.2% instructions on bolt_workload): -48 B.
+ratchet = 76904
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -52,7 +54,9 @@ justify_over = 4096
 # and queries over temp tables reading generate_series / dbstat /
 # pragma functions; STATUS.md): -8 B. The PRAGMA / REINDEX / ANALYZE
 # routing's two copies of the `temp.` cut became one, paying for it.
-ratchet = 478212
+# 478,212 -> 478,164 (Bolt): vec_zeroed builds page images with one
+# zeroed allocation (-12.2% instructions on bolt_workload): -48 B.
+ratchet = 478164
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -92,7 +96,9 @@ justify_over = 16384
 # and queries over temp tables reading generate_series / dbstat /
 # pragma functions; STATUS.md): -24 B. The PRAGMA / REINDEX / ANALYZE
 # routing's two copies of the `temp.` cut became one, paying for it.
-ratchet = 964684
+# 964,684 -> 964,644 (Bolt): vec_zeroed builds page images with one
+# zeroed allocation (-12.2% instructions on bolt_workload): -40 B.
+ratchet = 964644
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -126,7 +132,9 @@ justify_over = 32768
 # and queries over temp tables reading generate_series / dbstat /
 # pragma functions; STATUS.md): -88 B. The PRAGMA / REINDEX / ANALYZE
 # routing's two copies of the `temp.` cut became one, paying for it.
-ratchet = 1061344
+# 1,061,344 -> 1,061,304 (Bolt): vec_zeroed builds page images with one
+# zeroed allocation (-12.2% instructions on bolt_workload): -40 B.
+ratchet = 1061304
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

@@ -247,3 +247,53 @@ span buffer per index insert), 143,513,712 -> 145,792,820 bytes
 
 Size gates: tiny unchanged; full +184 B, max +24 B, xl +40 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+## vec_zeroed builds page images a byte at a time (baseline at c261574)
+
+`bolt_workload` (callgrind, release + debuginfo). `vec_zeroed(n)`, the
+zeroed buffer behind every page image `build_leaf_image`,
+`build_leaf_image_inserted`, `build_interior_image` and
+`build_index_image` start from, pushes `n` zero bytes one by one into
+an empty `AVec`: ~4 instructions of capacity check per byte plus ~10
+`RawVec<u8>::grow_one` reallocations (8 -> 4096 B) per page.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 249,920,143   |
+| 1000 | 582,896,114   |
+| 2000 | 1,425,375,525 |
+
+n=1000 profile: `build_leaf_image_inserted` (the table-INSERT fast
+path, 1,996 calls) inclusive 88,174,993 (15.13%), ~44.2k Ir per call
+for a 4096 B page; its inlined `Vec::push` loop 42,146,318 (7.23%)
+inclusive, and 19,960 `grow_one` calls (10 per image) costing
+9,383,974 (1.61%). dhat (n=1000): 538,328 blocks, 145,799,068 bytes;
+t-gmax 852,164 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: one zeroed allocation per page image
+
+`vec_zeroed(n)` is `AVec::filled(0, n)` (a new `AVec` constructor in
+`arena.rs` over `vec![v; n]`), so each page image is one zeroed
+allocation instead of `n` pushes and ~10 regrowths. Every image
+builder that calls it benefits; the workload exercises the table
+INSERT fast path. Workload checksum identical (657610). Test pass/fail
+set identical before/after (1022 tests; the 893 failures are the
+absent `sqlite3` oracle, `expect("oracle runs")`, same on the
+baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 249,920,143   | 215,916,996   | -13.6%  |
+| 1000 | 582,896,114   | 511,583,798   | -12.2%  |
+| 2000 | 1,425,375,525 | 1,276,264,443 | -10.5%  |
+
+n=1000: `build_leaf_image_inserted` inclusive 88,174,993 ->
+22,614,443 (-74.4%; 44.2k -> 11.3k Ir per call). dhat (n=1000):
+538,328 -> 519,770 blocks (-3.4%), 145,799,068 -> 137,369,612 bytes
+(-5.8%); t-gmax unchanged at 852,164 B.
+
+Size gates: tiny -48 B, full -48 B, max -40 B, xl -32 B; ratchets
+lowered by those amounts.

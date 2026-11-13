@@ -364,6 +364,16 @@ impl<T> AVec<T> {
             vec: Vec::with_capacity(cap),
         }
     }
+    /// `n` copies of `v` in one allocation (a zero byte fill becomes
+    /// one zeroed allocation, not `n` pushes).
+    pub fn filled(v: T, n: usize) -> AVec<T>
+    where
+        T: Clone,
+    {
+        AVec {
+            vec: alloc::vec![v; n],
+        }
+    }
     pub fn extend_from_slice(&mut self, b: &[T])
     where
         T: Clone,
