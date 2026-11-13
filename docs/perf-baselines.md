@@ -297,3 +297,56 @@ n=1000: `build_leaf_image_inserted` inclusive 88,174,993 ->
 
 Size gates: tiny -48 B, full -48 B, max -40 B, xl -32 B; ratchets
 lowered by those amounts.
+
+## index_search_raw lays every leaf cell out out-of-line (baseline at 1bde36f)
+
+`bolt_workload` (callgrind, release + debuginfo). On every index
+insert, `index_search_raw` walks all cells of the target page to
+validate them, sum their lengths and record their spans, calling the
+general `index_cell_layout` (an out-of-line call returning a
+`Result<IndexCellLayout>` through memory, plus an out-of-line
+`decode_varint` and `index_local`) for each one, although nearly every
+index cell is a 1-byte payload-length varint with no overflow.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 215,947,232   |
+| 1000 | 512,085,990   |
+| 2000 | 1,275,323,631 |
+
+n=1000 profile: `index_insert_core` inclusive 220,249,518 (43.01%);
+`index_search_raw` inclusive 126,399,681 (24.68%); `index_cell_layout`
+inclusive 51,809,543 (10.12%), of which 48,768,787 (9.52%, 566,692
+calls, ~86 Ir per cell) from the walk in `index_search_raw`.
+`index_cell_layout` is the top self-cost entry (31,892,921, 6.23%).
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`
+
+### After: lay out 1-byte-header local cells inline
+
+The validation walk in `index_search_raw` reads the byte after the
+cell's child pointer: when it is a 1-byte varint (`< 0x80`) no larger
+than X (`index_max_local`, now shared with `index_local`) and the
+payload ends on the page, the cell's length is `child + 1 + b`, which
+is exactly what `index_cell_layout` would return. Every other cell,
+and every error, still goes through `index_cell_layout`, so corrupt
+pages fail with the same error as before. Workload checksums identical
+(176089 / 657610 / 4083309 at n=500/1000/2000). Test pass/fail set
+identical before/after (1157 tests; the 1027 failures are the absent
+`sqlite3` oracle, same on the baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 215,947,232   | 197,576,305   | -8.51%  |
+| 1000 | 512,085,990   | 466,197,976   | -8.96%  |
+| 2000 | 1,275,323,631 | 1,168,340,905 | -8.39%  |
+
+n=1000: `index_search_raw` inclusive 126,399,681 -> 80,513,948
+(-36.3%); `index_insert_core` inclusive 220,249,518 -> 174,363,785
+(-20.8%); calls to `index_cell_layout` from the walk 566,692 -> 0
+(the 34,896 left come from `parse_index_cell` in the binary search).
+No allocation change (the walk allocated nothing before or after).
+
+Size gates: tiny unchanged (no `indexes`); full +104 B, max +88 B,
+xl +88 B; ratchets raised by those amounts (each well under
+`justify_over`).

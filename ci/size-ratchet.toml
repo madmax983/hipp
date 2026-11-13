@@ -56,7 +56,10 @@ justify_over = 4096
 # routing's two copies of the `temp.` cut became one, paying for it.
 # 478,212 -> 478,164 (Bolt): vec_zeroed builds page images with one
 # zeroed allocation (-12.2% instructions on bolt_workload): -48 B.
-ratchet = 478164
+# 478,164 -> 478,268 (Bolt): index_search_raw lays out 1-byte-header
+# local index cells inline (-8.4..9.0% instructions on bolt_workload):
+# +104 B.
+ratchet = 478268
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -98,7 +101,10 @@ justify_over = 16384
 # routing's two copies of the `temp.` cut became one, paying for it.
 # 964,684 -> 964,644 (Bolt): vec_zeroed builds page images with one
 # zeroed allocation (-12.2% instructions on bolt_workload): -40 B.
-ratchet = 964644
+# 964,644 -> 964,732 (Bolt): index_search_raw lays out 1-byte-header
+# local index cells inline (-8.4..9.0% instructions on bolt_workload):
+# +88 B.
+ratchet = 964732
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -134,7 +140,10 @@ justify_over = 32768
 # routing's two copies of the `temp.` cut became one, paying for it.
 # 1,061,344 -> 1,061,304 (Bolt): vec_zeroed builds page images with one
 # zeroed allocation (-12.2% instructions on bolt_workload): -40 B.
-ratchet = 1061304
+# 1,061,304 -> 1,061,392 (Bolt): index_search_raw lays out 1-byte-header
+# local index cells inline (-8.4..9.0% instructions on bolt_workload):
+# +88 B.
+ratchet = 1061392
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

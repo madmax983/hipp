@@ -2893,12 +2893,19 @@ pub async fn btree_delete<S: Storage>(
 // index thresholds of SQFMT §1.6.
 // ----------------------------------------------------------------
 
+/// X of SQFMT §1.6 for an index cell: the largest payload kept
+/// wholly on its page, ((U-12)*64/255)-23.
+#[cfg(any(feature = "indexes", feature = "write"))]
+fn index_max_local(usable: usize) -> usize {
+    (usable - 12) * 64 / 255 - 23
+}
+
 /// Local-payload byte count for an index cell (SQFMT §1.6):
 /// X = ((U-12)*64/255)-23; if P > X, M = ((U-12)*32/255)-23 and
 /// K = M + ((P-M) mod (U-4)); keep K if K <= X else M.
 #[cfg(any(feature = "indexes", feature = "write"))]
 pub fn index_local(usable: usize, payload_len: usize) -> usize {
-    let x = (usable - 12) * 64 / 255 - 23;
+    let x = index_max_local(usable);
     if payload_len <= x {
         return payload_len;
     }
@@ -3777,15 +3784,30 @@ async fn index_search_raw<S: Storage>(
     let mut sum = 0usize;
     spans.clear();
     spans.try_reserve(n)?;
+    // A payload under 128 bytes that stays local (`index_local`'s X)
+    // is a 1-byte length varint and its payload: lay that cell out
+    // inline. Anything else, every error included, takes
+    // `index_cell_layout`.
+    let child_len = if interior { 4 } else { 0 };
+    let max_local = index_max_local(usable);
     for i in 0..n {
         let ptr = cell_ptr::<S::Error>(bytes, h, i, page)?;
-        let l = index_cell_layout::<S::Error>(bytes, ptr, usable, page, interior)?;
-        sum += padded_cell_len(l.total);
+        let total = match bytes.get(ptr + child_len) {
+            Some(&b)
+                if b < 0x80
+                    && usize::from(b) <= max_local
+                    && ptr + child_len + 1 + usize::from(b) <= bytes.len() =>
+            {
+                child_len + 1 + usize::from(b)
+            }
+            _ => index_cell_layout::<S::Error>(bytes, ptr, usable, page, interior)?.total,
+        };
+        sum += padded_cell_len(total);
         // Both fit: a cell offset is a u16 on the page, and an index
         // cell's local part is capped well below 64 KiB.
         let span = (
             u16::try_from(ptr).map_err(|_| Error::CorruptPage { page })?,
-            u16::try_from(l.total).map_err(|_| Error::CorruptPage { page })?,
+            u16::try_from(total).map_err(|_| Error::CorruptPage { page })?,
         );
         spans.push(span);
     }
