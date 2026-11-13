@@ -297,3 +297,27 @@ n=1000: `build_leaf_image_inserted` inclusive 88,174,993 ->
 
 Size gates: tiny -48 B, full -48 B, max -40 B, xl -32 B; ratchets
 lowered by those amounts.
+
+## index_search_raw lays every leaf cell out out-of-line (baseline at 1bde36f)
+
+`bolt_workload` (callgrind, release + debuginfo). On every index
+insert, `index_search_raw` walks all cells of the target page to
+validate them, sum their lengths and record their spans, calling the
+general `index_cell_layout` (an out-of-line call returning a
+`Result<IndexCellLayout>` through memory, plus an out-of-line
+`decode_varint` and `index_local`) for each one, although nearly every
+index cell is a 1-byte payload-length varint with no overflow.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 215,947,232   |
+| 1000 | 512,085,990   |
+| 2000 | 1,275,323,631 |
+
+n=1000 profile: `index_insert_core` inclusive 220,249,518 (43.01%);
+`index_search_raw` inclusive 126,399,681 (24.68%); `index_cell_layout`
+inclusive 51,809,543 (10.12%), of which 48,768,787 (9.52%, 566,692
+calls, ~86 Ir per cell) from the walk in `index_search_raw`.
+`index_cell_layout` is the top self-cost entry (31,892,921, 6.23%).
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`
