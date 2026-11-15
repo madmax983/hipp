@@ -18,7 +18,7 @@ use crate::storage::Storage;
 #[cfg(feature = "indexes")]
 use crate::record::{KeyOrder, compare_coll, compare_coll_in};
 #[cfg(feature = "indexes")]
-use crate::record::{OwnedValue, Value, decode_record, encode_record};
+use crate::record::{OwnedValue, Value, decode_record_into, encode_record};
 
 pub const KIND_INTERIOR_INDEX: u8 = 0x02;
 pub const KIND_INTERIOR_TABLE: u8 = 0x05;
@@ -3209,27 +3209,36 @@ fn entry_fields<S: Storage>(pager: &Pager<S>, root: u32, desc: &[KeyOrder]) -> u
 /// `entry_fields`).
 #[cfg(feature = "indexes")]
 pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntry, E> {
-    #[cfg(feature = "without_rowid")]
-    if nfields == 0 {
-        let vals = decode_record::<E>(payload, usize::MAX)?;
-        let mut out = AVec::new();
-        for v in vals.iter() {
-            out.push(OwnedValue::from_value(*v));
-        }
-        return Ok(IndexEntry { values: out });
-    }
-    let vals = decode_record::<E>(payload, nfields)?;
-    if vals.len() != nfields {
-        return Err(Error::CorruptRecord);
-    }
+    let mut vals = AVec::new();
+    decode_index_values_into::<E>(payload, nfields, &mut vals)?;
     let mut out = AVec::new();
     for v in vals.iter() {
         out.push(OwnedValue::from_value(*v));
     }
-    let entry = IndexEntry { values: out };
+    Ok(IndexEntry { values: out })
+}
+
+/// `decode_index_entry`'s decode and checks, borrowing the fields
+/// from `payload` into `out` (cleared first) instead of owning them.
+#[cfg(feature = "indexes")]
+fn decode_index_values_into<'a, E>(
+    payload: &'a [u8],
+    nfields: usize,
+    out: &mut AVec<Value<'a>>,
+) -> Result<(), E> {
+    #[cfg(feature = "without_rowid")]
+    if nfields == 0 {
+        return decode_record_into::<E>(payload, usize::MAX, out);
+    }
+    decode_record_into::<E>(payload, nfields, out)?;
+    if out.len() != nfields {
+        return Err(Error::CorruptRecord);
+    }
     // The trailing field is the rowid and must be an integer.
-    let _ = entry.rowid::<E>()?;
-    Ok(entry)
+    match out.as_slice().last() {
+        Some(Value::Integer(_)) => Ok(()),
+        _ => Err(Error::CorruptRecord),
+    }
 }
 
 /// Every key payload of the index rooted at `root`, raw, in key
@@ -3323,6 +3332,27 @@ pub fn compare_entries(
     for j in 0..a.len().min(b.len()) {
         let o = desc.get(j).copied().unwrap_or_default();
         let c = compare_coll_in(&a[j].as_value(), &b[j].as_value(), o.coll, enc);
+        let c = if o.desc { c.reverse() } else { c };
+        if c != Ordering::Equal {
+            return c;
+        }
+    }
+    Ordering::Equal
+}
+
+/// `compare_entries` with the second key's fields borrowed (from a
+/// page image) rather than owned.
+#[cfg(feature = "indexes")]
+fn compare_entry_values(
+    a: &[OwnedValue],
+    b: &[Value<'_>],
+    desc: &[KeyOrder],
+    enc: crate::record::TextEnc,
+) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    for j in 0..a.len().min(b.len()) {
+        let o = desc.get(j).copied().unwrap_or_default();
+        let c = compare_coll_in(&a[j].as_value(), &b[j], o.coll, enc);
         let c = if o.desc { c.reverse() } else { c };
         if c != Ordering::Equal {
             return c;
@@ -3812,18 +3842,44 @@ async fn index_search_raw<S: Storage>(
         spans.push(span);
     }
     let (mut lo, mut hi) = (0usize, n);
+    // A visited cell whose payload is all on the page is compared
+    // in place (its fields borrowed from `bytes`); one that spills
+    // to overflow pages is reassembled and decoded as before, and so
+    // is every cell of a UTF-16 database (`assemble_payload` hands
+    // its records over transcoded to UTF-8).
+    #[cfg(feature = "utf16")]
+    let in_place = crate::utf16::byte_order(pager.text_enc()).is_none();
+    #[cfg(not(feature = "utf16"))]
+    let in_place = true;
+    let mut vals: AVec<Value<'_>> = AVec::new();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let ptr = cell_ptr::<S::Error>(bytes, h, mid, page)?;
-        let cell = parse_index_cell::<S::Error>(bytes, ptr, usable, page, interior)?;
-        let p = index_cell_payload(pager, &cell).await?;
-        let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
-        match compare_entries(
-            probe.values.as_slice(),
-            e.values.as_slice(),
-            desc,
-            pager.text_enc(),
-        ) {
+        let l = index_cell_layout::<S::Error>(bytes, ptr, usable, page, interior)?;
+        let ord = if in_place && l.local_len == l.payload_len {
+            let at = ptr + l.payload_off;
+            let local = bytes
+                .get(at..at + l.local_len)
+                .ok_or(Error::CorruptPage { page })?;
+            decode_index_values_into::<S::Error>(local, nfields, &mut vals)?;
+            compare_entry_values(
+                probe.values.as_slice(),
+                vals.as_slice(),
+                desc,
+                pager.text_enc(),
+            )
+        } else {
+            let cell = parse_index_cell::<S::Error>(bytes, ptr, usable, page, interior)?;
+            let p = index_cell_payload(pager, &cell).await?;
+            let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+            compare_entries(
+                probe.values.as_slice(),
+                e.values.as_slice(),
+                desc,
+                pager.text_enc(),
+            )
+        };
+        match ord {
             Ordering::Equal => {
                 return Err(Error::Schema {
                     kind: SchemaKind::DuplicateRowid,

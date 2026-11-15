@@ -350,3 +350,67 @@ No allocation change (the walk allocated nothing before or after).
 Size gates: tiny unchanged (no `indexes`); full +104 B, max +88 B,
 xl +88 B; ratchets raised by those amounts (each well under
 `justify_over`).
+
+## index_search_raw decodes each binary-search probe into owned copies (baseline at 9c007e6)
+
+`bolt_workload` (callgrind, release + debuginfo). Every cell the
+binary search in `index_search_raw` visits (17,103 visits over 3,101
+pages at n=1000, all from `index_insert_core`: CREATE INDEX and
+index maintenance) goes through `parse_index_cell` (a heap copy of the
+cell), `index_cell_payload` (a second copy, through
+`assemble_payload`'s byte-at-a-time push) and `decode_index_entry` (a
+`Value` vector, then an `OwnedValue` vector with a heap copy of every
+text / blob field), ~1,890 Ir per visit, to compare one key, although
+nearly every index cell is entirely local on the page.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 197,547,305   |
+| 1000 | 465,696,010   |
+| 2000 | 1,169,278,333 |
+
+n=1000 profile: `index_insert_core` inclusive 174,172,870 (37.40%);
+`index_search_raw` inclusive 80,486,203 (17.28%), of which the binary
+search's per-probe decode is 32,208,535 (6.92%): `decode_index_entry`
+16,761,743 (3.60%), `index_cell_payload` 9,704,854 (2.08%),
+`parse_index_cell` 4,026,254 (0.86%), `compare_entries` 1,715,684
+(0.37%). dhat (n=1000): 519,770 blocks, 137,369,612 bytes; t-gmax
+852,164 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: compare local probes in place
+
+The binary search lays out the visited cell (`index_cell_layout`) and,
+when its payload is entirely local (`local_len == payload_len`),
+decodes the record straight from the page image into a reused
+borrowed `Value` vector (`decode_index_values_into`, the checks
+`decode_index_entry` makes, which now calls it) and compares it with
+`compare_entry_values` (`compare_entries` over borrowed fields). A
+cell that spills to overflow pages, and every cell of a UTF-16
+database (whose records `assemble_payload` transcodes to UTF-8 before
+they are compared), takes the old copy + reassemble + owned-decode
+path; `tests/utf16_index_insert.rs` pins that (without the UTF-16
+guard, `integrity_check` finds rows missing from both indexes). Workload checksums identical (176089 / 657610 /
+4083309 at n=500/1000/2000). Test pass/fail set identical
+before/after (1033 tests; the 899 failures are the absent `sqlite3`
+oracle, same on the baseline commit), plus the 3 new tests passing.
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 197,547,305   | 186,678,623   | -5.50%  |
+| 1000 | 465,696,010   | 440,999,107   | -5.30%  |
+| 2000 | 1,169,278,333 | 1,114,283,597 | -4.70%  |
+
+n=1000: `index_search_raw` inclusive 80,486,203 -> 55,806,678
+(-30.7%); `index_insert_core` inclusive 174,172,870 -> 149,489,452
+(-14.2%); the per-probe compare 32,208,535 -> ~3.4M
+(`index_cell_layout` 1,502,183 + `compare_entry_values` 1,655,487
+plus the inlined record decode). dhat (n=1000): 519,770 -> 437,354
+blocks (-15.86%), 137,369,612 -> 133,470,749 bytes (-2.84%); t-gmax
+unchanged at 852,164 B.
+
+Size gates: tiny unchanged (no `indexes`); full +288 B, max +464 B,
+xl +472 B; ratchets raised by those amounts (each well under
+`justify_over`).
