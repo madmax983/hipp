@@ -379,3 +379,35 @@ search's per-probe decode is 32,208,535 (6.92%): `decode_index_entry`
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: compare local probes in place
+
+The binary search lays out the visited cell (`index_cell_layout`) and,
+when its payload is entirely local (`local_len == payload_len`),
+decodes the record straight from the page image into a reused
+borrowed `Value` vector (`decode_index_values_into`, the checks
+`decode_index_entry` makes, which now calls it) and compares it with
+`compare_entry_values` (`compare_entries` over borrowed fields). A
+cell that spills to overflow pages takes the old copy + reassemble +
+owned-decode path. Workload checksums identical (176089 / 657610 /
+4083309 at n=500/1000/2000). Test pass/fail set identical
+before/after (1033 tests; the 899 failures are the absent `sqlite3`
+oracle, same on the baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 197,547,305   | 186,202,068   | -5.74%  |
+| 1000 | 465,696,010   | 439,818,362   | -5.56%  |
+| 2000 | 1,169,278,333 | 1,111,540,808 | -4.94%  |
+
+n=1000: `index_search_raw` inclusive 80,486,203 -> 54,628,179
+(-32.1%); `index_insert_core` inclusive 174,172,870 -> 148,310,953
+(-14.8%); the per-probe compare 32,208,535 -> ~3.4M
+(`index_cell_layout` 1,502,183 + `compare_entry_values` 1,655,487
+plus the inlined record decode). dhat (n=1000): 519,770 -> 437,354
+blocks (-15.86%), 137,369,612 -> 133,470,749 bytes (-2.84%); t-gmax
+unchanged at 852,164 B.
+
+Size gates: tiny unchanged (no `indexes`); full +288 B, max +448 B,
+xl +448 B; ratchets raised by those amounts (each well under
+`justify_over`).
