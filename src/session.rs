@@ -1941,6 +1941,13 @@ impl<S: Storage> Connection<S> {
             },
             e => e,
         })?;
+        // Of an empty statement, a syntax error (v0.17).
+        if matches!(st.ast, Ast::Empty) {
+            return Err(Error::Parse {
+                offset: sql.len(),
+                kind: crate::error::ParseKind::UnexpectedEof,
+            });
+        }
         #[allow(unused_mut)]
         let mut rows = st.eqp_rows().await?;
         if let Plan::Temp { .. } = &st.plan {
@@ -2249,6 +2256,8 @@ impl<S: Storage> Connection<S> {
             Ast::AlterRename { .. }
             | Ast::AlterRenameColumn { .. }
             | Ast::AlterDropColumn { .. } => self.plan_alter16(arena, ast),
+            #[cfg(feature = "sql")]
+            Ast::Empty => Ok(Plan::Maint(maint::Maint::Nothing)),
             #[cfg(feature = "sql")]
             Ast::Savepoint { .. }
             | Ast::Release { .. }
@@ -5388,7 +5397,13 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::Fts5Context,
             });
         }
-        if !has_agg && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
+        // A core over no table makes one row, which satisfies its
+        // ORDER BY: the pin's loop over no table never computes the
+        // terms (`nOBSat`; DISTINCT likewise), so an aggregate there
+        // is no misuse either (v0.17 fix: hipp sorted the one row,
+        // and failed on a term that errors or aggregates).
+        let free = sources.is_empty() && !has_agg && stmt.compound.is_empty();
+        if !has_agg && !free && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,
             });
@@ -5425,6 +5440,10 @@ impl<S: Storage> Connection<S> {
                 }
             }
             order_by = kept;
+        }
+        // (A window query keeps it: see above.)
+        if free && plain {
+            order_by.clear();
         }
         cur.aliases.clear();
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
@@ -12257,7 +12276,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         offset: &Option<RExpr>,
     ) -> Result<(usize, usize), S::Error> {
         let mut vals = [None, None];
-        for (slot, e) in vals.iter_mut().zip([limit, offset]) {
+        for (i, (slot, e)) in vals.iter_mut().zip([limit, offset]).enumerate() {
             let Some(e) = e else { continue };
             #[cfg(feature = "sql")]
             let v = self.eval_row_sub(e, &RowData::empty()).await?;
@@ -12266,7 +12285,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 e,
                 &Ctx::of(&RowData::empty()).with(&self.conn.env),
             )?;
-            *slot = Some(crate::query::limit_int::<S::Error>(v)?);
+            let n = crate::query::limit_int::<S::Error>(v)?;
+            // LIMIT 0 ends the statement before its OFFSET is
+            // computed (the pin's `OP_IfNot` on the limit register;
+            // v0.17 fix: `LIMIT 0 OFFSET <failing>` failed).
+            if n == 0 && i == 0 {
+                return Ok((0, 0));
+            }
+            *slot = Some(n);
         }
         let [lim, off] = vals;
         let take = match lim {
@@ -12436,12 +12462,29 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(src_rows)
     }
 
+    /// LIMIT 0 (`window`'s take): the query computes nothing and
+    /// returns no row, as the pin jumps past its whole loop (v0.17
+    /// fix: a FROM-less, compound or window query computed its
+    /// terms and could fail).
+    #[cfg(feature = "sql")]
+    fn limit_zero(&mut self, window: (usize, usize)) -> bool {
+        let z = window.1 == 0;
+        if z {
+            self.query_rows.clear();
+            self.query_rowids.clear();
+        }
+        z
+    }
+
     /// Execute a compound / VALUES-core top-level query (v0.9):
     /// each core's rows through the async core path, combined
     /// left to right, then the compound ORDER BY / LIMIT.
     #[cfg(feature = "sql")]
     async fn run_query_compound(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        if self.limit_zero(window) {
+            return Ok(());
+        }
         let head = self.exec_qp_core_values(qp).await?;
         let mut tails = AVec::new();
         let mut cores = AVec::new();
@@ -12566,6 +12609,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "sql")]
     async fn run_query_sub(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        if self.limit_zero(window) {
+            return Ok(());
+        }
         // Window calls (v0.16, `window`) read every input row: no
         // bound passes into the sources.
         #[cfg(feature = "window")]
@@ -13185,6 +13231,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             return self.exec_recursive(plan, rec, outer, need).await;
         }
         let window = self.limit_window(&plan.limit, &plan.offset).await?;
+        // LIMIT 0: nothing is computed (`limit_zero`).
+        if window.1 == 0 {
+            return Ok(AVec::new());
+        }
         // The rows its reader takes bound the rows it must make.
         let (skip, take) = window;
         let streamed = (skip, need.map_or(take, |n| take.min(n)));

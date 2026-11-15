@@ -6022,19 +6022,26 @@ pub fn is_constant(e: &RExpr) -> bool {
     }
 }
 
-/// An integer literal's truth (`None` for any other expression).
-/// An AND over a false one is false too, an OR over a true one true
-/// (the pin's simplified operator is such a literal again).
+/// An integer literal's truth (`None` for any other expression),
+/// after the pin's `sqlite3ExprSimplifiedAndOr`: an AND over a false
+/// one is false, an OR over a true one true, and an AND over a true
+/// one (an OR over a false one) is its other operand (v0.17 fix:
+/// `x AND (0 OR 0)` is 0 on the pin without computing `x`).
 pub(crate) fn int_lit(e: &RExpr) -> Option<bool> {
     match e {
         RExpr::Literal(OwnedValue::Integer(i)) => Some(*i != 0),
-        RExpr::Binary(BinOp::And, a, b)
-            if int_lit(a) == Some(false) || int_lit(b) == Some(false) =>
-        {
-            Some(false)
-        }
-        RExpr::Binary(BinOp::Or, a, b) if int_lit(a) == Some(true) || int_lit(b) == Some(true) => {
-            Some(true)
+        RExpr::Binary(op @ (BinOp::And | BinOp::Or), a, b) => {
+            let or = *op == BinOp::Or;
+            let (x, y) = (int_lit(a), int_lit(b));
+            if x == Some(or) || y == Some(or) {
+                Some(or)
+            } else if x == Some(!or) {
+                y
+            } else if y == Some(!or) {
+                x
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -7063,13 +7070,9 @@ fn scalar_values<E>(
             }
             OwnedValue::Text(t)
         }
-        ScalarFn::Hex => {
-            if matches!(v0, OwnedValue::Null) {
-                OwnedValue::Null
-            } else {
-                hex_text(to_text(v0).unwrap_or_default().as_slice())
-            }
-        }
+        // NULL reads as no bytes: `hex(NULL)` is '' on the pin
+        // (v0.17 fix: hipp returned NULL).
+        ScalarFn::Hex => hex_text(to_text(v0).unwrap_or_default().as_slice()),
         // The pin's `sqlite3_value_numeric_type`: a number, or a
         // text that is wholly one; a BLOB or any other text is NULL
         // (v0.16 fix, ungated: `sign(x'32')` and `sign('2x')` were 1).
@@ -7115,6 +7118,13 @@ fn scalar_values<E>(
                 return Ok(OwnedValue::Null);
             };
             let blob = matches!(v0, OwnedValue::Blob(_));
+            // An empty BLOB is NULL: the pin's substrFunc gets no
+            // pointer from `sqlite3_value_blob` for zero bytes and
+            // returns nothing (v0.17 fix: hipp returned X''). An
+            // empty text is a pointer to "" and answers ''.
+            if blob && text.is_empty() {
+                return Ok(OwnedValue::Null);
+            }
             // Start and length are read as the pin's
             // `sqlite3_value_int64` reads them: a text's integer
             // prefix ('1e1' is 1), a real truncated.
@@ -7940,21 +7950,55 @@ pub fn constant_terms_hold<E>(filter: &RExpr, ctx: &Ctx<'_>) -> Result<bool, E> 
 }
 
 /// A constant-propagation binding (`join_constants_hold`): the
-/// column slot, the index of the term defining it, the literal with
-/// the column's affinity applied, the column's affinity and
-/// collation.
-type ConstBind = (usize, usize, OwnedValue, Affinity, Option<Coll>);
+/// column's key (`prop_key`), the index of the term defining it,
+/// what stands in for the column (the constant, with the column's
+/// affinity, as an `AffLiteral`; the constant itself when computing
+/// it failed) and the column's affinity.
+type ConstBind = (usize, usize, RExpr, Affinity);
+
+/// A column (or a table's rowid: the INTEGER PRIMARY KEY column
+/// resolves to it) as a constant-propagation key, with its affinity
+/// and collation.
+fn prop_key(e: &RExpr) -> Option<(usize, Affinity, Option<Coll>)> {
+    match e {
+        RExpr::Column(slot, aff, coll) => Some((*slot, *aff, *coll)),
+        RExpr::Rowid(s) => Some((usize::MAX - *s, Affinity::Integer, None)),
+        _ => None,
+    }
+}
+
+/// The operands of a term that may fix a column, as the pin's
+/// `findConstInWhere` sees them: `=` under BINARY, and a one-item
+/// `x IN (c)` without a top-level COLLATE, which the pin's parser
+/// turns into `x = +c`.
+fn prop_eq(t: &RExpr) -> Option<(&RExpr, &RExpr)> {
+    match t {
+        RExpr::Binary(BinOp::Eq, l, r) => Some((&**l, &**r)),
+        RExpr::InList(x, l, false, false) => match l.as_slice() {
+            [c] if !matches!(c, RExpr::Collate(..)) => Some((&**x, c)),
+            _ => None,
+        },
+        _ => None,
+    }
+    .filter(|(l, r)| binary_coll(l, r) == Coll::Binary)
+}
 
 /// `constant_terms_hold` for a SELECT core: the WHERE clause
 /// `filter`, then the ON clause of each inner-joined source (the
 /// pin moves those into WHERE; an outer join's ON is tested per
 /// row), after the pin's constant propagation (`propagateConstants`):
-/// a term `column = literal` (BINARY, the literal of no affinity;
-/// the last such term of a column, the pin scanning right to left)
-/// stands the literal, with the column's affinity, in for that
+/// a term `column = constant` (BINARY, the constant of no affinity;
+/// the last such term of a column, the pin scanning right to left;
+/// the rowid and its alias included; `column IN (constant)` too)
+/// stands the constant, with the column's affinity, in for that
 /// column in the other terms — as a comparison operand only when
 /// the column has BLOB affinity — so `WHERE x = 1 AND (x = 2 OR
 /// json('[') IS NULL)` computes its second term up front as well.
+/// A constant that fails to compute raises only where a term reads
+/// it (v0.17 fix: the rowid, constants other than literals, and
+/// IN / BETWEEN / LIKE / CASE / COLLATE / unary-plus operands were
+/// left out, so `WHERE a = 5 AND a < 5 AND <failing constant>` over
+/// an INTEGER PRIMARY KEY `a` computed the failing term).
 pub fn join_constants_hold<E>(
     filter: Option<&RExpr>,
     sources: &[SubSource],
@@ -7976,31 +8020,40 @@ pub fn join_constants_hold<E>(
     let mut binds: AVec<ConstBind> = AVec::new();
     if terms.len() > 1 && !right_join {
         for (i, t) in terms.iter().enumerate().rev() {
-            let RExpr::Binary(BinOp::Eq, l, r) = t else {
+            let Some((l, r)) = prop_eq(t) else {
                 continue;
             };
-            for (c, v) in [(&**r, &**l), (&**l, &**r)] {
-                if let (RExpr::Column(slot, aff, coll), RExpr::Literal(lit)) = (c, v)
-                    && coll.unwrap_or_default() == Coll::Binary
-                    && !binds.iter().any(|b| b.0 == *slot)
+            for (c, v) in [(r, l), (l, r)] {
+                if let Some((key, aff, coll)) = prop_key(c)
+                    && !binds.iter().any(|b| b.0 == key)
+                    && !matches!(v, RExpr::AffLiteral(..))
+                    && factorable(v)
+                    && item_result_affinity(v).is_none()
                 {
-                    binds.push((
-                        *slot,
-                        i,
-                        crate::record::apply_affinity(lit.clone(), *aff),
-                        *aff,
-                        *coll,
-                    ));
+                    let with = match match v {
+                        RExpr::Literal(x) => Ok(x.clone()),
+                        _ => eval::<E>(v, ctx),
+                    } {
+                        Ok(x) => RExpr::AffLiteral(
+                            crate::record::apply_affinity(x, aff),
+                            Some(aff),
+                            coll,
+                        ),
+                        // It fails again wherever a term reads it.
+                        Err(_) => v.clone(),
+                    };
+                    binds.push((key, i, with, aff));
                 }
             }
         }
     }
     for (i, t) in terms.iter().enumerate() {
-        let t2;
+        let mut t2;
         let t: &RExpr = if binds.is_empty() {
             t
         } else {
-            t2 = propagate(t, binds.as_slice(), i, false);
+            t2 = (*t).clone();
+            propagate(&mut t2, binds.as_slice(), i, false);
             &t2
         };
         if factorable(t) && !cond::<E>(t, ctx)? {
@@ -8010,43 +8063,78 @@ pub fn join_constants_hold<E>(
     Ok(true)
 }
 
-/// `join_constants_hold`'s rewrite of term `i` (`binds`): a bound
-/// column becomes its literal, unless the term defines it; a BLOB
-/// affinity column only as an operand of `=`, `<`, `<=`, `>`, `>=`
-/// or IS (`operand`), the right one only when the left one is not
-/// of TEXT affinity (the pin's `propagateConstantExprRewrite`).
-/// Other node kinds are left as they are: one still reading a
-/// column is no constant term (a narrower rewrite than the pin's).
-fn propagate(e: &RExpr, binds: &[ConstBind], i: usize, operand: bool) -> RExpr {
-    let p = |x: &RExpr, o: bool| Box::new(propagate(x, binds, i, o));
+/// `join_constants_hold`'s rewrite of term `i` (`binds`), in place
+/// (the pin's `propagateConstantExprRewrite`): a bound column
+/// becomes its constant, unless the term defines it; a BLOB
+/// affinity column only as an operand of `=`, `<`, `<=`, `>`, `>=`,
+/// IS or a one-item IN (`operand`), the right one only when the
+/// left one is not of TEXT affinity. Subqueries are left as they
+/// are (no constant term holds one).
+fn propagate(e: &mut RExpr, binds: &[ConstBind], i: usize, operand: bool) {
+    if let Some((key, ..)) = prop_key(e) {
+        if let Some((_, def, with, aff)) = binds.iter().find(|b| b.0 == key)
+            && *def != i
+            && (operand || *aff != Affinity::Blob)
+        {
+            *e = with.clone();
+        }
+        return;
+    }
+    let one = matches!(e, RExpr::InList(_, l, false, false) if l.len() == 1);
+    let mut kids: AVec<(&mut RExpr, bool)> = AVec::new();
     match e {
-        RExpr::Column(slot, ..) => match binds.iter().find(|b| b.0 == *slot) {
-            Some((_, def, v, aff, coll)) if *def != i && (operand || *aff != Affinity::Blob) => {
-                RExpr::AffLiteral(v.clone(), Some(*aff), *coll)
-            }
-            _ => e.clone(),
-        },
         RExpr::Binary(
-            op @ (BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Is),
+            BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Is,
             l,
             r,
         ) => {
-            let text = matches!(&**l, RExpr::Column(_, Affinity::Text, _));
-            RExpr::Binary(*op, p(l, true), p(r, !text))
+            let text = item_result_affinity(l) == Some(Affinity::Text);
+            kids.push((l, true));
+            kids.push((r, !text));
         }
-        RExpr::Binary(op, l, r) => RExpr::Binary(*op, p(l, false), p(r, false)),
-        RExpr::Not(x) => RExpr::Not(p(x, false)),
-        RExpr::Neg(x) => RExpr::Neg(p(x, false)),
-        RExpr::IsNull(x, n) => RExpr::IsNull(p(x, false), *n),
-        RExpr::Cast(x, a) => RExpr::Cast(p(x, false), *a),
-        RExpr::Scalar(f, args) => {
-            let mut out = AVec::new();
-            for a in args.iter() {
-                out.push(propagate(a, binds, i, false));
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            kids.push((a, false));
+            kids.push((b, false));
+        }
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => kids.push((a, false)),
+        RExpr::InList(x, l, ..) => {
+            kids.push((x, one));
+            for v in l.as_mut_slice() {
+                kids.push((v, false));
             }
-            RExpr::Scalar(*f, out)
         }
-        _ => e.clone(),
+        RExpr::Between(x, a, b, _) => {
+            kids.push((x, false));
+            kids.push((a, false));
+            kids.push((b, false));
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            for b in base.iter_mut().chain(otherwise.iter_mut()) {
+                kids.push((b, false));
+            }
+            for (w, t) in whens.as_mut_slice() {
+                kids.push((w, false));
+                kids.push((t, false));
+            }
+        }
+        RExpr::Scalar(_, args) => {
+            for a in args.as_mut_slice() {
+                kids.push((a, false));
+            }
+        }
+        _ => {}
+    }
+    for (k, o) in kids {
+        propagate(k, binds, i, o);
     }
 }
 

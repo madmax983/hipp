@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 478,212 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 964,684 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,061,344 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 479,332 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 965,876 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,062,520 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,16 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **Evaluator and statement-level parity** (unit `gaps_eval`,
+  ungated; empty statements on `sql`). `hex(NULL)` is `''` and
+  `substr` of an empty BLOB is NULL, as on the pin; a FROM-less core
+  never computes its ORDER BY terms; LIMIT 0 computes nothing else
+  (not even its OFFSET); the WHERE clause's constant propagation
+  covers the rowid, non-literal constants, one-item IN lists and every
+  operand kind, so `WHERE a = 5 AND a < 5 AND <failing constant>` is
+  no row; AND / OR drop a neutral operand (`x AND (0 OR 0)` is 0);
+  and empty statements (`;`, `;;`, comments) do nothing, in the
+  library and in the CLI's scripts.
 - **Streamed rows.** A top-level SELECT hands its rows to
   `Statement::step` one at a time, as the pin does: the join is a
   resumable nested loop whose first source is read through its

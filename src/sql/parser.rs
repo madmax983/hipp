@@ -447,7 +447,7 @@ struct InsertSource {
 pub fn parse<E>(sql: &[u8], arena: &Arena, lim: Limits) -> Result<Ast, E> {
     let toks = lex_checked::<E>(sql, arena)?;
     let mut p = Parser::new(toks, arena, sql, lim);
-    let ast = p.statement::<E>()?;
+    let ast = p.top::<E>()?;
     p.expect_end::<E>()?;
     Ok(ast)
 }
@@ -482,7 +482,7 @@ pub fn parse_params<E>(
     too_long::<E>(sql.len())?;
     let toks = lexer::lex_params::<E>(sql, arena, &mut params)?;
     let mut p = Parser::new(toks, arena, sql, lim);
-    let ast = p.statement::<E>()?;
+    let ast = p.top::<E>()?;
     p.expect_end::<E>()?;
     let stored = match &ast {
         #[cfg(feature = "sql")]
@@ -1087,12 +1087,27 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_end<E>(&mut self) -> Result<(), E> {
+        // The pin's prepare stops at the first `;`, and its exec skips
+        // the empty statements after it (v0.17, `sql`).
+        #[cfg(feature = "sql")]
+        while self.eat(Tok::Semi) {}
+        #[cfg(not(feature = "sql"))]
         self.eat(Tok::Semi);
         if self.at_eof() {
             Ok(())
         } else {
             Err(perr(self.cur().offset, ParseKind::TrailingInput))
         }
+    }
+
+    /// A statement handed to `prepare`: also the empty one (v0.17,
+    /// `sql`; `Ast::Empty`).
+    fn top<E>(&mut self) -> Result<Ast, E> {
+        #[cfg(feature = "sql")]
+        if self.at_eof() || matches!(self.cur().tok, Tok::Semi) {
+            return Ok(Ast::Empty);
+        }
+        self.statement::<E>()
     }
 
     fn statement<E>(&mut self) -> Result<Ast, E> {

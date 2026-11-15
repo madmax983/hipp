@@ -62,7 +62,13 @@ justify_over = 4096
 # 478,268 -> 478,556 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +288 B.
-ratchet = 478556
+# 478,556 -> 479,332 (v0.17 gaps_eval, ungated correctness fixes on the
+# evaluator / executor, plus empty statements on `sql`; STATUS.md): +776 B.
+# hex(NULL) is '', substr of an empty BLOB is NULL; the WHERE constant
+# propagation covers the rowid, non-literal constants, one-item IN and
+# every node kind; LIMIT 0 computes nothing; a FROM-less core drops its
+# ORDER BY; AND / OR simplify neutral operands. No offsetting saving found.
+ratchet = 479332
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -110,7 +116,13 @@ justify_over = 16384
 # 964,732 -> 965,196 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +464 B.
-ratchet = 965196
+# 965,196 -> 965,876 (v0.17 gaps_eval, ungated correctness fixes on the
+# evaluator / executor, plus empty statements on `sql`; STATUS.md): +680 B.
+# hex(NULL) is '', substr of an empty BLOB is NULL; the WHERE constant
+# propagation covers the rowid, non-literal constants, one-item IN and
+# every node kind; LIMIT 0 computes nothing; a FROM-less core drops its
+# ORDER BY; AND / OR simplify neutral operands. No offsetting saving found.
+ratchet = 965876
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -152,7 +164,13 @@ justify_over = 32768
 # 1,061,392 -> 1,061,864 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +472 B.
-ratchet = 1061864
+# 1,061,864 -> 1,062,520 (v0.17 gaps_eval, ungated correctness fixes on the
+# evaluator / executor, plus empty statements on `sql`; STATUS.md): +656 B.
+# hex(NULL) is '', substr of an empty BLOB is NULL; the WHERE constant
+# propagation covers the rowid, non-literal constants, one-item IN and
+# every node kind; LIMIT 0 computes nothing; a FROM-less core drops its
+# ORDER BY; AND / OR simplify neutral operands. No offsetting saving found.
+ratchet = 1062520
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

@@ -1166,6 +1166,11 @@ pub enum Ast {
     Commit,
     /// `ROLLBACK [TRANSACTION]` (v0.2).
     Rollback,
+    /// An empty statement: nothing but `;`, blanks and comments
+    /// (v0.17, `sql`). The pin prepares no statement for it and its
+    /// exec skips it; hipp's runs and does nothing.
+    #[cfg(feature = "sql")]
+    Empty,
     /// `SAVEPOINT name` (v0.16, `sql`).
     #[cfg(feature = "sql")]
     Savepoint {

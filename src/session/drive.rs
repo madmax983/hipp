@@ -542,6 +542,13 @@ impl<S: Storage> Connection<S> {
             },
             e => e,
         })?;
+        // Of an empty statement, a syntax error (v0.17).
+        if matches!(st.ast, crate::sql::Ast::Empty) {
+            return Err(Error::Parse {
+                offset: sql.len(),
+                kind: crate::error::ParseKind::UnexpectedEof,
+            });
+        }
         let prog = match &st.plan {
             Plan::Query(_) | Plan::Scan { .. } => st.vm_program(),
             _ => Program::host(op::HOST_STMT),

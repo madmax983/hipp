@@ -5,6 +5,28 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Evaluator and statement-level parity (wave 17, unit `gaps_eval`)
+
+- Fixes (ungated, every profile with the evaluator): `hex(NULL)` is
+  `''`; `substr` of an empty BLOB is NULL; a FROM-less core never
+  computes its ORDER BY terms (`SELECT 1 ORDER BY
+  abs(-9223372036854775808)` is 1, DISTINCT and nested cores too, an
+  aggregate there is no misuse); LIMIT 0 computes nothing else (its
+  OFFSET, the result columns, WHERE, compound cores, subqueries); the
+  WHERE clause's constant propagation covers the rowid and its
+  INTEGER PRIMARY KEY alias, constants other than literals, one-item
+  IN lists and IN / BETWEEN / LIKE / CASE / COLLATE operands (`WHERE
+  a = 5 AND a < 5 AND <failing constant>` is no row); AND / OR drop a
+  neutral operand as the pin does (`x AND (0 OR 0)` is 0 without
+  computing `x`).
+- Empty statements (`sql`): `;`, `;;`, blanks and comments prepare to
+  a statement that does nothing, a statement may end in several `;`,
+  and the CLI skips empty statements in scripts as the pin's shell
+  does.
+- Sizes: tiny 76,904 (0), full 479,332 (+776), max 965,876 (+680), xl
+  1,062,520 (+656). Tests: `tests/eval_gaps_v17.rs`,
+  `hipp-cli/tests/cli_v17_eval_gaps.rs`.
+
 ### The bytecode VM migration stopped (owner decision, 2026-11-15)
 
 - ADR 0005 Stages 2-4 are not adopted and ADR 0007 is rejected: the

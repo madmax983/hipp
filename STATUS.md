@@ -11,6 +11,141 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: gaps_eval — evaluator and statement-level divergences (2026-11-15)
+
+Wave 17's first parity unit (after the owner's VM stop, ADR 0005 /
+0007): the evaluator / executor divergences the v0.16 and v0.17 units
+recorded as honest gaps, each probed on the live 3.54.1 pin first,
+fixed at the root, and differential-tested against it. Ungated
+fixes on claimed paths (ADR 0001), except empty statements (new
+surface, `sql`).
+
+**Shipped.**
+1. **`hex(NULL)` is `''`** (it was NULL): NULL reads as no bytes, as
+   the pin's `hexFunc` does (`query::scalar_values`).
+2. **`substr` of an empty BLOB is NULL** whatever its other
+   arguments (`substr(x'', 0)`, `substr(x'', 'NULL')`,
+   `substr(zeroblob(0), 1)`; it was `X''`); an empty text stays `''`.
+   The pin's `substrFunc` returns nothing when `sqlite3_value_blob`
+   gives no pointer, which it does for zero bytes; a text's pointer
+   is never NULL. Every other blob function already matched (probed:
+   instr, length, octet_length, unicode, replace, trim, upper / lower,
+   quote, `||`, concat, printf, unhex, LIKE / GLOB over `x''`).
+3. **A FROM-less core never computes its ORDER BY terms** (`SELECT 1
+   ORDER BY abs(-9223372036854775808)` is 1; it failed with
+   IntegerOverflow): its one row satisfies the ORDER BY (the pin's
+   `nOBSat` over no table), so the planner drops the terms after
+   resolving them (`plan_core`; resolution errors stay: `ORDER BY 2`,
+   `ORDER BY nosuch`, `sum(max(1))`). DISTINCT, nested cores (scalar /
+   IN / EXISTS subqueries, FROM subqueries, CTEs) and aggregates there
+   (`SELECT 1 ORDER BY count(*)` is 1 on the pin, an aggregate misuse
+   only where a sorter codes it) follow. GROUP BY, compounds and
+   window queries keep theirs, as on the pin. The VM's `free_order`
+   rule is now moot (the terms are gone before codegen).
+4. **LIMIT 0 computes nothing else** (`SELECT 1 LIMIT 0 OFFSET
+   abs(-9223372036854775808)`, `... OFFSET 'x'`, `SELECT <failing>
+   LIMIT 0`, `SELECT <failing> UNION ALL SELECT 2 LIMIT 0`, a window
+   query's input, a subquery's, a FROM subquery's): the pin's
+   `OP_IfNot` on the limit register jumps past the OFFSET and the
+   whole loop. `limit_window` returns before the OFFSET;
+   `run_query_sub` / `run_query_compound` (`limit_zero`) and
+   `exec_subplan_inner` return no row.
+5. **The WHERE clause's constant propagation is the pin's**
+   (`join_constants_hold`, `propagateConstants`): the rowid and its
+   INTEGER PRIMARY KEY alias are columns (`WHERE a = 5 AND a < 5 AND
+   abs(-9223372036854775808)` is no row; it failed); the fixing
+   constant is any constant of no affinity (`c = 1+4`, `c =
+   abs(-5)`), computed once (a failing one fails again only where a
+   term reads it: `c = abs(-9223372036854775808) AND c < 5` fails
+   over an empty table, as on the pin); a one-item `x IN (c)` (no
+   top-level COLLATE) fixes and is rewritten as the pin's parser's `x
+   = +c`; the rewrite reaches IN, BETWEEN, LIKE, CASE, COLLATE and
+   unary-plus operands (it stopped at them). UPDATE / DELETE still
+   do not propagate (the pin's `propagateConstants` is
+   SELECT-only: `DELETE ... WHERE a = 5 AND a < 5 AND <failing>`
+   fails on both).
+6. **AND / OR simplify as `sqlite3ExprSimplifiedAndOr`** (`query::
+   int_lit`): an operand neutral to its operator (true for AND, false
+   for OR) leaves the other, so `x AND (0 OR 0)` is 0 and `x OR (1 AND
+   1)` is 1 without computing `x` (they failed).
+7. **Empty statements** (`sql`): `;`, `;;`, blanks and comments
+   prepare to a statement that does nothing (`Ast::Empty`, planned as
+   `Maint::Nothing`: no columns, no transaction, counters untouched),
+   and a statement may end in several `;`. The CLI's scripts (one-shot
+   and stdin) skip them as the pin's do (`SELECT 1;;SELECT 2;` prints
+   1 and 2; it printed 1 and failed). `EXPLAIN QUERY PLAN ;` (and the
+   `vm` build's plain `EXPLAIN ;`) stays a syntax error.
+
+**Oracle-probing notes** (live pin, `EXPLAIN` listings where the rule
+was not plain): `hex(NULL)` '' (text); `substr(x'01', 2)` `X''` but
+`substr(x'', 1)` NULL; `SELECT 1 ORDER BY abs(..)`, its DISTINCT,
+scalar, IN, EXISTS, FROM-subquery and CTE forms all 1, `SELECT 1
+GROUP BY 1 ORDER BY abs(..)` and `SELECT a FROM t ORDER BY abs(..)`
+fail, `SELECT 1 UNION ALL SELECT 2 ORDER BY abs(..)` fails at prepare;
+`LIMIT 0` codes `Goto` to the end before anything (`LIMIT (SELECT 0)`
+an `IfNot`), even before a compound's co-routines, so neither OFFSET
+nor any core runs; `LIMIT -1 OFFSET abs(..)` and `LIMIT 1 OFFSET 'x'`
+fail. Constant propagation: `a = 5 AND a < 5 AND abs(..)` (rowid) no
+row, `a = 5 AND a = 6`, `a = 5 AND a > 5` likewise, `a > 5 AND a < 5
+AND abs(..)` fails (no equality fixes `a`), `abs(..) AND a = 5 AND a <
+5` fails (written order); `c = (SELECT 5)`, `c = CAST(5 AS INT)`, `c =
+random()` and `c = 5 COLLATE NOCASE` fix nothing; `x IN (c)` lists
+`Eq` with the left operand's affinity (`t IN (CAST(1 AS INTEGER))` is
+TEXT `'1.0' = '1'`, 0), except `x IN ('a' COLLATE NOCASE)`, which
+stays an IN; `x AND (1 OR 0)` codes `And x, x`, `x AND (0 OR 0)` codes
+`Integer 0`. Empty statements: `;`, `;;`, `-- c` succeed silently;
+`EXPLAIN QUERY PLAN ;` and `EXPLAIN ;` are syntax errors.
+
+**Tests.** `tests/eval_gaps_v17.rs` (10 tests): hex / substr over
+literals and columns of every affinity; 100 FROM-less ORDER BY /
+LIMIT / OFFSET shapes (top level, nested, DISTINCT, aggregate,
+compound, window, recursive CTE); 75 constant-propagation shapes over
+the rowid, its alias and every affinity (and the write side, which
+does not propagate); one-item IN lists; 33 AND / OR simplification
+shapes; generated corpora (xorshift): 140 WHERE conjunctions, 160
+ORDER BY / LIMIT queries, 80 hex / substr calls; empty statements
+through the library (no columns, counters and transaction kept) and
+the pin's one-shot CLI. With `vm` each query also runs on the VM and
+on today's executor. `hipp-cli/tests/cli_v17_eval_gaps.rs` (5 tests):
+the same fixes byte-for-byte on stdin and one-shot scripts, empty
+statements included, exit status and error presence compared.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (its `--features vm` workspace suite included);
+`tests/depth_v16.rs` and `tests/triggers_v16.rs` with debug info:
+pass (no `STACK_*` change).
+
+**Size Δ.** tiny 0 (76,904); full +776 (478,556 → 479,332); max +680
+(965,196 → 965,876); xl +656 (1,061,864 → 1,062,520). Ratchets raised
+to the measured figures (`ci/size-ratchet.toml`): the propagation's
+wider rewrite and constant evaluation, LIMIT 0's early returns, the
+FROM-less ORDER BY drop and the empty statement (`sql`) are the
+growth; no offsetting saving was found (the planner's own propagation
+in `session/join.rs` is `planner`-only, so sharing it would save in
+`xl` alone and change join planning).
+
+**Honest gaps.**
+- Over a table, an ORDER BY led by the rowid (or a unique index the
+  loop reads) is the pin's scan order, so its later terms go
+  uncomputed there (`SELECT a FROM t ORDER BY a, abs(..)` answers on
+  the pin, fails in hipp): a planner rule (`isOrderDistinct`) left
+  for a planner unit.
+- The pin's constant propagation also descends into subqueries (a
+  correlated subquery over fixed outer columns becomes a constant
+  term); hipp's stops at them. It is still not transitive, and a
+  LEFT JOIN's ON terms aside, inner-join ON terms fix columns in hipp
+  where the pin's `mExcludeOn` keeps them out (pre-existing; no probe
+  found a visible difference).
+- `SELECT 1 COLLATE bogus` is still refused at prepare where the pin
+  runs it (it looks a collation up only where a comparison or sort
+  uses it).
+- `INDEXED BY` an index of another table is still accepted (a
+  planner item, left for `gaps_plan_cli`).
+- The tiny profile still refuses an empty statement (its parser is
+  tiny's claimed path and may not grow; the surface is `sql`).
+- `hipp-cli` reads an argument starting with `-` as SQL; the pin's
+  shell takes it as an option (`-- only` is "unknown option").
+
 ### A smaller VM: slim_design (2026-11-12)
 
 Wave 16's first unit (owner decision 2026-11-12, after `s3_probe`
@@ -211,7 +346,8 @@ passed.
   `;` line) is refused with `Parse { kind: UnsupportedStatement }`
   (CLI exits 1 after printing `1`); the pin skips it and prints `1`,
   `2`. Left for a parity unit: the parser is on tiny's path and this
-  unit may not grow any profile.
+  unit may not grow any profile. (Closed in v0.17: `gaps_eval`, on
+  `sql`.)
 
 ### ADR 0005 Stage 3: sync_readers — not built (verdict stop); review fix: table-valued functions beside TEMP tables (2026-11-11)
 
@@ -609,13 +745,15 @@ c2914be, and four pin divergences shared by every hipp build, VM and
 today's executor alike, reproduced here and tracked for a parity
 unit (fixing them changes shipped profiles, which a size unit may
 not grow):
-- `hex(NULL)` is NULL; the pin returns `''`.
+- `hex(NULL)` is NULL; the pin returns `''` (closed in v0.17: `gaps_eval`).
 - `substr` of an empty blob (`substr(x'', 0)`, `substr(x'', 'NULL')`)
-  is `X''`; the pin returns NULL (`substr('', 'a')` is `''` on both).
+  is `X''`; the pin returns NULL (`substr('', 'a')` is `''` on both)
+  (closed in v0.17: `gaps_eval`).
 - Contradictory rowid constraints next to an overflowing constant
   term (`WHERE a = 5 AND a < 5 AND abs(-9223372036854775808)`, `a`
   the rowid): the pin returns no rows without evaluating the
-  constant; hipp fails with `IntegerOverflow`.
+  constant; hipp fails with `IntegerOverflow` (closed in v0.17:
+  `gaps_eval`, constant propagation over the rowid).
 - `INDEXED BY` an index of another table is accepted; the pin fails
   with "no such index".
 
@@ -1076,7 +1214,7 @@ or a `cfg(vm)` shape; no ratchet moved.
   it included) and still fails, as today's executor, for a DISTINCT
   core and a nested query's own ORDER BY (`SELECT DISTINCT 1 ORDER BY
   ...`, `SELECT (SELECT 1 ORDER BY ...)`, `SELECT * FROM (SELECT 1
-  ORDER BY ...)`).
+  ORDER BY ...)`). (Closed in v0.17: `gaps_eval`, both executors.)
 - The probe's figures depend on LTO's inlining: single changes of a
   few hundred bytes moved profiles in opposite directions (the
   "tried and dropped" list); the table is the measured sequence.
@@ -6517,7 +6655,9 @@ and the function-name table.
   operand has a subquery, which can differ when the same side
   also raises an error of its own. The pin also folds `X AND 0`
   to 0 at prepare (`abs(-9223372036854775808) AND 0` is 0 there;
-  hipp raises), an expression-folding gap outside this unit.
+  hipp raises), an expression-folding gap outside this unit. (Closed
+  since; the nested form `x AND (0 OR 0)` closed in v0.17:
+  `gaps_eval`.)
 - OR ABORT inside an explicit transaction still rolls back the
   whole transaction (the documented v0.5 simplification); OR
   FAIL and OR ROLLBACK match the pin there. ~~Column-level conflict
@@ -9861,7 +10001,8 @@ lateral dead-slot planning and the compound-subtype rule.
   rows: ~1.6 KB each with the join's copy), where the pin streams.
 - Constant propagation is not transitive (`t.a = u.a AND u.a = 2 AND
   (t.a = 3 OR json('[') IS NULL)` fails on the pin, not in hipp),
-  binds only literal values, and is skipped when a RIGHT / FULL join
+  binds only literal values (closed in v0.17: `gaps_eval` binds any
+  constant of no affinity, the rowid and one-item IN), and is skipped when a RIGHT / FULL join
   is present; an uncorrelated EXISTS term is not computed up front;
   a correlated subquery's outer-column terms are not constants.
 - A compound scalar subquery with an arm that may return plain text
