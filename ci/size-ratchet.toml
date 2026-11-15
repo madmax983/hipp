@@ -60,8 +60,8 @@ justify_over = 4096
 # local index cells inline (-8.4..9.0% instructions on bolt_workload):
 # +104 B.
 # 478,268 -> 478,556 (Bolt): index_search_raw compares local binary-search
-# probes in place (-4.9..5.7% instructions, -15.9% allocations on
-# bolt_workload): +288 B.
+# probes in place, UTF-8 databases only (-4.7..5.5% instructions,
+# -15.9% allocations on bolt_workload): +288 B.
 ratchet = 478556
 budget = 524288
 statics_budget = 8192
@@ -107,10 +107,10 @@ justify_over = 16384
 # 964,644 -> 964,732 (Bolt): index_search_raw lays out 1-byte-header
 # local index cells inline (-8.4..9.0% instructions on bolt_workload):
 # +88 B.
-# 964,732 -> 965,180 (Bolt): index_search_raw compares local binary-search
-# probes in place (-4.9..5.7% instructions, -15.9% allocations on
-# bolt_workload): +448 B.
-ratchet = 965180
+# 964,732 -> 965,196 (Bolt): index_search_raw compares local binary-search
+# probes in place, UTF-8 databases only (-4.7..5.5% instructions,
+# -15.9% allocations on bolt_workload): +464 B.
+ratchet = 965196
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -149,10 +149,10 @@ justify_over = 32768
 # 1,061,304 -> 1,061,392 (Bolt): index_search_raw lays out 1-byte-header
 # local index cells inline (-8.4..9.0% instructions on bolt_workload):
 # +88 B.
-# 1,061,392 -> 1,061,840 (Bolt): index_search_raw compares local binary-search
-# probes in place (-4.9..5.7% instructions, -15.9% allocations on
-# bolt_workload): +448 B.
-ratchet = 1061840
+# 1,061,392 -> 1,061,864 (Bolt): index_search_raw compares local binary-search
+# probes in place, UTF-8 databases only (-4.7..5.5% instructions,
+# -15.9% allocations on bolt_workload): +472 B.
+ratchet = 1061864
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

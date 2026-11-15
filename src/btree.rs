@@ -3844,13 +3844,19 @@ async fn index_search_raw<S: Storage>(
     let (mut lo, mut hi) = (0usize, n);
     // A visited cell whose payload is all on the page is compared
     // in place (its fields borrowed from `bytes`); one that spills
-    // to overflow pages is reassembled and decoded as before.
+    // to overflow pages is reassembled and decoded as before, and so
+    // is every cell of a UTF-16 database (`assemble_payload` hands
+    // its records over transcoded to UTF-8).
+    #[cfg(feature = "utf16")]
+    let in_place = crate::utf16::byte_order(pager.text_enc()).is_none();
+    #[cfg(not(feature = "utf16"))]
+    let in_place = true;
     let mut vals: AVec<Value<'_>> = AVec::new();
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let ptr = cell_ptr::<S::Error>(bytes, h, mid, page)?;
         let l = index_cell_layout::<S::Error>(bytes, ptr, usable, page, interior)?;
-        let ord = if l.local_len == l.payload_len {
+        let ord = if in_place && l.local_len == l.payload_len {
             let at = ptr + l.payload_off;
             let local = bytes
                 .get(at..at + l.local_len)
