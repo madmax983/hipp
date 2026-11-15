@@ -9,6 +9,12 @@
 //! `.import`/`.export`, no format/flag parity beyond diffable
 //! basics.
 //!
+//! The command line is the pin shell's (v0.17): `[OPTIONS]
+//! [FILENAME [SQL...]]`, the database `:memory:` when none is
+//! named and opened only when the input first needs it; of the
+//! options hipp takes `-help`, `-version` (each also as `--x`) and
+//! `--` / `-`, which end them, and it refuses the pin's others.
+//!
 //! Bound parameters (v0.16) work as in the oracle shell: every
 //! parameter of a statement is bound from the `.parameter set`
 //! table by its name (a nameless `?` by `?N`), NULL when the
@@ -429,8 +435,13 @@ fn fmt_real(f: f64) -> String {
     String::from_utf8_lossy(t.as_slice()).into_owned()
 }
 
-/// `.dump`'s literal: `fmt_literal`, but a blob as the pin shell's
-/// `x'hex'` (v0.16 review fix: hipp wrote `X'HEX'`).
+/// `.dump`'s literal, as the pin shell's insert mode writes it: a
+/// blob as `x'hex'` (v0.16 review fix: hipp wrote `X'HEX'`); a real
+/// as `%.16g` (`1`, `1e+300`, `3e-05`), an infinity as `9e+999`; a
+/// text up to its first NUL, quoted with `''` doubling, and as
+/// `unistr('...')` — each control character `\uXXXX`, each `\`
+/// doubled — when it holds one (v0.17 fix: hipp wrote `1.0`, `1e300`,
+/// raw newlines).
 fn dump_literal(v: Value<'_>) -> Vec<u8> {
     match v {
         Value::Blob(b) => {
@@ -441,9 +452,221 @@ fn dump_literal(v: Value<'_>) -> Vec<u8> {
             out.push(b'\'');
             out
         }
+        Value::Real(f) if f.is_infinite() => {
+            if f > 0.0 {
+                b"9e+999".to_vec()
+            } else {
+                b"-9e+999".to_vec()
+            }
+        }
+        Value::Real(f) => {
+            let mut fmt = hipp::arena::AVec::new();
+            fmt.extend_from_slice(b"%.16g");
+            match hipp::func::printf::<()>(&[OwnedValue::Text(fmt), OwnedValue::Real(f)]) {
+                Ok(OwnedValue::Text(t)) => t.as_slice().to_vec(),
+                _ => fmt_real(f).into_bytes(),
+            }
+        }
+        Value::Text(b) => {
+            let b = &b[..b.iter().position(|c| *c == 0).unwrap_or(b.len())];
+            let esc = b.iter().any(|c| *c < 0x20);
+            let mut out: Vec<u8> = if esc {
+                b"unistr('".to_vec()
+            } else {
+                b"'".to_vec()
+            };
+            for &c in b {
+                match c {
+                    b'\'' => out.extend_from_slice(b"''"),
+                    b'\\' if esc => out.extend_from_slice(b"\\\\"),
+                    c if c < 0x20 => out.extend_from_slice(format!("\\u{c:04x}").as_bytes()),
+                    c => out.push(c),
+                }
+            }
+            out.extend_from_slice(if esc { b"')" } else { b"'" });
+            out
+        }
         v => fmt_literal(v),
     }
 }
+
+/// A name as the pin shell's `.dump` writes it after `INSERT INTO`
+/// (its `quoteChar`): in `"..."` unless it is a letter or `_` then
+/// letters, digits and `_`, and no keyword (v0.17 fix: hipp wrote
+/// every name bare, and could not read a table back whose name needs
+/// quoting).
+fn dump_name(n: &[u8]) -> Vec<u8> {
+    let plain = n
+        .first()
+        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+        && n.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        && !KEYWORDS
+            .iter()
+            .any(|k| k.as_bytes().eq_ignore_ascii_case(n));
+    if plain {
+        return n.to_vec();
+    }
+    let mut out = vec![b'"'];
+    for &c in n {
+        if c == b'"' {
+            out.push(b'"');
+        }
+        out.push(c);
+    }
+    out.push(b'"');
+    out
+}
+
+/// The pin's keywords (`sqlite3_keyword_check`).
+const KEYWORDS: &[&str] = &[
+    "ABORT",
+    "ACTION",
+    "ADD",
+    "AFTER",
+    "ALL",
+    "ALTER",
+    "ALWAYS",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "ATTACH",
+    "AUTOINCREMENT",
+    "BEFORE",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "CONFLICT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CURRENT",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DATABASE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DELETE",
+    "DESC",
+    "DETACH",
+    "DISTINCT",
+    "DO",
+    "DROP",
+    "EACH",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCEPT",
+    "EXCLUDE",
+    "EXCLUSIVE",
+    "EXISTS",
+    "EXPLAIN",
+    "FAIL",
+    "FILTER",
+    "FIRST",
+    "FOLLOWING",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GENERATED",
+    "GLOB",
+    "GROUP",
+    "GROUPS",
+    "HAVING",
+    "IF",
+    "IGNORE",
+    "IMMEDIATE",
+    "IN",
+    "INDEX",
+    "INDEXED",
+    "INITIALLY",
+    "INNER",
+    "INSERT",
+    "INSTEAD",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "KEY",
+    "LAST",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "MATERIALIZED",
+    "NATURAL",
+    "NO",
+    "NOT",
+    "NOTHING",
+    "NOTNULL",
+    "NULL",
+    "NULLS",
+    "OF",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER",
+    "OTHERS",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PLAN",
+    "PRAGMA",
+    "PRECEDING",
+    "PRIMARY",
+    "QUERY",
+    "RAISE",
+    "RANGE",
+    "RECURSIVE",
+    "REFERENCES",
+    "REGEXP",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPLACE",
+    "RESTRICT",
+    "RETURNING",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "TABLE",
+    "TEMP",
+    "TEMPORARY",
+    "THEN",
+    "TIES",
+    "TO",
+    "TRANSACTION",
+    "TRIGGER",
+    "UNBOUNDED",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VACUUM",
+    "VALUES",
+    "VIEW",
+    "VIRTUAL",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+    "WITHOUT",
+];
 
 /// SQL literal rendering for `.dump`: text quoted with `''`
 /// doubling, blobs as `X'HEX'`, reals round-trip exact.
@@ -1004,13 +1227,13 @@ where
             // precede: replaying it, the shell turns defensive mode
             // off (v0.16 review fix: without it the pin refused the
             // replay).
+            // (v0.17 fix: the PRAGMA line is always there.)
             if !vtabs.is_empty() {
                 let _ = out.write_all(
-                    b"/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */\n\
-                      PRAGMA foreign_keys=OFF;\n",
+                    b"/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */\n",
                 );
             }
-            let _ = out.write_all(b"BEGIN TRANSACTION;\n");
+            let _ = out.write_all(b"PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
             let mut writable = false;
             let ordered = tables
                 .iter()
@@ -1050,23 +1273,38 @@ where
                     );
                     vt_done += 1;
                 }
-                if sql.starts_with(b"CREATE TABLE \"") || sql.starts_with(b"CREATE TABLE '") {
+                if is_seq(name) {
+                    // (v0.17 fix: the pin re-creates it first.)
+                    if !writable {
+                        let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+                        writable = true;
+                    }
+                    let _ = out.write_all(
+                        b"CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);\n\
+                          DELETE FROM sqlite_sequence;\n",
+                    );
+                } else if name.starts_with(b"sqlite_stat") && name.len() == 12 {
+                    // (v0.17 fix: ANALYZE's tables replay their rows.)
+                    let _ = out.write_all(b"ANALYZE sqlite_schema;\n");
+                } else if name.starts_with(b"sqlite_") {
+                    continue;
+                } else if sql.starts_with(b"CREATE TABLE \"") || sql.starts_with(b"CREATE TABLE '")
+                {
                     let _ = out.write_all(b"CREATE TABLE IF NOT EXISTS ");
                     let _ = out.write_all(&sql[13..]);
                     let _ = out.write_all(b";\n");
-                } else if is_seq(name) {
-                    let _ = out.write_all(b"DELETE FROM sqlite_sequence;\n");
                 } else {
                     let _ = out.write_all(sql);
                     let _ = out.write_all(b";\n");
                 }
-                let name = String::from_utf8_lossy(name);
+                let quoted = format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
                 let mut st = db
-                    .prepare(&format!("SELECT {list} FROM {name}"))
+                    .prepare(&format!("SELECT {list} FROM {quoted}"))
                     .await
                     .map_err(|e| format!("{e:?}"))?;
+                let head = [b"INSERT INTO ".as_slice(), &dump_name(name), b" VALUES("].concat();
                 while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
-                    let mut line = format!("INSERT INTO {name} VALUES(").into_bytes();
+                    let mut line = head.clone();
                     for i in 0..st.column_count() {
                         if i > 0 {
                             line.extend_from_slice(b",");
@@ -1135,6 +1373,45 @@ where
     }
 }
 
+/// Whether `sql` holds nothing but blanks and comments (the pin
+/// shell's `_all_whitespace`: such input is skipped, `;` is not).
+fn no_sql(sql: &str) -> bool {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.find('\n').map_or("", |i| &r[i..]);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.find("*/").map_or("", |i| &r[i + 2..]);
+        } else {
+            return rest.is_empty();
+        }
+    }
+}
+
+/// `dispatch`, opening the database `path` first if no input has
+/// needed it yet (v0.17: as the pin's shell, which opens it on the
+/// first statement or command, so an empty script, `-help` or
+/// `-version` makes no file).
+async fn dispatch_lazy(
+    db: &mut Option<Db>,
+    path: &str,
+    input: &str,
+    params: &mut Params,
+    out: &mut impl Write,
+) -> Result<Flow, String> {
+    let db = match db {
+        Some(d) => d,
+        // (Blank and comment-only input needs no database.)
+        None if no_sql(input) => return Ok(Flow::Continue),
+        // (A first `.open` replaces the database before anything
+        // reads it.)
+        None if input.split_whitespace().next() == Some(".open") => db.insert(open_db(":memory:")?),
+        None => db.insert(open_db(path)?),
+    };
+    dispatch(db, input, params, out).await
+}
+
 /// Execute one input unit (statement or dot-command) against the
 /// current database, handling `.open` by swapping `db`.
 async fn dispatch(
@@ -1182,10 +1459,123 @@ async fn dispatch(
     }
 }
 
-fn usage() -> ExitCode {
-    eprintln!("usage: hipp <database|:memory:> [sql]");
-    eprintln!("       hipp <database|:memory:>            (interactive / stdin batch)");
-    ExitCode::from(2)
+/// `-help` (v0.17): the pin shell's usage text, to stderr, listing
+/// the options hipp takes.
+fn usage(argv0: &str) {
+    eprintln!("Usage: {argv0} [OPTIONS] [FILENAME [SQL...]]");
+    eprintln!("FILENAME is the name of an SQLite database. A new database is created");
+    eprintln!("if the file does not previously exist. Defaults to :memory:.");
+    eprintln!("OPTIONS include:");
+    eprintln!("   --                   treat no subsequent arguments as options");
+    eprintln!("   -help                show this message");
+    eprintln!("   -version             show SQLite version");
+}
+
+/// The pin shell's other options (its `-help` list and the ones it
+/// takes unlisted): hipp takes none of them, and says so rather than
+/// reading one as a file name.
+const PIN_OPTIONS: &[&str] = &[
+    "-A",
+    "-append",
+    "-ascii",
+    "-bail",
+    "-batch",
+    "-box",
+    "-cmd",
+    "-cmdline-edit",
+    "-column",
+    "-csv",
+    "-deserialize",
+    "-echo",
+    "-escape",
+    "-header",
+    "-heap",
+    "-html",
+    "-ifexists",
+    "-init",
+    "-interactive",
+    "-json",
+    "-line",
+    "-list",
+    "-lookaside",
+    "-markdown",
+    "-maxsize",
+    "-memtrace",
+    "-mmap",
+    "-multiplex",
+    "-newline",
+    "-no-rowid-in-view",
+    "-nofollow",
+    "-noheader",
+    "-noinit",
+    "-nonce",
+    "-nullvalue",
+    "-pagecache",
+    "-pcachetrace",
+    "-quote",
+    "-readonly",
+    "-safe",
+    "-screenwidth",
+    "-separator",
+    "-sorterref",
+    "-stats",
+    "-table",
+    "-tabs",
+    "-unsafe-testing",
+    "-utf8",
+    "-vfs",
+    "-vfstrace",
+    "-zip",
+];
+
+/// The command line as the pin's shell reads it (v0.17): options
+/// (`-x`, or `--x`) anywhere before `-` / `--`, which ends them; the
+/// first other argument is the database (`:memory:` when there is
+/// none), the rest SQL texts run in order. `Err`: the exit status
+/// `-help`, `-version` or a bad option ends with, having printed
+/// what the pin prints (no database is opened, so no file made).
+fn parse_args(
+    argv0: &str,
+    args: impl Iterator<Item = String>,
+) -> Result<(String, Vec<String>), ExitCode> {
+    let mut file: Option<String> = None;
+    let mut cmds: Vec<String> = Vec::new();
+    let mut opts = true;
+    for a in args {
+        if !opts || !a.starts_with('-') {
+            match file {
+                None => file = Some(a),
+                Some(_) => cmds.push(a),
+            }
+            continue;
+        }
+        let z = if a.starts_with("--") {
+            &a[1..]
+        } else {
+            a.as_str()
+        };
+        match z {
+            "-" => opts = false,
+            "-help" => {
+                usage(argv0);
+                return Err(ExitCode::SUCCESS);
+            }
+            "-version" => {
+                println!("3.54.1 (hipp {})", env!("CARGO_PKG_VERSION"));
+                return Err(ExitCode::SUCCESS);
+            }
+            _ if PIN_OPTIONS.contains(&z) => {
+                eprintln!("{argv0}: Error: option not supported by hipp: {z}");
+                return Err(ExitCode::FAILURE);
+            }
+            _ => {
+                eprintln!("{argv0}: Error: unknown option: {z}");
+                eprintln!("Use -help for a list of options.");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+    Ok((file.unwrap_or_else(|| String::from(":memory:")), cmds))
 }
 
 fn main() -> ExitCode {
@@ -1201,38 +1591,46 @@ fn main() -> ExitCode {
 }
 
 fn run() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args.len() > 2 {
-        return usage();
-    }
-    let mut db = match open_db(&args[0]) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return ExitCode::FAILURE;
-        }
+    let mut argv = std::env::args();
+    let argv0 = argv.next().unwrap_or_else(|| String::from("hipp"));
+    let (file, cmds) = match parse_args(&argv0, argv) {
+        Ok(x) => x,
+        Err(code) => return code,
     };
-    let code = session(&mut db, &args);
+    let mut db = None;
+    let code = session(&mut db, &file, &cmds);
     // The oracle shell closes the database however the session
     // ended (v0.16: a WAL-mode log is checkpointed and removed).
-    if let Err(e) = close_db(db) {
+    if let Some(db) = db
+        && let Err(e) = close_db(db)
+    {
         eprintln!("Error: {e}");
         return ExitCode::FAILURE;
     }
     code
 }
 
-/// Run the one-shot SQL argument, or the interactive / stdin
+/// Run the one-shot SQL arguments, or the interactive / stdin
 /// session, against `db`.
-fn session(db: &mut Db, args: &[String]) -> ExitCode {
+fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut params = Params::new();
 
-    // One-shot mode: run the SQL argument (possibly several
-    // statements), stop at the first error.
-    if let Some(sql) = args.get(1) {
-        for stmt in split_statements(sql) {
-            match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
+    // One-shot mode: run the SQL arguments (each possibly several
+    // statements) in order, stop at the first error. (The pin opens
+    // the database for any argument, blank ones too.)
+    if !cmds.is_empty() {
+        if db.is_none() {
+            match open_db(path) {
+                Ok(d) => *db = Some(d),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        for stmt in cmds.iter().flat_map(|sql| split_statements(sql)) {
+            match block_on(dispatch_lazy(db, path, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return ExitCode::SUCCESS,
                 Err(e) => {
@@ -1281,7 +1679,7 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
         // does, and a schema text can hold them).
         let line = line.as_str();
         if buffer.is_empty() && line.trim_start().starts_with('.') {
-            match block_on(dispatch(db, line.trim(), &mut params, &mut out)) {
+            match block_on(dispatch_lazy(db, path, line.trim(), &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return status(failed),
                 Err(e) => {
@@ -1298,7 +1696,7 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
         if buffer.trim_end().ends_with(';') && split_script(&buffer).1 {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
-                match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
+                match block_on(dispatch_lazy(db, path, &stmt, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return status(failed),
                     Err(e) => {
@@ -1316,7 +1714,7 @@ fn session(db: &mut Db, args: &[String]) -> ExitCode {
     // A trailing unterminated statement still runs at EOF.
     if !buffer.trim().is_empty() {
         for stmt in split_statements(&buffer) {
-            match block_on(dispatch(db, &stmt, &mut params, &mut out)) {
+            match block_on(dispatch_lazy(db, path, &stmt, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return status(failed),
                 Err(e) => {

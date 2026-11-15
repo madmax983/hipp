@@ -1177,6 +1177,10 @@ pub fn item_affinity(e: &RExpr) -> Affinity {
 #[cfg(feature = "sql")]
 pub fn item_datatype(e: &RExpr) -> u8 {
     match e {
+        // (`TK_COLLATE` and `TK_UPLUS` read their operand: v0.17 fix,
+        // `SELECT real_c ... UNION ALL SELECT text_c COLLATE NOCASE`
+        // is untyped on the pin, so its text rows stay text.)
+        RExpr::Collate(x, _) | RExpr::Pos(x) => item_datatype(x),
         RExpr::Literal(OwnedValue::Null) => 0x00,
         RExpr::Literal(OwnedValue::Text(_)) => 0x02,
         RExpr::Literal(OwnedValue::Blob(_)) => 0x04,

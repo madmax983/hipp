@@ -11,6 +11,204 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: gaps_plan_cli — planner and CLI divergences (2026-11-15)
+
+Wave 17's second parity unit: the planner and hipp-cli divergences
+the v0.16 / v0.17 units recorded, each probed on the live 3.54.1 pin
+first (notes below), fixed at the root, searched for elsewhere and
+differential-tested. Every library change is an ungated fix on a
+claimed path (ADR 0001); no new leaf.
+
+**Shipped.**
+1. **INDEXED BY resolves on the source's own table everywhere.** A
+   plain single-table scan (`SELECT a FROM t INDEXED BY nx`, `SELECT
+   *`, `WHERE col = literal`) took the pre-v0.4 scan path, which never
+   looked the name up: an index of another table, of a TEMP or
+   attached table, an automatic index's name or none at all was
+   accepted when `t` had no index (`select_is_simple`). Every other
+   resolution (joins, subqueries, views, CTEs, UPDATE / DELETE targets
+   and FROM, trigger bodies, TEMP, attached) already matched.
+2. **WHERE / inner-join ON terms are simplified as the pin's
+   `whereClauseInsert` does** (`xplan::and_or_simplified`, the pin's
+   `sqlite3ExprSimplifiedAndOr` with `ExprAlwaysTrue`: a plain integer
+   literal, `true` / `false`, hex; not `-1`, `+1`, `1.0`, `1 COLLATE c`,
+   `likely(1)`): `b.a > 0 OR 1` constrains nothing, so the join keeps
+   the FROM order (it put `b` outermost), and `x OR 0` / `x OR (0 AND
+   y)` is `x`, which an index serves (`SEARCH ... (y=?)`; it scanned).
+   A term that simplifies to an AND stays one term; a LEFT JOIN's ON
+   clause keeps its literals (`EP_OuterON`). Lone tables and joins
+   alike (`xplan::conjuncts`).
+3. **WHERE push-down into compound FROM subqueries** (`planner`,
+   `push_down`): arms of different affinities take the term, each
+   comparing with its own affinity (the v0.16 gap: `(SELECT real_c x
+   ... UNION ALL SELECT 1) WHERE x = '1'` is one row, as on the pin);
+   UNION / INTERSECT / EXCEPT arms take it too when no arm's column has
+   a non-BINARY collation (the pin's restriction 8); a term the pin's
+   constant propagation rewrites is not pushed (`query::prop_rewrites`,
+   sharing `findConstInWhere`'s code with `join_constants_hold`: its
+   fixed column is a constant in every arm, `EP_FixedCol`, so it
+   filters an arm wholly or not at all, as the term in the reader
+   does; pushing the arm's expression lost rows: `x == 3 AND x >= '2'`
+   compared an untyped `+i` with `'2'` as text); the pushed copy wraps
+   an arm's expression in the leftmost arm's collation where the pin's
+   `substExpr` does (an expression, or a different collation: `x IS
+   NOT NULL` under an `i+0` arm is no index range).
+4. **Compound column types read through COLLATE and unary plus**
+   (`rules::item_datatype`, the pin's `sqlite3ExprDataType`): `SELECT
+   real_c ... UNION ALL SELECT text_c COLLATE NOCASE` is untyped on the
+   pin, so its text rows stay text (they read as reals). Ungated
+   (`sql`).
+5. **A merged compound member is planned for the merge key's
+   collation** (`MergeSpec`'s third part, the pin's
+   `multiSelectCollSeq`: the leftmost core whose item has one), not
+   its own: a silent wrong answer — `SELECT x COLLATE NOCASE FROM t
+   UNION SELECT x FROM t WHERE k > 2` read the right member through a
+   BINARY index, so UNION kept `C` where the pin keeps `c`; and `x
+   UNION x COLLATE NOCASE` sorted a member the index serves. A member
+   with no collation of its own and none to its left keeps its own
+   (later cores are not planned yet; an expression index would be
+   needed to tell).
+6. **Lone-table planning details**: `x IS [NOT] NULL` on a never-NULL
+   column (the rowid, its alias, NOT NULL, a WITHOUT ROWID key) is the
+   constant 0 / 1 in a lone table's and a write's planning too, as the
+   pin's resolver makes it (`never_null_terms`; `k IS NULL ORDER BY k`
+   read a covering index, its ORDER BY taken as satisfied); an ORDER BY
+   term a WHERE equality holds constant must be a column or the rowid
+   (`order_sat`, the pin's `TK_COLUMN` test: `upper(x) = 'A' ORDER BY
+   upper(x)` sorts); `x IS NOT NULL` is a range term only on a bare
+   column (`x COLLATE NOCASE IS NOT NULL` scans); EXPLAIN QUERY PLAN
+   shows no sort for a merged aggregate member without GROUP BY.
+7. **hipp-cli's command line is the pin shell's**: `[OPTIONS]
+   [FILENAME [SQL...]]`; `-help` / `--help` print the usage to stderr
+   (exit 0), `-version` / `--version` print `3.54.1 (hipp 0.16.0)`
+   (exit 0), an unknown option (`-foo`, `--foo`, `---version`, `-HELP`,
+   `-- c`) is the pin's `NAME: Error: unknown option: -foo` / `Use -help
+   for a list of options.` (exit 1), the pin's other options are
+   refused by name (`option not supported by hipp`), `--` and `-` end
+   the options; options are read before anything runs and anywhere on
+   the line; every argument after the database is an SQL text, run in
+   order (a third argument was a usage error); no database is
+   `:memory:` (it was a usage error). The database is opened only when
+   input first needs it: `-help`, `-version`, an empty or comment-only
+   script make no file (`--help` made a file named `--help`), a blank
+   one-shot argument or `;` does, as on the pin, and a first `.open`
+   replaces the named database before it is made.
+8. **hipp-cli `.dump` is the pin's byte for byte**: `PRAGMA
+   foreign_keys=OFF;` before BEGIN always (only with virtual tables
+   before); reals as the pin's insert mode (`%.16g`: `1`, `1e+300`, `0`
+   for `-0.0`, `3e-05`, `1.797693134862316e+308`; infinities
+   `9e+999`); text up to its first NUL, `unistr('...')` with `\uXXXX`
+   for control characters and `\\` for backslashes when it holds one
+   (raw newlines and tabs before); table names quoted as the pin's
+   `quoteChar` (keywords, blanks, a leading digit; hipp could not read
+   such a table back and failed mid-dump); `sqlite_sequence` re-created
+   under `PRAGMA writable_schema=ON` before its DELETE / INSERTs;
+   `sqlite_stat1` as `ANALYZE sqlite_schema;` and its rows; other
+   `sqlite_` tables skipped.
+
+**Oracle-probing notes** (live pin, one-shot and stdin; EQP trees):
+INDEXED BY of another table's index, of a TEMP / attached index, of
+`sqlite_autoindex_*` or of nothing is "no such index" in every
+statement shape; `generate_series(..) INDEXED BY` is a syntax error;
+in a trigger body "the INDEXED BY clause is not allowed". `ON b.a > 0
+OR 1`, `1 OR b.a>0`, `OR 2`, `OR 0x1`, `OR true`, `OR (1)`, `OR (1 AND
+1)`, `OR (b.y AND 0) OR 1` keep FROM order; `OR -1`, `OR +1`, `OR 1.0`,
+`OR 'x'`, `OR (1+1)`, `OR 1 COLLATE nocase`, `OR likely(1)`, `(... OR 1)
+= 1`, `NOT (... OR 1)` put `b` first; `WHERE b.y = 5 OR 0` searches
+`by`, `(b.y = 5 AND b.a > 0) OR 0` scans (one term), `(b.y = 5 OR 0) OR
+b.a = 7` scans (no simplification at that level), `+0` / `-0` scan; a
+LEFT JOIN's `ON b.y = a.x OR 0` scans. Push-down: `(SELECT r ... UNION
+ALL SELECT 1) WHERE x = '1'` gives `1.0` once; `i <> 1` over (INTEGER,
+TEXT) arms gives `2`, `2`; UNION / INTERSECT / EXCEPT arms filter with
+their own affinity (`(2 UNION ALL s UNION '1') WHERE c <> '1.0' AND c
+<= '1'` is `2`, `1`); a NOCASE arm in a UNION stops it; `c == 3 AND c >=
+'2'` over (`2`, REAL `s`, `+i`) keeps the `+i` rows (the second term
+is fixed, not pushed as `+i >= '2'`); `x IS NOT NULL` pushed under an
+`i+0` leftmost arm scans `tx` (COLLATE BINARY wrapper), under an `x`
+arm searches `(x>?)`. Merges: `x COLLATE NOCASE UNION x WHERE k > 2`
+is `a`, `B`, `c` with the right member a rowid range and a sort;
+`count(*) UNION x` sorts no aggregate member. CLI: `-help` / `--help`
+usage on stderr, exit 0, any position; `-version` / `--version` the
+version on stdout, exit 0, before a later bad option; `-foo` / `--foo`
+/ `---version` / `-HELP` / `-- c` "unknown option" (one `-` stripped
+from `--x`), exit 1; `-` and `--` end options (`- -version` is a
+database named `-version`); no file for `-help`, `-version`, an empty,
+blank or comment-only stdin; a 0-byte file for `;`, `/* x */ ;;`, a
+blank one-shot argument, `SELECT 1`, `.tables`; several SQL arguments
+run in order and stop at the first error. `.dump`: always `PRAGMA
+foreign_keys=OFF;`; reals `%.16g` (lossy: `1.7976931348623157e308`
+dumps as `1.797693134862316e+308`, which replays as an infinity, on
+the pin too); `unistr()` for any byte below 0x20, `\\` inside it, DEL
+and UTF-8 raw, `'\u0041'` without a control character stays plain;
+`INSERT INTO "order"`, `INSERT INTO true`, `within`, `rowid` bare;
+table texts keep a `--` inside a literal on their line, a view's /
+trigger's / index's text holding `--` ends `\n;`.
+
+**Tests.** `tests/plan_gaps_v17.rs` (8 tests, rows in order and EQP
+trees against the live pin): INDEXED BY over 29 query shapes, 6 writes
+and view definitions (files unchanged) and TEMP / attached sessions; 38
+`OR 1` / `OR 0` join shapes and 22 lone-table ones; 33 compound
+push-down cases (mixed affinities, every compound operator, collations,
+constant propagation, column types) and a generated corpus of 240
+compound queries (xorshift) over every affinity and operator; 18 merge
+key / merged-aggregate cases; 25 lone-table constant-term cases.
+`hipp-cli/tests/cli_v17_plan_cli.rs` (6 tests): help / version
+(channel, exit status, first line and the option lines, no file), 22
+command lines (exit status, stdout, stderr with the program name
+normalised, files made), lazy opening over 10 scripts and a first
+`.open`, `.dump` byte-identical on a 30-table corpus written by the
+pin and by hipp (and replayed into the pin), 24 generated dumps, and
+the planner fixes through the shell. Updated to the live pin (no
+expectation moved to hipp's own output): `cli_v16_foreign_keys`,
+`cli_v16_triggers`, `cli_v16_vtab` (they stripped the pin's `PRAGMA
+foreign_keys=OFF;` line hipp did not write) and `cli_diff` (the
+dump's first line).
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (its `--features vm` workspace suite included);
+`tests/depth_v16.rs` and `tests/triggers_v16.rs` with debug info:
+pass (no `STACK_*` change; `and_or_simplified` recurses once per AND /
+OR level of one term, within the parser's depth limit).
+
+**Size Δ.** tiny 0 (76,904); full +32 (479,332 → 479,364); max +772
+(965,876 → 966,648); xl +1,328 (1,062,520 → 1,063,848). Ratchets
+raised to the measured figures (`ci/size-ratchet.toml`): the scan
+path's INDEXED BY test and the column-type rule (`full`), the term
+simplification, the merge key's collations, the never-NULL constants
+and the ORDER BY column test (`max`, the `expr_index` planner), the
+compound push-down (`xl`, `planner`). No offsetting saving found (the
+join planner's own IS NULL rewrite works on owned, multi-source terms
+and could not take the lone-table one).
+
+**Honest gaps.**
+- The pin flattens a compound FROM subquery whose arms agree in
+  affinity into its reader (`COMPOUND QUERY` / `MERGE` at the top of
+  its plan); hipp keeps a co-routine (rows agree; EQP differs).
+  Pre-existing; the generated corpus tolerates exactly that shape.
+- A co-routine or materialisation in a join keeps FROM order and gets
+  no automatic index or Bloom filter (pre-existing, recorded by the
+  flatten unit); with one, an inner join's ON term does not reach an
+  earlier table's access path (`t JOIN (sub) ON t.k = 1` scans `t`,
+  the pin searches it), and a WHERE equality on a co-routine column
+  does not satisfy an ORDER BY on it (hipp adds a sorter). EQP only.
+- The LIKE optimisation (`z LIKE 'a'` as `z>? AND z<?` on a NOCASE
+  index, or the rowid) is not modelled (pre-existing).
+- A merged member whose item has no collation, with none to its left,
+  is planned for its own (BINARY) order even if a later core's NOCASE
+  decides the key: only an expression index could tell.
+- The push-down of a term whose other table's column constant
+  propagation fixes (`t2.x = 5 AND c = t2.x`) is not done (the pin
+  pushes `c = 5`): EQP only.
+- Without `planner` (the `full` / `max` profiles) there is no
+  push-down, so mixed-affinity compound subqueries still compare with
+  the compound's affinity there.
+- hipp-cli: a fresh database file gets its 4,096-byte header page
+  when opened (the pin leaves a 0-byte file until its first write);
+  the version line names hipp, not the pin's source id; the pin's
+  other options are refused rather than implemented; `.dump`'s own
+  options (`--data-only`, `--newlines`, `--nosys`,
+  `--preserve-rowids`) are still ignored.
+
 ### Parity: gaps_eval — evaluator and statement-level divergences (2026-11-15)
 
 Wave 17's first parity unit (after the owner's VM stop, ADR 0005 /
@@ -140,11 +338,13 @@ in `session/join.rs` is `planner`-only, so sharing it would save in
   runs it (it looks a collation up only where a comparison or sort
   uses it).
 - `INDEXED BY` an index of another table is still accepted (a
-  planner item, left for `gaps_plan_cli`).
+  planner item, left for `gaps_plan_cli`) (closed in v0.17:
+  `gaps_plan_cli`).
 - The tiny profile still refuses an empty statement (its parser is
   tiny's claimed path and may not grow; the surface is `sql`).
 - `hipp-cli` reads an argument starting with `-` as SQL; the pin's
-  shell takes it as an option (`-- only` is "unknown option").
+  shell takes it as an option (`-- only` is "unknown option")
+  (closed in v0.17: `gaps_plan_cli`).
 
 ### A smaller VM: slim_design (2026-11-12)
 
@@ -755,7 +955,7 @@ not grow):
   constant; hipp fails with `IntegerOverflow` (closed in v0.17:
   `gaps_eval`, constant propagation over the rowid).
 - `INDEXED BY` an index of another table is accepted; the pin fails
-  with "no such index".
+  with "no such index" (closed in v0.17: `gaps_plan_cli`).
 
 **Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
 passed; `tests/vm_v17.rs` strict (`--cfg hipp_vm_strict`) too.
@@ -891,11 +1091,12 @@ under its budget (512 KiB / 1 MiB / 1.25 MiB).
   open): the pin pushes `x = '1'` into each UNION ALL arm and compares
   with that arm's affinity, so `... (SELECT real_c x ... UNION ALL
   SELECT 1) WHERE x = '1'` has no row on the pin and one (`1.0`) on
-  hipp.
+  hipp (closed in v0.17: `gaps_plan_cli`).
 - Found while testing, out of this unit's scope: hipp-cli's `.dump`
   prints a real `1.0` as `1.0` and omits the leading `PRAGMA
   foreign_keys=OFF;`; the pin prints `1` and the PRAGMA line
-  (pre-existing, independent of subqueries).
+  (pre-existing, independent of subqueries) (closed in v0.17:
+  `gaps_plan_cli`).
 
 ### VM (ADR 0005 Stage 2): vm_shrink (2026-11-11)
 
@@ -1956,7 +2157,8 @@ later, overflowing group the pin never reaches).
   planner, not the VM port): the pin keeps the FROM order for `ON
   b.a > 0 OR 1`; hipp costs it as a term on `b` and puts `b`
   outermost (rows in another order, EQP `SCAN b` first). A planner
-  fix (the pin's always-true OR simplification), not this unit's.
+  fix (the pin's always-true OR simplification), not this unit's
+  (closed in v0.17: `gaps_plan_cli`).
 - Seen while fuzzing, pre-existing and unchanged: with a LIMIT the
   pin's cost model sometimes prefers a loop that delivers part of a
   GROUP BY (`SCAN t USING INDEX tb` for `GROUP BY b, c LIMIT 3`), or
@@ -4103,7 +4305,8 @@ marking). `max` + the leaf measures 1,121,684 B (it pulls in
   column; flattening is bottom-up (a body flattens its own subqueries
   first), where the pin works top-down, which can name a different
   co-routine after a LIMIT.
-- Push-down: not into the arms of UNION / INTERSECT / EXCEPT, not a
+- Push-down: not into the arms of UNION / INTERSECT / EXCEPT (closed
+  in v0.17: `gaps_plan_cli`, when every column is BINARY), not a
   term holding a subquery, not a WHERE term past a LEFT JOIN the
   WHERE makes inner (closed in the review fixes: the LEFT JOIN
   simplification now runs first).
@@ -7711,6 +7914,8 @@ affinity fixes and the view column naming.
   affinity everywhere; the pin pushes some operators (`>`, `>=`,
   `<>`, ...) into each core and compares with that core's
   affinity (planner-dependent; the generated corpus avoids it).
+  (Closed in v0.17: `gaps_plan_cli` pushes every term into each arm
+  under `planner`, as the pin's `pushDownWhereTerms` does.)
 - The CTE's ORDER BY matches result columns by name or ordinal
   only, not by expression (`ORDER BY x + 1` matching a step's
   `x + 1` item is "no such column" in hipp; the pin accepts it) —

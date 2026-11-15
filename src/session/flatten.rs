@@ -565,13 +565,15 @@ impl<S: Storage> Connection<S> {
     /// columns of a FROM subquery that is not flattened, by
     /// deterministic expressions with no subquery, is copied into the
     /// subquery (each column replaced by its expression, into every
-    /// arm of a UNION ALL), into its WHERE — its HAVING when it
+    /// arm of a compound), into its WHERE — its HAVING when it
     /// aggregates and the term reads more than its GROUP BY terms
     /// (`havingToWhere` moves the rest) — and the subquery is planned
-    /// again, so its loops can use the term. Not into a LIMITed,
-    /// recursive, windowed, MATERIALIZED or shared subquery, a compound
-    /// other than UNION ALL, a VALUES body, or past a RIGHT / FULL
-    /// join; the term stays in the reader too.
+    /// again, so its loops can use the term. Each arm compares with
+    /// its own affinity (v0.17 fix: arms of different affinities took
+    /// no term). Not into a LIMITed, recursive, windowed, MATERIALIZED
+    /// or shared subquery, a UNION / INTERSECT / EXCEPT with a
+    /// non-BINARY column, a VALUES body, or past a RIGHT / FULL join;
+    /// the term stays in the reader too.
     fn push_down(
         &self,
         arena: &Arena,
@@ -619,14 +621,23 @@ impl<S: Storage> Connection<S> {
             let mut arms: AVec<(&SelectStmt, &SubPlan)> = AVec::new();
             arms.push((d, dp));
             let mut ok = d.compound.len() == dp.compound.len();
+            let mut union_all = true;
             for ((op, c), (_, t)) in d.compound.iter().zip(dp.compound.iter()) {
-                ok &= *op == crate::sql::CompoundOp::UnionAll;
+                union_all &= *op == crate::sql::CompoundOp::UnionAll;
                 arms.push((c, t));
             }
+            // (A UNION / INTERSECT / EXCEPT takes the terms only when
+            // no arm's column has a collation other than BINARY: the
+            // pin's restriction (8); v0.17 fix.)
             ok &= arms.iter().all(|(a, q)| {
                 a.values.is_empty()
                     && a.items.iter().all(|it| matches!(it, SelectItem::Expr(..)))
                     && !q.items.iter().any(has_win)
+                    && (union_all
+                        || q.items.iter().all(|it| {
+                            crate::query::expr_coll(it).unwrap_or_default()
+                                == crate::record::Coll::Binary
+                        }))
             });
             if !ok {
                 continue;
@@ -657,8 +668,53 @@ impl<S: Storage> Connection<S> {
             for _ in arms.iter() {
                 adds.push((AVec::new(), AVec::new()));
             }
+            // A term the pin's constant propagation rewrites (over the
+            // WHERE and the inner joins' ON clauses; an outer join's ON
+            // is left alone) is pushed with its fixed columns as
+            // constants, which filter an arm wholly or not at all, as
+            // the term in the reader does: not pushed here (v0.17 fix:
+            // `x == 3 AND x >= '2'` compared an untyped arm's `+i` with
+            // '2' as text and lost its rows).
+            let mut fixed: AVec<bool> = AVec::new();
+            if sp.kind != JoinKind::Left {
+                let mut all: AVec<&Expr> = AVec::new();
+                if let Some(w) = &stmt.filter {
+                    conj(w, &mut all);
+                }
+                for g in stmt.from.iter() {
+                    if matches!(g.kind, JoinKind::Inner | JoinKind::Cross)
+                        && let Some(on) = &g.on
+                    {
+                        conj(on, &mut all);
+                    }
+                }
+                let mut rs: AVec<RExpr> = AVec::new();
+                for e in all.iter() {
+                    rs.push(
+                        crate::query::resolve_scoped::<S::Error>(
+                            e,
+                            arena,
+                            p.cur,
+                            enclosing,
+                            &mut planner,
+                        )
+                        .unwrap_or(RExpr::Literal(OwnedValue::Null)),
+                    );
+                }
+                let mut refs: AVec<&RExpr> = AVec::new();
+                for r in rs.iter() {
+                    refs.push(r);
+                }
+                for c in cand.iter() {
+                    let i = all.iter().position(|a| core::ptr::eq(*a, *c));
+                    fixed.push(i.is_some_and(|i| crate::query::prop_rewrites(refs.as_slice(), i)));
+                }
+            }
             let mut any = false;
-            for t in cand.iter() {
+            for (ci, t) in cand.iter().enumerate() {
+                if fixed.as_slice().get(ci).copied().unwrap_or(false) {
+                    continue;
+                }
                 let subq = crate::rules::expr_any(t, &mut |x| {
                     matches!(
                         x,
@@ -730,24 +786,32 @@ impl<S: Storage> Connection<S> {
                                 // The column's collating sequence is
                                 // the leftmost arm's (the pin's
                                 // `pCList`): an arm whose expression
-                                // has another gets it explicitly.
-                                let want = dp
-                                    .items
-                                    .as_slice()
-                                    .get(c)
-                                    .and_then(crate::query::expr_coll)
-                                    .unwrap_or_default();
-                                let have = q
-                                    .items
-                                    .as_slice()
-                                    .get(c)
-                                    .and_then(crate::query::expr_coll)
-                                    .unwrap_or_default();
-                                Some(if want == have {
-                                    ie.clone()
-                                } else {
-                                    Expr::Collate(Box::new(ie.clone()), want)
-                                })
+                                // has another — or is neither a column
+                                // nor a COLLATE — gets it explicitly
+                                // (`substExpr`; v0.17 fix: a plain
+                                // column has BINARY there, an
+                                // expression none, so `x IS NOT NULL`
+                                // pushed under an `i+0` arm is no
+                                // index range).
+                                let coll = |q: &SubPlan| {
+                                    q.items.as_slice().get(c).and_then(|e| match e {
+                                        RExpr::Column(_, _, k) => Some(k.unwrap_or_default()),
+                                        e => crate::query::expr_coll(e),
+                                    })
+                                };
+                                let want = coll(dp);
+                                Some(
+                                    if want == coll(q)
+                                        && matches!(ie, Expr::Column { .. } | Expr::Collate(..))
+                                    {
+                                        ie.clone()
+                                    } else {
+                                        Expr::Collate(
+                                            Box::new(ie.clone()),
+                                            want.unwrap_or_default(),
+                                        )
+                                    },
+                                )
                             }
                             _ => {
                                 fine = false;
@@ -761,20 +825,6 @@ impl<S: Storage> Connection<S> {
                     per.push(x);
                 }
                 if per.len() != arms.len() {
-                    continue;
-                }
-                // Across a compound's arms a column must compare alike
-                // (its affinity is the compound's, not each arm's).
-                let alike = cols.iter().all(|c| {
-                    let aff = |q: &SubPlan| {
-                        q.items
-                            .as_slice()
-                            .get(*c)
-                            .map(crate::query::item_result_affinity)
-                    };
-                    arms.iter().all(|(_, q)| aff(q) == aff(dp))
-                });
-                if !alike {
                     continue;
                 }
                 for ((x, (a, q)), add) in per

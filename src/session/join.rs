@@ -1133,9 +1133,9 @@ impl<S: Storage> Connection<S> {
         }
         for (i, sp) in sources.iter().enumerate() {
             if let Some(on) = &sp.on {
-                conjuncts(on, &mut conj);
-                crate::xplan::conjuncts_meta(on, &mut meta);
                 let left = sp.kind == crate::sql::JoinKind::Left;
+                crate::xplan::conjuncts_as(on, &mut conj, !left);
+                crate::xplan::conjuncts_meta(on, &mut meta);
                 while on_of.len() < conj.len() {
                     on_of.push(if left { Some(i) } else { None });
                 }

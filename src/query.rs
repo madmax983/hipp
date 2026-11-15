@@ -8017,36 +8017,20 @@ pub fn join_constants_hold<E>(
             and_terms(on, &mut terms);
         }
     }
-    let mut binds: AVec<ConstBind> = AVec::new();
-    if terms.len() > 1 && !right_join {
-        for (i, t) in terms.iter().enumerate().rev() {
-            let Some((l, r)) = prop_eq(t) else {
-                continue;
-            };
-            for (c, v) in [(r, l), (l, r)] {
-                if let Some((key, aff, coll)) = prop_key(c)
-                    && !binds.iter().any(|b| b.0 == key)
-                    && !matches!(v, RExpr::AffLiteral(..))
-                    && factorable(v)
-                    && item_result_affinity(v).is_none()
-                {
-                    let with = match match v {
-                        RExpr::Literal(x) => Ok(x.clone()),
-                        _ => eval::<E>(v, ctx),
-                    } {
-                        Ok(x) => RExpr::AffLiteral(
-                            crate::record::apply_affinity(x, aff),
-                            Some(aff),
-                            coll,
-                        ),
-                        // It fails again wherever a term reads it.
-                        Err(_) => v.clone(),
-                    };
-                    binds.push((key, i, with, aff));
-                }
+    let binds = if right_join {
+        AVec::new()
+    } else {
+        prop_binds(terms.as_slice(), &mut |v, aff, coll| {
+            match match v {
+                RExpr::Literal(x) => Ok(x.clone()),
+                _ => eval::<E>(v, ctx),
+            } {
+                Ok(x) => RExpr::AffLiteral(crate::record::apply_affinity(x, aff), Some(aff), coll),
+                // It fails again wherever a term reads it.
+                Err(_) => v.clone(),
             }
-        }
-    }
+        })
+    };
     for (i, t) in terms.iter().enumerate() {
         let mut t2;
         let t: &RExpr = if binds.is_empty() {
@@ -8061,6 +8045,52 @@ pub fn join_constants_hold<E>(
         }
     }
     Ok(true)
+}
+
+/// The columns the pin's `findConstInWhere` fixes among the AND
+/// terms `terms`, each standing in as `with(constant, affinity,
+/// collation)`.
+fn prop_binds(
+    terms: &[&RExpr],
+    with: &mut dyn FnMut(&RExpr, Affinity, Option<Coll>) -> RExpr,
+) -> AVec<ConstBind> {
+    let mut binds: AVec<ConstBind> = AVec::new();
+    if terms.len() > 1 {
+        for (i, t) in terms.iter().enumerate().rev() {
+            let Some((l, r)) = prop_eq(t) else {
+                continue;
+            };
+            for (c, v) in [(r, l), (l, r)] {
+                if let Some((key, aff, coll)) = prop_key(c)
+                    && !binds.iter().any(|b| b.0 == key)
+                    && !matches!(v, RExpr::AffLiteral(..))
+                    && factorable(v)
+                    && item_result_affinity(v).is_none()
+                {
+                    binds.push((key, i, with(v, aff, coll), aff));
+                }
+            }
+        }
+    }
+    binds
+}
+
+/// Whether the pin's constant propagation rewrites a column of term
+/// `i` of the AND terms `terms` (v0.17, `planner`): the WHERE
+/// push-down copies such a term with the column fixed to its constant
+/// and the column's affinity (`EP_FixedCol`, which `substExpr` leaves
+/// alone), so it does not push the arm's expression in its place.
+#[cfg(feature = "planner")]
+pub(crate) fn prop_rewrites(terms: &[&RExpr], i: usize) -> bool {
+    let binds = prop_binds(terms, &mut |_, _, _| {
+        RExpr::Raise(SchemaKind::UnknownColumn)
+    });
+    let Some(t) = terms.get(i) else {
+        return false;
+    };
+    let mut t2 = (*t).clone();
+    propagate(&mut t2, binds.as_slice(), i, false);
+    has_raise(&t2) && !has_raise(t)
 }
 
 /// `join_constants_hold`'s rewrite of term `i` (`binds`), in place

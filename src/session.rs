@@ -1440,9 +1440,12 @@ fn select_is_simple(stmt: &SelectStmt) -> bool {
         return false;
     }
     // v0.16: `name(args)` is a table-valued function (or the
-    // pin's "not a function"), for the general planner.
+    // pin's "not a function"), for the general planner. So is an
+    // INDEXED BY / NOT INDEXED source (v0.17 fix: this path never
+    // looked the index up, so an index of another table, or none,
+    // was accepted where the pin says "no such index").
     #[cfg(feature = "sql")]
-    if stmt.from.as_slice()[0].args.is_some() {
+    if stmt.from.as_slice()[0].args.is_some() || stmt.from.as_slice()[0].indexed.is_some() {
         return false;
     }
     let mut stars = 0usize;
@@ -3720,7 +3723,15 @@ impl<S: Storage> Connection<S> {
             let (compound, comp_order) = if stmt.compound.is_empty() {
                 (AVec::new(), AVec::new())
             } else {
-                self.plan_sub_compound(stmt, arena, enclosing, &keys, width)?
+                self.plan_sub_compound(
+                    stmt,
+                    arena,
+                    enclosing,
+                    &keys,
+                    width,
+                    #[cfg(feature = "expr_index")]
+                    core_colls(&[], values.as_slice()),
+                )?
             };
             let mut result_names: AVec<AVec<u8>> = AVec::new();
             let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
@@ -3776,7 +3787,15 @@ impl<S: Storage> Connection<S> {
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_sub_compound(stmt, arena, enclosing, &core.keys, core.items.len())?
+            self.plan_sub_compound(
+                stmt,
+                arena,
+                enclosing,
+                &core.keys,
+                core.items.len(),
+                #[cfg(feature = "expr_index")]
+                core_colls(core.items.as_slice(), &[]),
+            )?
         };
         #[cfg(not(feature = "sql"))]
         let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
@@ -3936,16 +3955,20 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
         head: &CompKeys,
         width: usize,
+        #[cfg(feature = "expr_index")] mut seen: AVec<Option<crate::record::Coll>>,
     ) -> Result<SubCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
         for (i, (op, core)) in stmt.compound.iter().enumerate() {
             #[cfg(feature = "expr_index")]
             if core.values.is_empty() {
-                self.merge_core.set(merge_member(stmt, i + 1));
+                self.merge_core
+                    .set(merge_member(stmt, i + 1).map(|(t, r, _)| (t, r, seen.clone())));
             }
             let _ = i;
             let (p, k) = self.plan_subquery_keyed(core, arena, enclosing)?;
+            #[cfg(feature = "expr_index")]
+            seen_colls(&mut seen, p.items.as_slice(), p.values.as_slice());
             if p.width() != width {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
@@ -3973,16 +3996,20 @@ impl<S: Storage> Connection<S> {
         arena: &Arena,
         head: &CompKeys,
         width: usize,
+        #[cfg(feature = "expr_index")] mut seen: AVec<Option<crate::record::Coll>>,
     ) -> Result<QueryCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
         for (i, (op, core)) in stmt.compound.iter().enumerate() {
             #[cfg(feature = "expr_index")]
             if core.values.is_empty() {
-                self.merge_core.set(merge_member(stmt, i + 1));
+                self.merge_core
+                    .set(merge_member(stmt, i + 1).map(|(t, r, _)| (t, r, seen.clone())));
             }
             let _ = i;
             let (p, k) = self.plan_query_keyed(core, arena)?;
+            #[cfg(feature = "expr_index")]
+            seen_colls(&mut seen, p.items.as_slice(), p.values.as_slice());
             if p.width != width {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
@@ -4945,7 +4972,14 @@ impl<S: Storage> Connection<S> {
             let (compound, comp_order) = if stmt.compound.is_empty() {
                 (AVec::new(), AVec::new())
             } else {
-                self.plan_query_compound(stmt, arena, &keys, width)?
+                self.plan_query_compound(
+                    stmt,
+                    arena,
+                    &keys,
+                    width,
+                    #[cfg(feature = "expr_index")]
+                    core_colls(&[], values.as_slice()),
+                )?
             };
             let qp = QueryPlan {
                 sources: AVec::new(),
@@ -4977,7 +5011,14 @@ impl<S: Storage> Connection<S> {
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_query_compound(stmt, arena, &core.keys, width)?
+            self.plan_query_compound(
+                stmt,
+                arena,
+                &core.keys,
+                width,
+                #[cfg(feature = "expr_index")]
+                core_colls(core.items.as_slice(), &[]),
+            )?
         };
         #[cfg(not(feature = "sql"))]
         let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
@@ -5478,7 +5519,7 @@ impl<S: Storage> Connection<S> {
         // it can (`merge_core`).
         #[cfg(feature = "expr_index")]
         let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = match merge {
-            Some((terms, rest)) if order_by.is_empty() && !has_agg => {
+            Some((terms, rest, colls)) if order_by.is_empty() && !has_agg => {
                 let key = |j: usize, desc: bool, nulls_first: bool| {
                     items.as_slice().get(j).map(|e| {
                         (
@@ -5486,7 +5527,13 @@ impl<S: Storage> Connection<S> {
                             crate::sql::SortOrder {
                                 desc,
                                 nulls_first,
-                                coll: crate::query::expr_coll(e).unwrap_or_default(),
+                                coll: colls
+                                    .as_slice()
+                                    .get(j)
+                                    .copied()
+                                    .flatten()
+                                    .or_else(|| crate::query::expr_coll(e))
+                                    .unwrap_or_default(),
                             },
                         )
                     })
@@ -14729,6 +14776,23 @@ pub(crate) fn core_colls(
     out
 }
 
+/// Fill the columns no earlier core gave a collation with the next
+/// core's (`MergeSpec`; v0.17).
+#[cfg(feature = "expr_index")]
+fn seen_colls(
+    seen: &mut AVec<Option<crate::record::Coll>>,
+    items: &[RExpr],
+    values: &[AVec<RExpr>],
+) {
+    for (i, c) in core_colls(items, values).into_iter().enumerate() {
+        match seen.as_mut_slice().get_mut(i) {
+            Some(s) if s.is_none() => *s = c,
+            Some(_) => {}
+            None => seen.push(c),
+        }
+    }
+}
+
 /// A compound result column's collation (v0.16, the pin's
 /// `multiSelectCollSeq`): the leftmost core whose item `i` has
 /// one decides; BINARY when none does.
@@ -14952,9 +15016,16 @@ pub(crate) fn run_compound(
 /// The merge key a compound member is read for (v0.16,
 /// `expr_index`; `Connection::merge_core`): `(result column, DESC,
 /// NULLS FIRST)` terms, then (when the flag says so) every other
-/// column ascending.
+/// column ascending; per column, the collation an earlier core gave
+/// it (the merge key's, the pin's `multiSelectCollSeq`; v0.17 fix:
+/// the member's own was used, so a BINARY index was read for a
+/// NOCASE key and UNION kept another row of a NOCASE-equal group).
 #[cfg(feature = "expr_index")]
-type MergeSpec = (AVec<(usize, bool, bool)>, bool);
+type MergeSpec = (
+    AVec<(usize, bool, bool)>,
+    bool,
+    AVec<Option<crate::record::Coll>>,
+);
 
 /// The merge key core `k` (0: the head) of compound `stmt` is merged
 /// by (see `run_compound`), as the pin's `multiSelectOrderBy` keys
@@ -14984,7 +15055,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
             .iter()
             .rposition(|(op, _)| *op != UnionAll)
             .filter(|l| k <= l + 1)
-            .map(|_| (AVec::new(), true));
+            .map(|_| (AVec::new(), true, AVec::new()));
     }
     let mut terms = AVec::new();
     for (e, o) in stmt.order_by.iter() {
@@ -15000,7 +15071,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
         .as_slice()
         .last()
         .is_some_and(|(op, _)| *op != UnionAll);
-    Some((terms, rest))
+    Some((terms, rest, AVec::new()))
 }
 
 /// The pin's UNION-with-LIMIT-1 shortcut (3.54.0: "UNION queries

@@ -5,6 +5,39 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Planner and CLI parity (wave 17, unit `gaps_plan_cli`)
+
+- Fixes (ungated): `INDEXED BY` an index of another table (or of a
+  TEMP / attached table, or no index) is "no such index" on the plain
+  single-table scan path too (it was accepted when the table had no
+  index); WHERE and inner-join ON terms are simplified as the pin's
+  `whereClauseInsert` does (`x OR 1` constrains nothing and keeps the
+  FROM join order; `x OR 0` is `x`, which an index serves); a merged
+  compound member is planned for the merge key's collation, so `x
+  COLLATE NOCASE UNION x` keeps the pin's row of a NOCASE-equal group
+  (a silent wrong answer); compound column types read through COLLATE
+  and unary plus; `x IS NULL` on a never-NULL column is a constant in a
+  lone table's planning, an ORDER BY constant must be a column, `x IS
+  NOT NULL` is a range only on a bare column, and a merged aggregate
+  member without GROUP BY shows no sort.
+- `planner`: WHERE push-down into compound FROM subqueries whose arms
+  differ in affinity (each arm compares with its own: the v0.16 honest
+  gap) and into UNION / INTERSECT / EXCEPT arms with BINARY columns; a
+  term constant propagation rewrites is left in the reader; the pushed
+  copy carries the leftmost arm's collation where the pin adds one.
+- hipp-cli: the pin shell's command line — `-help` / `--help` (usage on
+  stderr), `-version` / `--version`, the pin's "unknown option" error
+  (exit 1), `--` / `-`, every argument after the database an SQL text,
+  `:memory:` when none is named; the database is opened only when
+  input needs it (`--help` made a file named `--help`). `.dump` is the
+  pin's byte for byte: `PRAGMA foreign_keys=OFF;` first, reals as
+  `%.16g`, text with control characters as `unistr('...')`, names
+  quoted as the pin's `quoteChar` (a table named `"we ird"` failed the
+  dump), `sqlite_sequence` re-created, `sqlite_stat1` as `ANALYZE
+  sqlite_schema;`.
+- Tests: `tests/plan_gaps_v17.rs`, `hipp-cli/tests/cli_v17_plan_cli.rs`.
+- Size: tiny 0, full +32 B, max +772 B, xl +1,328 B (ratchets raised).
+
 ### Evaluator and statement-level parity (wave 17, unit `gaps_eval`)
 
 - Fixes (ungated, every profile with the evaluator): `hex(NULL)` is
