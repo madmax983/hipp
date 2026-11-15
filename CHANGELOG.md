@@ -5,6 +5,16 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The bytecode VM migration stopped (owner decision, 2026-11-15)
+
+- ADR 0005 Stages 2-4 are not adopted and ADR 0007 is rejected: the
+  VM was measured three times (the Stage 2 flip, the combined Stage
+  2 + 3 flip, a redesigned smaller VM) and never fitted the size
+  ratchets. The tree-walking executors stay. The Stage 2 VM stays
+  frozen behind the hidden `vm` feature, which no profile enables;
+  new SQL shapes fall back to today's executor under it. No code,
+  behaviour or size change.
+
 ### A smaller VM: measured design, verdict stop (wave 16, unit `slim_design`)
 
 - ADR 0007 "A smaller VM" (proposed): the four levers of a smaller

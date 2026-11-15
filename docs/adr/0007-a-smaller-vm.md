@@ -1,10 +1,14 @@
 # ADR 0007 — A smaller VM
 
-- **Status:** proposed (2026-11-12, wave 16, unit `slim_design`).
-  **Verdict: stop in full, max and xl** (below): the design is
-  recorded, measured and costed, and `slim_core` does not start. The
-  wave plan called this record "ADR 0006"; that number is taken
-  (features named for capabilities), so it is 0007.
+- **Status:** rejected (2026-11-15, owner). Proposed 2026-11-12
+  (wave 16, unit `slim_design`) with the **verdict stop in full, max
+  and xl** (below): the design is recorded, measured and costed, and
+  `slim_core` never started. Offered a ratchet re-baseline, a Tier B
+  probe or stopping, the owner chose to stop the VM migration and
+  return to SQLite parity work; ADR 0005 records the consequences
+  for the hidden `vm` code. The wave plan called this record "ADR
+  0006"; that number is taken (features named for capabilities), so
+  it is 0007.
 - **Context:** ADR 0005's bytecode VM runs every SELECT behind the
   hidden `vm` feature, but its flip never fitted. Stage 2 measured
   the VM's read path at 1.5-1.9x the read executor it replaces

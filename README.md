@@ -1557,8 +1557,9 @@ shared page cache (a file is attached once); the pin's own bytecode
 listing (plain EXPLAIN lists hipp's program, in the pin's columns, under
 the hidden `vm` feature, which no profile enables: turning the VM on
 measured larger in every profile, Stage 2 alone and with Stage 3,
-ADR 0005, and as a redesigned smaller VM, ADR 0007; its content is
-hipp's, not the pin's); loadable
+ADR 0005, and as a redesigned smaller VM, ADR 0007, so the migration
+stopped there and the VM stays frozen; its content is hipp's, not the
+pin's); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.
