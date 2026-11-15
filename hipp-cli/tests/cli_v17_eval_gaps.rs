@@ -190,3 +190,38 @@ fn empty_statements_in_one_shot_scripts_like_the_pin() {
         ],
     );
 }
+
+/// The shapes behind the review findings on this unit (v0.17 review
+/// fixes): an enclosing query's aggregate in a FROM-less core's
+/// dropped ORDER BY (one row), `c IN (col)` fixing nothing, a CAST
+/// item and NOT IN in the constant propagation, every aggregate of a
+/// group stepped beside a neutral AND / OR operand, and a dropped
+/// ORDER BY's code-generation errors never raised.
+#[test]
+fn review_fixes_render_like_the_pin() {
+    same(
+        "rf",
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, x);
+INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (5, 1, x'01');",
+        "SELECT (SELECT 1 ORDER BY sum(t.a)) FROM t;
+SELECT a, (SELECT 1 ORDER BY max(t.a)) FROM t;
+SELECT (SELECT DISTINCT 1 ORDER BY sum(t.a) LIMIT 1) FROM t;
+SELECT a FROM t WHERE (SELECT 1 ORDER BY sum(t.a));
+SELECT * FROM t WHERE 5 IN (b) AND b < 5 AND abs(-9223372036854775808);
+SELECT 'next';
+SELECT * FROM t WHERE 5 IN (a) AND abs(a - 5 - 9223372036854775807 - 1);
+SELECT * FROM t WHERE a IN (CAST(5 AS INT)) AND a < 5 AND abs(-9223372036854775808);
+SELECT * FROM t WHERE x = 1 AND x NOT IN (1) AND abs(-9223372036854775808);
+SELECT sum(abs(-9223372036854775808)) AND (0 OR 0);
+SELECT 'then';
+SELECT coalesce(1, sum(abs(-9223372036854775808)));
+SELECT 'and';
+SELECT (SELECT sum(abs(-9223372036854775808)) AND (0 OR 0)) FROM t;
+SELECT b, coalesce(1, sum(a)) FROM t GROUP BY b;
+SELECT 1 ORDER BY (1,2);
+SELECT 1 ORDER BY raise(ignore);
+SELECT count(*) FROM t ORDER BY (SELECT 1, 2);
+SELECT 1 ORDER BY (1,2) = (1,2,3);
+SELECT 'done';",
+    );
+}

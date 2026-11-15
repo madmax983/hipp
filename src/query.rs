@@ -871,6 +871,12 @@ pub struct ScopeGroup {
     /// `window`).
     #[cfg(feature = "window")]
     pub win: WinScope,
+    /// While this group's SELECT core resolves an ORDER BY the pin
+    /// never codes (v0.17 review fix, `sql`; see `late`): `Some`,
+    /// holding the first error the pin would raise only in code
+    /// generation. `None` otherwise.
+    #[cfg(feature = "sql")]
+    pub late: core::cell::Cell<Option<Option<SchemaKind>>>,
 }
 
 /// What window calls a SELECT core's resolution may make (v0.16,
@@ -897,6 +903,8 @@ impl ScopeGroup {
             agg_owner: true,
             #[cfg(feature = "window")]
             win: WinScope::default(),
+            #[cfg(feature = "sql")]
+            late: core::cell::Cell::new(None),
         }
     }
 
@@ -2330,7 +2338,7 @@ fn resolve_other<E>(
         Expr::BitNot(_) => res_bit_not::<E>(expr, arena, cur, enclosing, p)?,
         // A row value anywhere but a comparison operand.
         #[cfg(feature = "sql")]
-        Expr::Vector(_) => return Err(row_misused()),
+        Expr::Vector(_) => late::<E>(SchemaKind::RowValueMisused, cur, enclosing)?,
         #[cfg(feature = "sql")]
         Expr::RowItem(..) => res_row_item::<E>(expr, arena, cur, enclosing, p)?,
         #[cfg(feature = "sql")]
@@ -2382,9 +2390,7 @@ fn resolve_other<E>(
         #[cfg(feature = "triggers")]
         Expr::Raise(kind, msg, in_trigger) => {
             if !*in_trigger {
-                return Err(Error::Schema {
-                    kind: SchemaKind::RaiseOutsideTrigger,
-                });
+                return late::<E>(SchemaKind::RaiseOutsideTrigger, cur, enclosing);
             }
             let mut args = AVec::new();
             if let Some(m) = msg {
@@ -2414,9 +2420,7 @@ fn res_in_sub_row<E>(
             let xp = resolve_row::<E>(x, arena, cur, enclosing, &mut *planner)?;
             let plan = planner(stmt, cur, enclosing)?;
             if plan.width() != xp.len() {
-                return Err(Error::Schema {
-                    kind: SchemaKind::ColumnCountMismatch,
-                });
+                return late::<E>(SchemaKind::ColumnCountMismatch, cur, enclosing);
             }
             RExpr::InSub(
                 Box::new(RExpr::Scalar(ScalarFn::Vector, xp)),
@@ -2444,9 +2448,7 @@ fn res_in_sub<E>(
             let xr = resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?;
             let plan = planner(stmt, cur, enclosing)?;
             if plan.width() != 1 {
-                return Err(Error::Schema {
-                    kind: SchemaKind::ColumnCountMismatch,
-                });
+                return late::<E>(SchemaKind::ColumnCountMismatch, cur, enclosing);
             }
             RExpr::InSub(Box::new(xr), Box::new(plan), *neg)
         }
@@ -2469,9 +2471,7 @@ fn res_scalar_sub<E>(
         Expr::ScalarSubquery(stmt) => {
             let plan = planner(stmt, cur, enclosing)?;
             if plan.width() != 1 {
-                return Err(Error::Schema {
-                    kind: SchemaKind::ColumnCountMismatch,
-                });
+                return late::<E>(SchemaKind::ColumnCountMismatch, cur, enclosing);
             }
             RExpr::SubScalar(Box::new(first_row_limit(plan)))
         }
@@ -2861,6 +2861,32 @@ fn res_case<E>(
         }
         _ => return Err(Error::Unsupported),
     })
+}
+
+/// An error the pin raises only when it codes the expression
+/// (v0.17 review fix): a row value out of place, RAISE outside a
+/// trigger, a subquery of the wrong width. While a SELECT core
+/// resolves an ORDER BY the pin never codes (`ScopeGroup::late`, on
+/// it or an enclosing group), the first such error waits there and
+/// the expression stands as NULL; elsewhere it fails now.
+#[cfg(feature = "sql")]
+fn late<E>(kind: SchemaKind, cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> Result<RExpr, E> {
+    let Some(g) = core::iter::once(cur)
+        .chain(enclosing)
+        .find(|g| g.late.get().is_some())
+    else {
+        return Err(Error::Schema { kind });
+    };
+    if g.late.get() == Some(None) {
+        g.late.set(Some(Some(kind)));
+    }
+    Ok(RExpr::Literal(OwnedValue::Null))
+}
+
+/// `late` without the `sql` feature: the error, now.
+#[cfg(not(feature = "sql"))]
+fn late<E>(kind: SchemaKind, _: &ScopeGroup, _: &[ScopeGroup]) -> Result<RExpr, E> {
+    Err(Error::Schema { kind })
 }
 
 /// The pin's "row value misused" (v0.16).
@@ -3937,6 +3963,66 @@ pub fn where_agg(e: &RExpr, allow_foreign: bool) -> bool {
 /// nested subquery (v0.16).
 fn has_direct_agg(e: &RExpr) -> bool {
     direct_agg(e, &|_| true)
+}
+
+/// Whether `e` holds an aggregate outside nested subqueries where
+/// `eval` may not reach it (v0.17 review fix): an AND / OR, CASE or
+/// IN-list operand, or an argument of coalesce / ifnull / iif /
+/// likely. The pin steps every aggregate of a group whatever its
+/// result terms read, so its group computes them all first
+/// (`session::lazy_aggs`).
+#[cfg(feature = "query")]
+pub(crate) fn agg_skippable(e: &RExpr) -> bool {
+    let f = agg_skippable;
+    // (A lazy node's first operand is always computed.)
+    let lazy = |first: &RExpr, rest: &[RExpr]| f(first) || rest.iter().any(has_direct_agg);
+    match e {
+        RExpr::Binary(BinOp::And | BinOp::Or, ..) | RExpr::Case { .. } => has_direct_agg(e),
+        RExpr::InList(x, l, ..) => lazy(x, l.as_slice()),
+        #[cfg(feature = "sql")]
+        RExpr::Scalar(ScalarFn::Likely, args) => args
+            .as_slice()
+            .split_first()
+            .is_some_and(|(a, r)| lazy(a, r)),
+        RExpr::Scalar(ScalarFn::Coalesce | ScalarFn::Iif, args) => args
+            .as_slice()
+            .split_first()
+            .is_some_and(|(a, r)| lazy(a, r)),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => f(a) || f(b),
+        RExpr::Neg(a)
+        | RExpr::Pos(a)
+        | RExpr::Not(a)
+        | RExpr::IsNull(a, _)
+        | RExpr::Cast(a, _)
+        | RExpr::Collate(a, _) => f(a),
+        RExpr::Between(x, a, b, _) => f(x) || f(a) || f(b),
+        RExpr::Scalar(_, args) => args.iter().any(f),
+        _ => false,
+    }
+}
+
+/// The aggregates a dropped ORDER BY term still holds (v0.17 review
+/// fix): the pin resolves each into its owner before it drops the
+/// term, so an enclosing query's makes that query an aggregate one
+/// (`SELECT (SELECT 1 ORDER BY sum(t.a)) FROM t` is one row), though
+/// nothing codes it (no misuse in a WHERE: inert, as an EXISTS
+/// subquery's are). Pushes, as a term at this query's level, each
+/// enclosing query's aggregate in `e` (inside a subquery too, its
+/// level counted from here) and, with `own`, this query's own.
+#[cfg(feature = "query")]
+pub fn dropped_term_aggs(e: &RExpr, own: bool, out: &mut AVec<RExpr>) {
+    visit_all_aggs(e, 0, &mut |a, d| {
+        if let RExpr::Agg { lvl, .. } = a
+            && (*lvl > d || (own && *lvl == d))
+        {
+            let mut c = a.clone();
+            if let RExpr::Agg { lvl, inert, .. } = &mut c {
+                *inert |= *lvl > d;
+                *lvl = lvl.saturating_sub(d);
+            }
+            out.push(c);
+        }
+    });
 }
 
 /// Whether `e` holds an aggregate node satisfying `p` outside
@@ -7967,20 +8053,38 @@ fn prop_key(e: &RExpr) -> Option<(usize, Affinity, Option<Coll>)> {
     }
 }
 
-/// The operands of a term that may fix a column, as the pin's
-/// `findConstInWhere` sees them: `=` under BINARY, and a one-item
-/// `x IN (c)` without a top-level COLLATE, which the pin's parser
-/// turns into `x = +c`.
-fn prop_eq(t: &RExpr) -> Option<(&RExpr, &RExpr)> {
-    match t {
-        RExpr::Binary(BinOp::Eq, l, r) => Some((&**l, &**r)),
-        RExpr::InList(x, l, false, false) => match l.as_slice() {
-            [c] if !matches!(c, RExpr::Collate(..)) => Some((&**x, c)),
-            _ => None,
-        },
+/// A one-item `x [NOT] IN (c)` that the pin's parser turns into
+/// `x = +c` (under NOT): `c` constant as its parser sees it (no
+/// column, outer one included, nor subquery, nothing
+/// non-deterministic) and `x` no row value. `5 IN (b)` stays an IN
+/// (v0.17 review fix: it fixed b).
+fn in_one(e: &RExpr) -> Option<(&RExpr, &RExpr)> {
+    let RExpr::InList(x, l, _, false) = e else {
+        return None;
+    };
+    #[cfg(feature = "sql")]
+    if matches!(&**x, RExpr::Scalar(ScalarFn::Vector, _)) {
+        return None;
+    }
+    match l.as_slice() {
+        [c] if factorable(c) && !matches!(c, RExpr::AffLiteral(..)) => Some((&**x, c)),
         _ => None,
     }
-    .filter(|(l, r)| binary_coll(l, r) == Coll::Binary)
+}
+
+/// The operands of a term that may fix a column, as the pin's
+/// `findConstInWhere` sees them: `=` under BINARY, and a one-item
+/// `x IN (c)` without a top-level COLLATE (`in_one`, flagged: only
+/// `x` is fixed, and the `+` leaves `c` no affinity).
+fn prop_eq(t: &RExpr) -> Option<(&RExpr, &RExpr, bool)> {
+    match t {
+        RExpr::Binary(BinOp::Eq, l, r) => Some((&**l, &**r, false)),
+        RExpr::InList(_, _, false, _) => in_one(t)
+            .filter(|(_, c)| !matches!(c, RExpr::Collate(..)))
+            .map(|(x, c)| (x, c, true)),
+        _ => None,
+    }
+    .filter(|(l, r, _)| binary_coll(l, r) == Coll::Binary)
 }
 
 /// `constant_terms_hold` for a SELECT core: the WHERE clause
@@ -8057,15 +8161,15 @@ fn prop_binds(
     let mut binds: AVec<ConstBind> = AVec::new();
     if terms.len() > 1 {
         for (i, t) in terms.iter().enumerate().rev() {
-            let Some((l, r)) = prop_eq(t) else {
+            let Some((l, r, one)) = prop_eq(t) else {
                 continue;
             };
-            for (c, v) in [(r, l), (l, r)] {
+            for (c, v) in [(r, l), (l, r)].into_iter().skip(usize::from(one)) {
                 if let Some((key, aff, coll)) = prop_key(c)
                     && !binds.iter().any(|b| b.0 == key)
                     && !matches!(v, RExpr::AffLiteral(..))
                     && factorable(v)
-                    && item_result_affinity(v).is_none()
+                    && (one || item_result_affinity(v).is_none())
                 {
                     binds.push((key, i, with(v, aff, coll), aff));
                 }
@@ -8097,7 +8201,7 @@ pub(crate) fn prop_rewrites(terms: &[&RExpr], i: usize) -> bool {
 /// (the pin's `propagateConstantExprRewrite`): a bound column
 /// becomes its constant, unless the term defines it; a BLOB
 /// affinity column only as an operand of `=`, `<`, `<=`, `>`, `>=`,
-/// IS or a one-item IN (`operand`), the right one only when the
+/// IS or a one-item [NOT] IN (`operand`), the right one only when the
 /// left one is not of TEXT affinity. Subqueries are left as they
 /// are (no constant term holds one).
 fn propagate(e: &mut RExpr, binds: &[ConstBind], i: usize, operand: bool) {
@@ -8110,7 +8214,8 @@ fn propagate(e: &mut RExpr, binds: &[ConstBind], i: usize, operand: bool) {
         }
         return;
     }
-    let one = matches!(e, RExpr::InList(_, l, false, false) if l.len() == 1);
+    // `x [NOT] IN (c)` is the pin's `[NOT] x = +c` (`in_one`).
+    let one = in_one(e).is_some();
     let mut kids: AVec<(&mut RExpr, bool)> = AVec::new();
     match e {
         RExpr::Binary(

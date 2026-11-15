@@ -5343,6 +5343,15 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::MisusedWindow,
             });
         }
+        // Only GROUP BY or an aggregate in the result list makes
+        // the query an aggregate one (v0.16 fix, ungated: an
+        // aggregate in ORDER BY alone is the pin's "misuse of
+        // aggregate" — hipp aggregated the query to one row).
+        // HAVING needs one of them already (checked above).
+        // (An EXISTS's inert aggregate counts here: the pin
+        // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
+        // t` to one row.)
+        let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
         // A compound head's ORDER BY resolves against the
         // combined result (comp_order), not this core's rows,
         // so the term loop is skipped for it.
@@ -5355,6 +5364,14 @@ impl<S: Storage> Connection<S> {
             // Window calls are allowed in ORDER BY terms too.
             #[cfg(feature = "window")]
             cur.win.ok.set(true);
+            // An ORDER BY the pin never codes (a FROM-less core's, an
+            // aggregate one's without GROUP BY: see below) raises none
+            // of its code-generation errors (v0.17 review fix:
+            // `SELECT 1 ORDER BY (1,2)` is 1 there; `query::late`).
+            #[cfg(feature = "sql")]
+            if group_by.is_empty() && (sources.is_empty() || has_agg) {
+                cur.late.set(Some(None));
+            }
             for (e, dir) in stmt.order_by.iter() {
                 let r = self.resolve_term(
                     e,
@@ -5382,6 +5399,8 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "window")]
             cur.win.ok.set(false);
         }
+        #[cfg(feature = "sql")]
+        let late = cur.late.take().flatten();
         #[cfg(feature = "fts5")]
         if rank_order {
             order_by.clear();
@@ -5409,15 +5428,6 @@ impl<S: Storage> Connection<S> {
         {
             return Err(Error::Unsupported);
         }
-        // Only GROUP BY or an aggregate in the result list makes
-        // the query an aggregate one (v0.16 fix, ungated: an
-        // aggregate in ORDER BY alone is the pin's "misuse of
-        // aggregate" — hipp aggregated the query to one row).
-        // HAVING needs one of them already (checked above).
-        // (An EXISTS's inert aggregate counts here: the pin
-        // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
-        // t` to one row.)
-        let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
         // An auxiliary function in an aggregate query over a
         // full-text table: the pin's columns there are aggregate
         // columns, which xFindFunction does not overload ("unable to
@@ -5471,20 +5481,30 @@ impl<S: Storage> Connection<S> {
         let plain = crate::window::calls(items.as_slice(), order_by.as_slice()).is_empty();
         #[cfg(not(feature = "window"))]
         let plain = true;
-        if has_agg && group_by.is_empty() && plain && !order_by.is_empty() {
+        // A core over no table keeps only the enclosing queries'
+        // aggregates of its ORDER BY (v0.17 review fix: `SELECT
+        // (SELECT 1 ORDER BY sum(t.a)) FROM t` is one row; see
+        // `query::dropped_term_aggs`, which lifts one inside a
+        // subquery of the term too). A window query keeps it (see
+        // above).
+        let dropped = plain && group_by.is_empty() && (has_agg || free);
+        if dropped && !order_by.is_empty() {
             let mut kept: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
             for (e, o) in order_by.iter() {
                 let mut aggs = AVec::new();
-                crate::query::collect_outer_aggs(e, &mut aggs);
+                crate::query::dropped_term_aggs(e, has_agg, &mut aggs);
                 for a in aggs {
-                    kept.push((a.clone(), *o));
+                    kept.push((a, *o));
                 }
             }
             order_by = kept;
         }
-        // (A window query keeps it: see above.)
-        if free && plain {
-            order_by.clear();
+        // A code-generation error of a term the pin codes after all.
+        #[cfg(feature = "sql")]
+        if let Some(kind) = late
+            && !dropped
+        {
+            return Err(Error::Schema { kind });
         }
         cur.aliases.clear();
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
@@ -13884,6 +13904,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 );
             }
         }
+        let lazy = lazy_aggs(qp.items.as_slice(), qp.order_by.as_slice());
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
@@ -13909,17 +13930,24 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
-                // Every aggregate of the group finalizes before its
-                // HAVING runs, the HAVING's own included (its AND / OR
-                // then stop early over the values).
+            }
+            // Every aggregate of the group finalizes before its HAVING
+            // runs, the HAVING's own included (its AND / OR then stop
+            // early over the values), or before result terms that may
+            // skip one (`lazy_aggs`).
+            if qp.having.is_some() || lazy {
                 let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
-                crate::query::collect_outer_aggs(h, &mut aggs);
+                if let Some(h) = &qp.having {
+                    crate::query::collect_outer_aggs(h, &mut aggs);
+                }
                 for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
-                    continue;
-                }
+            }
+            if let Some(h) = &qp.having
+                && !self.cond_group_sub(h, grows.as_slice(), &rep).await?
+            {
+                continue;
             }
             #[cfg(feature = "window")]
             if !wins.is_empty() {
@@ -14118,6 +14146,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 );
             }
         }
+        let lazy = lazy_aggs(plan.items.as_slice(), plan.order_by.as_slice());
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
@@ -14143,14 +14172,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
+            }
+            if plan.having.is_some() || lazy {
                 let mut aggs = group_aggs(plan.items.as_slice(), plan.order_by.as_slice());
-                crate::query::collect_outer_aggs(h, &mut aggs);
+                if let Some(h) = &plan.having {
+                    crate::query::collect_outer_aggs(h, &mut aggs);
+                }
                 for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
-                    continue;
-                }
+            }
+            if let Some(h) = &plan.having
+                && !self.cond_group_sub(h, grows.as_slice(), &rep).await?
+            {
+                continue;
             }
             #[cfg(feature = "window")]
             if !wins.is_empty() {
@@ -15328,6 +15363,20 @@ pub(crate) fn group_aggs<'x>(
     aggs
 }
 
+/// Whether a group computes its aggregates before its result terms
+/// even without HAVING (v0.17 review fix, ungated): a term holds one
+/// that evaluation may skip (`query::agg_skippable`). The pin steps
+/// every aggregate for every row, so `SELECT sum(<overflow>) AND (0
+/// OR 0)` fails there; hipp computed only what the term read, and
+/// answered 0.
+#[cfg(feature = "query")]
+pub(crate) fn lazy_aggs(items: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> bool {
+    items
+        .iter()
+        .chain(order_by.iter().map(|(e, _)| e))
+        .any(crate::query::agg_skippable)
+}
+
 /// Whether a grouped query's ORDER BY is its GROUP BY (the pin's
 /// `orderByGrp`, v0.17 review fix): each term the GROUP BY term in
 /// its position, compared as `sqlite3ExprListCompare` does
@@ -16063,6 +16112,7 @@ fn project_rows<E>(
             );
         }
     }
+    let lazy = lazy_aggs(qp.items.as_slice(), qp.order_by.as_slice());
     for (_, grows) in groups.iter() {
         if cap.is_some_and(|c| out.len() >= c) {
             break;
@@ -16079,16 +16129,23 @@ fn project_rows<E>(
             if !pass {
                 continue;
             }
-            // Every aggregate of the group, the HAVING's included,
-            // finalizes before the HAVING runs.
+        }
+        // Every aggregate of the group, the HAVING's included,
+        // finalizes before the HAVING runs (or before result terms
+        // that may skip one: `lazy_aggs`).
+        if qp.having.is_some() || lazy {
             let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
-            crate::query::collect_outer_aggs(h, &mut aggs);
+            if let Some(h) = &qp.having {
+                crate::query::collect_outer_aggs(h, &mut aggs);
+            }
             for a in aggs.iter() {
                 crate::query::eval::<E>(a, &ctx)?;
             }
-            if !crate::query::cond::<E>(h, &ctx)? {
-                continue;
-            }
+        }
+        if let Some(h) = &qp.having
+            && !crate::query::cond::<E>(h, &ctx)?
+        {
+            continue;
         }
         let mut vals = AVec::new();
         for it in qp.items.iter() {

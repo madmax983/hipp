@@ -27,6 +27,11 @@
 //! - An empty statement (`;`, `;;`, blanks and comments) prepares to
 //!   a statement that does nothing; `EXPLAIN QUERY PLAN` of one is a
 //!   syntax error.
+//! - Review fixes: a dropped ORDER BY keeps an enclosing query's
+//!   aggregates (its owner aggregates) and raises none of the pin's
+//!   code-generation errors; `c IN (col)` fixes nothing, a CAST item
+//!   loses its affinity, `x NOT IN (c)` makes `x` an `=` operand; a
+//!   group computes every aggregate a result term may skip.
 //!
 //! Each query runs on hipp and on the pin over copies of one file and
 //! must give the same rows in the same order and the same success (an
@@ -504,6 +509,146 @@ fn and_or_simplification_matches_the_pin() {
     );
 }
 
+// ------------------------------------------------------- review fixes
+
+/// Shapes behind the review findings on this unit (v0.17 review
+/// fixes): an enclosing query's aggregate in a FROM-less core's
+/// dropped ORDER BY still makes that query an aggregate one (one row)
+/// and still steps; `c IN (col)` fixes nothing; `x IN (CAST(c AS T))`
+/// fixes x (the `+` drops the item's affinity); `x NOT IN (c)` makes
+/// x an `=` operand; every aggregate of a group steps whatever its
+/// result terms read (`sum(BAD) AND (0 OR 0)` fails); and a dropped
+/// ORDER BY raises none of the pin's code-generation errors.
+#[test]
+fn review_fixes_match_the_pin() {
+    corpus_bad(
+        "CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(3); \
+         CREATE TABLE u(b); INSERT INTO u VALUES(1);",
+        "rfa",
+        &[
+            "SELECT (SELECT 1 ORDER BY sum(t.a)) FROM t",
+            "SELECT a, (SELECT 1 ORDER BY max(t.a)) FROM t",
+            "SELECT (SELECT DISTINCT 1 ORDER BY sum(t.a)) FROM t",
+            "SELECT (SELECT 1 ORDER BY sum(t.a) LIMIT 1) FROM t",
+            "SELECT (SELECT 1 ORDER BY sum(t.a) LIMIT 0) FROM t",
+            "SELECT (SELECT 1 ORDER BY sum(t.a) + BAD) FROM t",
+            "SELECT (SELECT (SELECT 1 ORDER BY sum(t.a))) FROM t",
+            "SELECT (SELECT 1 ORDER BY (SELECT sum(t.a))) FROM t",
+            "SELECT (SELECT 1 ORDER BY (SELECT sum(t.a)) + BAD) FROM t",
+            "SELECT (SELECT count(*) ORDER BY (SELECT sum(t.a))) FROM t",
+            "SELECT (SELECT count(*) FROM u ORDER BY (SELECT sum(t.a))) FROM t",
+            "SELECT (SELECT count(*) FROM u ORDER BY sum(t.a)) FROM t",
+            "SELECT (SELECT 1 ORDER BY sum(t.a)) FROM t GROUP BY a",
+            "SELECT 1 FROM t WHERE EXISTS(SELECT 1 ORDER BY sum(t.a))",
+            "SELECT a FROM t WHERE (SELECT 1 ORDER BY sum(t.a))",
+            "SELECT a FROM t ORDER BY (SELECT 1 ORDER BY sum(t.a))",
+            "SELECT (SELECT 2 ORDER BY count(*)) FROM t",
+            "SELECT (SELECT 1 UNION SELECT 2 ORDER BY sum(t.a)) FROM t",
+        ],
+    );
+    corpus_bad(
+        "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c TEXT, x); \
+         INSERT INTO t VALUES(5, 1, '1', 1), (1, 1, '5', 5), (2, 2, '2', x'01');",
+        "rfp",
+        &[
+            "SELECT * FROM t WHERE 5 IN (b) AND b < 5 AND BAD",
+            "SELECT * FROM t WHERE 5 IN (a) AND abs(a - 5 - 9223372036854775807 - 1)",
+            "SELECT * FROM t WHERE 5 IN (a) AND a < 5 AND BAD",
+            "SELECT * FROM t WHERE '1' IN (c) AND c < '1' AND BAD",
+            "SELECT * FROM t WHERE b IN (a) AND b < 5 AND BAD",
+            "SELECT * FROM t WHERE a IN (CAST(5 AS INT)) AND a < 5 AND BAD",
+            "SELECT * FROM t WHERE c IN (CAST(1 AS INT)) AND c < '1' AND BAD",
+            "SELECT * FROM t WHERE b IN (CAST('1' AS TEXT)) AND b < 1 AND BAD",
+            "SELECT * FROM t WHERE x = 1 AND x NOT IN (1) AND BAD",
+            "SELECT * FROM t WHERE x = 1 AND x NOT IN (2) AND BAD",
+            "SELECT * FROM t WHERE x = 1 AND x IN (1) AND BAD",
+            "SELECT * FROM t WHERE x = 1 AND NOT x IN (1) AND BAD",
+            "SELECT * FROM t WHERE x = 1 AND x NOT IN (1, 2) AND BAD",
+            "SELECT * FROM t WHERE x = 1 AND x NOT IN (b) AND BAD",
+            "SELECT * FROM t WHERE b = 1 AND b NOT IN (1) AND BAD",
+            "SELECT * FROM t WHERE a = 5 AND a NOT IN (5) AND BAD",
+            "SELECT * FROM t WHERE x IN (random()) AND x < 1 AND BAD",
+        ],
+    );
+    corpus_bad(
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES(1, 1), (2, 1), (3, 2);",
+        "rfg",
+        &[
+            "SELECT sum(BAD) AND (0 OR 0)",
+            "SELECT total(BAD) OR (1 AND 1)",
+            "SELECT group_concat(BAD) AND (1 AND 0)",
+            "SELECT sum(BAD) AND 0",
+            "SELECT 0 AND sum(BAD)",
+            "SELECT 1 OR max(BAD)",
+            "SELECT CASE WHEN 1 THEN 2 ELSE sum(BAD) END",
+            "SELECT coalesce(1, sum(BAD)), iif(1, 2, sum(BAD))",
+            "SELECT 1 IN (1, sum(BAD))",
+            "SELECT likely(1) OR sum(BAD)",
+            "SELECT 0 AND sum(BAD) WHERE 0",
+            "SELECT 0 AND sum(BAD) WHERE 1",
+            "SELECT (SELECT sum(BAD) AND (0 OR 0)) FROM t",
+            "SELECT (SELECT coalesce(1, sum(BAD))) FROM t",
+            "SELECT 1 WHERE EXISTS(SELECT coalesce(1, sum(BAD)))",
+            "SELECT coalesce(1, sum(BAD)) FROM t",
+            "SELECT coalesce(1, sum(BAD)) FROM t WHERE 0",
+            "SELECT b, coalesce(1, sum(BAD)) FROM t GROUP BY b",
+            "SELECT b, 0 AND sum(a + 9223372036854775807) FROM t GROUP BY b",
+            "SELECT b FROM t GROUP BY b ORDER BY 0 AND sum(BAD)",
+            "SELECT b, CASE WHEN b = 1 THEN 0 ELSE max(BAD) END FROM t GROUP BY b",
+            "SELECT b, sum(a), count(*), coalesce(max(a), 0) FROM t GROUP BY b",
+            "SELECT (SELECT coalesce(1, sum(BAD)) FROM t GROUP BY b) FROM t",
+            "SELECT b FROM t GROUP BY b HAVING 0 AND sum(BAD)",
+        ],
+    );
+    corpus_bad(
+        "CREATE TABLE t(a); INSERT INTO t VALUES(1);",
+        "rfo",
+        &[
+            "SELECT 1 ORDER BY (1,2)",
+            "SELECT 1 ORDER BY (1,2) DESC",
+            "SELECT 1 ORDER BY 1, (1,2)",
+            "SELECT 1 ORDER BY (1,2) LIMIT 1",
+            "SELECT DISTINCT 1 ORDER BY (1,2)",
+            "SELECT (SELECT 1 ORDER BY (1,2))",
+            "SELECT 1 ORDER BY 1 + (1,2)",
+            "SELECT 1 ORDER BY CAST((1,2) AS INT)",
+            "SELECT 1 ORDER BY sum((1,2))",
+            "SELECT 1 ORDER BY raise(ignore)",
+            "SELECT 1 ORDER BY 1 + raise(abort, 'x')",
+            "SELECT 1 ORDER BY (SELECT raise(ignore))",
+            "SELECT 1 ORDER BY (SELECT 1, 2)",
+            "SELECT 1 ORDER BY (VALUES(1, 2))",
+            "SELECT 1 ORDER BY 1 IN (SELECT 1, 2)",
+            "SELECT 1 ORDER BY (1,2) IN (SELECT 1, 2, 3)",
+            "SELECT 1 ORDER BY (SELECT (1,2))",
+            "SELECT 1 ORDER BY EXISTS(SELECT (1,2))",
+            "SELECT 1 ORDER BY (SELECT 1 UNION SELECT (1,2))",
+            "SELECT count(*) ORDER BY (1,2)",
+            "SELECT count(*) ORDER BY raise(ignore)",
+            "SELECT count(*) FROM t ORDER BY (1,2)",
+            "SELECT count(*) FROM t ORDER BY (SELECT 1, 2)",
+            "SELECT count(*) FROM t ORDER BY sum(a) + (1,2)",
+            "SELECT (SELECT 1 ORDER BY sum(t.a) + (1,2)) FROM t",
+            // The pin raises these in resolution, or codes the term.
+            "SELECT 1 ORDER BY (1,2) = (1,2,3)",
+            "SELECT 1 ORDER BY (1,2) IN ((1,2,3))",
+            "SELECT 1 ORDER BY (1,2) + nosuchcol",
+            "SELECT 1 ORDER BY 'a' COLLATE bogus",
+            "SELECT 1 ORDER BY nosuchfn(1)",
+            "SELECT a FROM t ORDER BY (1,2)",
+            "SELECT a FROM t ORDER BY raise(ignore)",
+            "SELECT 1 GROUP BY 1 ORDER BY (1,2)",
+            "SELECT 1 UNION SELECT 2 ORDER BY (1,2)",
+            "SELECT row_number() OVER () ORDER BY (1,2)",
+            "SELECT (1,2)",
+            "SELECT 1 WHERE (1,2)",
+            "SELECT (SELECT 1, 2)",
+            "SELECT raise(ignore)",
+            "SELECT 1 LIMIT (1,2)",
+        ],
+    );
+}
+
 // ------------------------------------------------------------- generated
 
 /// A small deterministic generator (xorshift).
@@ -540,7 +685,7 @@ fn generated_where_clauses_match_the_pin() {
         for _ in 0..n {
             let c = rng.pick(&cols);
             let v = rng.pick(&vals);
-            let t = match rng.next() % 11 {
+            let t = match rng.next() % 15 {
                 0..=2 => format!("{c} = {v}"),
                 3 => format!("{c} < {v}"),
                 4 => format!("{c} >= {v}"),
@@ -549,6 +694,12 @@ fn generated_where_clauses_match_the_pin() {
                 7 => format!("{c} BETWEEN {v} AND 9"),
                 8 => format!("{c} LIKE '5'"),
                 9 => "BAD".to_string(),
+                // (v0.17 review fixes: a constant IN (column), a CAST
+                // item, NOT IN.)
+                10 => format!("{v} IN ({c})"),
+                11 => format!("{c} IN (CAST({v} AS INTEGER))"),
+                12 => format!("{c} NOT IN ({v})"),
+                13 => format!("{c} > {v} - 1"),
                 _ => format!("CASE {c} WHEN {v} THEN 0 ELSE 1 END"),
             };
             terms.push(t);
@@ -567,7 +718,20 @@ fn generated_where_clauses_match_the_pin() {
 #[test]
 fn generated_order_and_limit_match_the_pin() {
     let mut rng = Rng(0x0dd5_17a7_e017_0003);
-    let items = ["1", "1, 2", "'x'", "count(*)", "max(1)", "BAD", "a", "a, b"];
+    let items = [
+        "1",
+        "1, 2",
+        "'x'",
+        "count(*)",
+        "max(1)",
+        "BAD",
+        "a",
+        "a, b",
+        // (v0.17 review fixes: a neutral AND / OR operand beside an
+        // aggregate.)
+        "sum(BAD) AND (0 OR 0)",
+        "count(*) OR (1 AND 1)",
+    ];
     let orders = [
         "",
         "1",
@@ -577,6 +741,8 @@ fn generated_order_and_limit_match_the_pin() {
         "(SELECT BAD)",
         "json('x')",
         "2",
+        "(1, 2)",
+        "1, (1, 2)",
     ];
     let limits = [
         "",
@@ -610,12 +776,24 @@ fn generated_order_and_limit_match_the_pin() {
         // (Over a table, an ORDER BY led by the rowid is the pin's
         // scan order, so its later terms go uncomputed there: a
         // planner rule this unit does not take; STATUS.md.)
-        let o = if from && o == "1, BAD" { "BAD" } else { o };
+        let o = if from && (o == "1, BAD" || o == "1, (1, 2)") {
+            "BAD"
+        } else {
+            o
+        };
         if !o.is_empty() {
             q.push_str(" ORDER BY ");
             q.push_str(o);
         }
         let l = rng.pick(&limits);
+        // (The pin skips an OFFSET row before it computes the row's
+        // result columns; hipp computes a FROM-less core's first: an
+        // honest gap, STATUS.md.)
+        let l = if it.contains("BAD") && l == "LIMIT 2 OFFSET 1" {
+            "LIMIT 2"
+        } else {
+            l
+        };
         if !l.is_empty() {
             q.push(' ');
             q.push_str(l);
@@ -628,6 +806,83 @@ fn generated_order_and_limit_match_the_pin() {
         qs.push(q.replace("BAD", BAD));
     }
     let bad = diffs(T, "go", &qs);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// Generated subqueries whose dropped ORDER BY holds an enclosing
+/// query's aggregate, a failing term or a row value, and grouped
+/// queries whose aggregates sit under AND / OR / CASE / coalesce
+/// (v0.17 review fixes), compared with the pin.
+#[test]
+fn generated_dropped_terms_match_the_pin() {
+    let mut rng = Rng(0x0b1e_c7ed_e017_0011);
+    let inner = [
+        "SELECT 1",
+        "SELECT DISTINCT 1",
+        "SELECT count(*)",
+        "SELECT max(b) FROM u",
+        "SELECT 2 WHERE 1",
+    ];
+    let orders = [
+        "sum(t.a)",
+        "max(t.a) + BAD",
+        "(SELECT sum(t.a))",
+        "BAD",
+        "(1, 2)",
+        "sum(t.a), (1, 2)",
+        "count(*)",
+        "1",
+        "min(t.a) DESC",
+    ];
+    let outer_tail = ["", " GROUP BY a", " WHERE a > 1", " WHERE 0"];
+    let wraps = [
+        "x",
+        "x AND (0 OR 0)",
+        "coalesce(x, sum(a))",
+        "CASE WHEN a > 0 THEN 1 ELSE x END",
+        "(1 AND 1) OR x",
+    ];
+    let mut qs = Vec::new();
+    for _ in 0..120 {
+        let mut sub = format!("{} ORDER BY {}", rng.pick(&inner), rng.pick(&orders));
+        if rng.next().is_multiple_of(3) {
+            sub.push_str(rng.pick(&[" LIMIT 1", " LIMIT 0", " LIMIT 1 OFFSET 0"]));
+        }
+        let x = format!("({sub})");
+        let w = rng.pick(&wraps).replace('x', &x);
+        let lead = rng.pick(&["", "a, ", "count(*), "]);
+        qs.push(format!("SELECT {lead}{w} FROM t{}", rng.pick(&outer_tail)));
+    }
+    for _ in 0..60 {
+        let agg = rng.pick(&[
+            "sum(BAD)",
+            "max(BAD)",
+            "count(*)",
+            "sum(a)",
+            "total(a + 9223372036854775807)",
+        ]);
+        let w = rng.pick(&wraps).replace('x', agg);
+        let tail = rng.pick(&[
+            "",
+            " FROM t",
+            " FROM t GROUP BY b",
+            " FROM t WHERE 0",
+            " WHERE 0",
+        ]);
+        let tail = if w.contains("a > 0") || w.contains("sum(a)") {
+            " FROM t GROUP BY b"
+        } else {
+            tail
+        };
+        qs.push(format!("SELECT {w}{tail}"));
+    }
+    let qs: Vec<String> = qs.iter().map(|q| q.replace("BAD", BAD)).collect();
+    let bad = diffs(
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES(1, 1), (2, 1), (3, 2); \
+         CREATE TABLE u(b); INSERT INTO u VALUES(1);",
+        "gd",
+        &qs,
+    );
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
 }
 

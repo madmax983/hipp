@@ -346,6 +346,105 @@ in `session/join.rs` is `planner`-only, so sharing it would save in
   shell takes it as an option (`-- only` is "unknown option")
   (closed in v0.17: `gaps_plan_cli`).
 
+**Review fixes (2026-11-15).** Seven findings, each reproduced and
+probed on the live pin before the fix (all ungated: they are wrong
+answers or refusals on claimed paths).
+1. **An enclosing query's aggregate in a dropped ORDER BY still
+   aggregates its owner** (regression of item 3: `SELECT (SELECT 1
+   ORDER BY sum(t.a)) FROM t` gave one row per row of t; the pin one).
+   The drop keeps each such aggregate as a term at the core's level
+   (`query::dropped_term_aggs`, lifted out of a subquery of the term
+   too), inert as an EXISTS subquery's are: it makes the owner an
+   aggregate query and is no misuse where the pin never codes it
+   (`SELECT a FROM t WHERE (SELECT 1 ORDER BY sum(t.a))` is three
+   rows on the pin). The aggregate-without-GROUP-BY drop takes the
+   same rule (`SELECT (SELECT count(*) FROM u ORDER BY (SELECT
+   sum(t.a))) FROM t` was three rows too, pre-existing).
+2. **`c IN (col)` fixes nothing** (regression of item 5: `5 IN (b)`
+   bound `b := 5`). The pin's parser makes `x IN (c)` into `x = +c`
+   only for a constant item and no row value (`query::in_one`), so
+   only `x` is fixed, never the item.
+3. **A neutral AND / OR operand beside an aggregate no longer skips
+   it** (regression of item 6, and pre-existing for `0 AND sum(..)`,
+   CASE, coalesce / iif, IN lists, likely, in FROM-less and GROUP BY
+   groups): the pin steps every aggregate for every row, so `SELECT
+   sum(abs(-9223372036854775808)) AND (0 OR 0)` fails there. A group
+   whose result terms hold an aggregate evaluation may skip
+   (`query::agg_skippable`; a lazy node's first operand is always
+   computed, so `coalesce(sum(x), 0)` is not one) finalizes every
+   aggregate first, in the loop that already did so before HAVING
+   (`session::lazy_aggs`; all three group executors and the VM's
+   codegen).
+4. **`x IN (CAST(c AS T))` fixes `x`**: the `+` of the rewrite leaves
+   the item no affinity, so the affinity check skips a one-item IN.
+5. **`x NOT IN (c)` makes `x` an `=` operand** (the pin's `NOT(x =
+   +c)`): a BLOB-affinity column fixed elsewhere is rewritten there.
+6. **A dropped ORDER BY raises none of the pin's code-generation
+   errors**: a row value out of place, RAISE outside a trigger, a
+   subquery of the wrong width (`SELECT 1 ORDER BY (1,2)`, `ORDER BY
+   raise(ignore)`, `ORDER BY (SELECT 1, 2)`, `SELECT count(*) FROM t
+   ORDER BY (1,2)` all answer on the pin). While such an ORDER BY
+   resolves (FROM-less or aggregate core, no GROUP BY;
+   `ScopeGroup::late`), the first such error waits and the term
+   stands as NULL; it is raised if the term is coded after all (a
+   window query). Resolution errors stay (`(1,2) = (1,2,3)`, `(1,2)
+   IN ((1,2,3))`, `(1,2) + nosuchcol`, an unknown collation or
+   function).
+7. **Tests** for each shape (`review_fixes_match_the_pin`, 100
+   shapes; `generated_dropped_terms_match_the_pin`, 180 generated
+   queries; the WHERE generator now writes `c IN (col)`, CAST items
+   and NOT IN; the ORDER BY generator neutral AND / OR beside
+   aggregates and row values; `review_fixes_render_like_the_pin` in
+   `hipp-cli/tests/cli_v17_eval_gaps.rs`).
+
+Probing notes (live pin): `SELECT (SELECT 1 ORDER BY sum(t.a)) FROM
+t` 1, its DISTINCT / LIMIT / nested / `(SELECT sum(t.a))` forms 1,
+`... GROUP BY a` three rows; in a WHERE or the outer ORDER BY three
+rows (no misuse); `(SELECT 1 ORDER BY sum(abs(t.a - 9223372036854775807
+- 3))) FROM t` fails (stepped). `5 IN (b) AND b < 5 AND abs(..)` fails;
+`5 IN (a) AND abs(a - 5 - 9223372036854775807 - 1)` no row; `a IN
+(CAST(5 AS INT)) AND a < 5 AND abs(..)` and `x = 1 AND x NOT IN (1)
+AND abs(..)` (no affinity) no row. `sum(abs(..)) AND (0 OR 0)`, `0 AND
+sum(abs(..))`, `1 OR max(abs(..))`, `CASE WHEN 1 THEN 2 ELSE
+sum(abs(..)) END`, `coalesce(1, sum(abs(..)))`, with or without a
+table or GROUP BY, all fail; `... FROM t WHERE 0` and `WHERE 0` answer
+(no row stepped). `SELECT 1 ORDER BY (1,2)`, `1 + (1,2)`, `CAST((1,2)
+AS INT)`, `sum((1,2))`, `(SELECT (1,2))`, `EXISTS(SELECT (1,2))`,
+`raise(ignore)`, `(SELECT 1, 2)`, `1 IN (SELECT 1, 2)`, `(1,2) IN
+(SELECT 1, 2, 3)`, `count(*) ORDER BY (1,2)` all 1; `SELECT a FROM t
+ORDER BY (1,2)`, `GROUP BY 1 ORDER BY (1,2)`, `row_number() OVER ()
+ORDER BY (1,2)` and the resolution errors above fail.
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` workspace suite included); `tests/depth_v16.rs`
+and `tests/triggers_v16.rs` with debug info: pass.
+
+Size Δ of the review fixes: tiny 0 (76,904); full +864 (479,364 →
+480,228); max +888 (966,648 → 967,536); xl +752 (1,063,848 →
+1,064,600). Ratchets raised to the measured figures with a
+justification (`ci/size-ratchet.toml`); offsets taken on the way:
+`has_agg` reused for the ORDER BY rule (-80 B on full) and one
+finalize loop for HAVING and the skippable aggregates (-248 B).
+
+Honest gaps the review fixes leave (new or found on the way):
+- An enclosing query's aggregate in a dropped ORDER BY (and in an
+  EXISTS subquery's result list, pre-existing) is inert: the pin
+  still steps it in an aggregate owner, so `SELECT (SELECT 1 ORDER BY
+  sum(abs(t.a - 9223372036854775807 - 3))) FROM t` fails there and
+  answers 1 in hipp. Stepping inert aggregates would change the VM's
+  frozen subquery codegen too.
+- A group that finalizes its aggregates first computes the ones its
+  terms then read twice (no cache); only groups with an aggregate in
+  a skippable position pay it.
+- The pin skips an OFFSET row before computing its result columns;
+  hipp computes a FROM-less core's (and a subquery's over a table, and
+  a UNION ALL arm's) first, so `SELECT abs(-9223372036854775808)
+  LIMIT 1 OFFSET 1` fails where the pin returns no row (pre-existing;
+  a top-level query over a table already matches).
+- Inside a dropped ORDER BY, a nested window query that keeps its
+  own ORDER BY still raises that ORDER BY's code-generation error,
+  though the pin never codes the outer term (not probed further).
+
 ### A smaller VM: slim_design (2026-11-12)
 
 Wave 16's first unit (owner decision 2026-11-12, after `s3_probe`

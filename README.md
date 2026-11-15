@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 479,364 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 966,648 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,063,848 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 480,228 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 967,536 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,064,600 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -93,9 +93,12 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   (not even its OFFSET); the WHERE clause's constant propagation
   covers the rowid, non-literal constants, one-item IN lists and every
   operand kind, so `WHERE a = 5 AND a < 5 AND <failing constant>` is
-  no row; AND / OR drop a neutral operand (`x AND (0 OR 0)` is 0);
-  and empty statements (`;`, `;;`, comments) do nothing, in the
-  library and in the CLI's scripts.
+  no row; AND / OR drop a neutral operand (`x AND (0 OR 0)` is 0)
+  while a group still computes every aggregate, as the pin steps
+  them; a dropped ORDER BY raises none of the pin's code-generation
+  errors (`SELECT 1 ORDER BY (1,2)` is 1); and empty statements (`;`,
+  `;;`, comments) do nothing, in the library and in the CLI's
+  scripts.
 - **Streamed rows.** A top-level SELECT hands its rows to
   `Statement::step` one at a time, as the pin does: the join is a
   resumable nested loop whose first source is read through its

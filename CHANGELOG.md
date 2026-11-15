@@ -59,6 +59,19 @@ All notable changes to hipp. Versions follow the milestones in
 - Sizes: tiny 76,904 (0), full 479,332 (+776), max 965,876 (+680), xl
   1,062,520 (+656). Tests: `tests/eval_gaps_v17.rs`,
   `hipp-cli/tests/cli_v17_eval_gaps.rs`.
+- Review fixes (ungated): an enclosing query's aggregate in a dropped
+  ORDER BY still makes that query an aggregate one (`SELECT (SELECT 1
+  ORDER BY sum(t.a)) FROM t` is one row again; no misuse in a WHERE);
+  `5 IN (b)` no longer fixes `b` in the constant propagation, a
+  one-item `x IN (CAST(c AS T))` fixes `x` and `x NOT IN (c)` makes
+  `x` an `=` operand; a group computes every aggregate a result term
+  may skip (an AND / OR, CASE or IN-list operand, a later coalesce /
+  iif / likely argument) before its terms, so `SELECT
+  sum(<overflow>) AND (0 OR 0)` fails as on the pin (the VM too); a
+  dropped ORDER BY raises none of the pin's code-generation errors
+  (`SELECT 1 ORDER BY (1,2)`, `ORDER BY raise(ignore)`, `SELECT
+  count(*) FROM t ORDER BY (SELECT 1, 2)` answer). Sizes: tiny 0,
+  full +864 B, max +888 B, xl +752 B (ratchets raised).
 
 ### The bytecode VM migration stopped (owner decision, 2026-11-15)
 
