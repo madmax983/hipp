@@ -414,3 +414,27 @@ unchanged at 852,164 B.
 Size gates: tiny unchanged (no `indexes`); full +288 B, max +464 B,
 xl +472 B; ratchets raised by those amounts (each well under
 `justify_over`).
+
+## leaf_cells_meta grows its cell table one regrowth at a time (baseline at b0c69c5)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every table
+INSERT validates the target leaf with `leaf_cells_meta`, which pushes
+one 56-byte `CellMeta` per cell into an `AVec::new()`: a leaf of ~124
+cells regrows 4 -> 8 -> ... -> 128 (6 reallocations, each copying the
+table so far), and dhat counts every one of those blocks' bytes.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 187,442,516   |
+| 1000 | 440,999,108   |
+| 2000 | 1,114,110,743 |
+
+n=1000 profile: `btree_insert` inclusive 69,096,129 (15.67%);
+`leaf_cells_meta` inclusive 36,477,188 (8.27%; 2,004 calls from
+`btree_insert`, 249,028 cells, ~146 Ir per cell), of which the cell
+table's regrowth (`grow_one` -> `finish_grow`, 12,035 calls) is
+~6.1M (1.38%). dhat (n=1000): 437,354 blocks, 133,470,797 bytes;
+t-gmax 852,164 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
