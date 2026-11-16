@@ -867,6 +867,16 @@ pub struct SelectStmt {
     /// planned for a merge key (`session::merge_member`).
     #[cfg(feature = "expr_index")]
     pub first_row: bool,
+    /// A multi-row VALUES core the pin reads as a chain of one-row
+    /// selects joined by UNION ALL, not as one VALUES co-routine
+    /// (v0.17 review fix, `sql`; `sqlite3MultiValues`): after a WITH
+    /// clause began, in a view's text, when the first row has an
+    /// item with an affinity (a CAST) or a later row an item that is
+    /// not constant (a column, a function call, a subquery). It
+    /// decides the core's part in a compound's column affinity
+    /// (`rules::compound_affinity`).
+    #[cfg(feature = "sql")]
+    pub vchain: bool,
 }
 
 /// A statement conflict-resolution clause (v0.7): the `OR ...`

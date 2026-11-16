@@ -80,7 +80,11 @@ justify_over = 4096
 # every aggregate a result term may skip (`lazy_aggs`, shared with the
 # HAVING finalize loop and mirrored in the VM). Offsets taken (on full): has_agg
 # reused for the ORDER BY rule (-80 B), one finalize loop (-248 B).
-ratchet = 480228
+# 480,228 -> 481,048 (v0.17 gaps_plan_cli review fixes, ungated correctness;
+# STATUS.md): +820 B. Compound column types over VALUES / window arms
+# (`vchain`, `chain_reals`), the parser's `x AND 0` fold. Offset taken:
+# `compound_affinity` made non-generic and out of line (-2,237 B).
+ratchet = 481048
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -148,7 +152,9 @@ justify_over = 16384
 # every aggregate a result term may skip (`lazy_aggs`, shared with the
 # HAVING finalize loop and mirrored in the VM). Offsets taken (on full): has_agg
 # reused for the ORDER BY rule (-80 B), one finalize loop (-248 B).
-ratchet = 967536
+# 967,536 -> 968,448 (v0.17 gaps_plan_cli review fixes, ungated correctness;
+# STATUS.md): +912 B, the `full` fixes above. Same offset taken.
+ratchet = 968448
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -209,7 +215,12 @@ justify_over = 32768
 # every aggregate a result term may skip (`lazy_aggs`, shared with the
 # HAVING finalize loop and mirrored in the VM). Offsets taken (on full): has_agg
 # reused for the ORDER BY rule (-80 B), one finalize loop (-248 B).
-ratchet = 1064600
+# 1,064,600 -> 1,066,700 (v0.17 gaps_plan_cli review fixes, ungated
+# correctness; STATUS.md): +2,100 B. The `max` fixes, and the `planner`
+# ones: push-down past VALUES arms (a UNION's VALUES collations checked),
+# `x OR 0` after constant propagation, CROSS JOIN prerequisites, a LEFT
+# JOIN's constant ON term. Same offset.
+ratchet = 1066700
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

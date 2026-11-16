@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 480,228 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 967,536 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,064,600 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 481,048 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 968,448 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,066,700 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -85,7 +85,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   input needs it, so `--help` no longer makes a file; its `.dump` is
   the pin's byte for byte (the `PRAGMA foreign_keys=OFF;` header,
   `%.16g` reals, `unistr()` text, quoted names, `sqlite_sequence`,
-  `sqlite_stat1`).
+  `sqlite_stat1`). Its review fixes type compound columns over VALUES
+  and window arms as the pin does, keep the pin's join order after a
+  CROSS JOIN and around `x OR 0`, fold `x AND 0` to 0 as the pin's
+  parser does, and make `.quit` / `.exit` open no database.
 - **Evaluator and statement-level parity** (unit `gaps_eval`,
   ungated; empty statements on `sql`). `hex(NULL)` is `''` and
   `substr` of an empty BLOB is NULL, as on the pin; a FROM-less core
@@ -1568,7 +1571,8 @@ line (v0.17: `hipp [OPTIONS] [FILENAME [SQL...]]`, `-help`,
 `.schema`, `.dump`, `.open`, `.databases` (v0.16, with attached
 databases in `.schema` / `.tables`), `.parameter` (v0.16: `set`,
 `unset`, `clear`, `list`, `init`, bound by name as the oracle
-shell binds them), `.exit`. Its first job is
+shell binds them), `.exit [N]` / `.quit` (v0.17: neither opens the
+database). Its first job is
 differential testing. It is a separate crate and contributes
 0 bytes to the core's tiny build.
 

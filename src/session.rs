@@ -3224,8 +3224,8 @@ impl<S: Storage> Connection<S> {
             // pin's FLEXNUM, declared ` NUM`.
             let aff = crate::rules::compound_affinity(
                 item.and_then(crate::query::item_result_affinity),
-                item,
-                plan.compound.iter().map(|(_, t)| &**t),
+                &plan,
+                plan.compound.as_slice(),
                 i,
             )
             .unwrap_or(Affinity::Blob);
@@ -3764,6 +3764,7 @@ impl<S: Storage> Connection<S> {
                 rec: None,
                 mat: 0,
                 real_cols: AVec::new(),
+                vchain: stmt.vchain,
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
                 #[cfg(feature = "planner")]
@@ -3825,6 +3826,8 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "sql")]
             real_cols: AVec::new(),
+            #[cfg(feature = "sql")]
+            vchain: false,
             #[cfg(feature = "explain")]
             sel: stmt.sel,
             #[cfg(feature = "planner")]
@@ -16418,11 +16421,6 @@ fn derived_col_affinity(
     i: usize,
     aff: Option<crate::record::Affinity>,
 ) -> crate::record::Affinity {
-    crate::rules::compound_affinity(
-        aff,
-        plan.items.as_slice().get(i),
-        plan.compound.iter().map(|(_, t)| &**t),
-        i,
-    )
-    .unwrap_or(crate::record::Affinity::Blob)
+    crate::rules::compound_affinity(aff, plan, plan.compound.as_slice(), i)
+        .unwrap_or(crate::record::Affinity::Blob)
 }

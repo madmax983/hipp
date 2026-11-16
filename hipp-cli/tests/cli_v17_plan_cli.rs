@@ -107,8 +107,9 @@ fn same_line(tag: &str, args: &[&str], input: &str, sql_error: bool) {
 }
 
 /// `-help` and `-version` behave as the pin's: the channel, the exit
-/// status, no file; the usage's first line and option layout and the
-/// version's first word are the pin's.
+/// status, no file; the usage text is the pin's byte for byte (the
+/// program's name aside; v0.17 review fix: hipp listed only its own
+/// three options) and the version's first word is the pin's.
 #[test]
 fn help_and_version_make_no_file() {
     for args in [
@@ -127,13 +128,8 @@ fn help_and_version_make_no_file() {
             String::from_utf8_lossy(&h.stderr),
             String::from_utf8_lossy(&o.stderr),
         );
-        let first = |s: &str, b: &Path| {
-            s.lines()
-                .next()
-                .unwrap_or("")
-                .replace(b.to_string_lossy().as_ref(), "SHELL")
-        };
-        assert_eq!(first(&he, &hipp_bin()), first(&oe, &oracle()), "{args:?}");
+        let all = |s: &str, b: &Path| s.replace(b.to_string_lossy().as_ref(), "SHELL");
+        assert_eq!(all(&he, &hipp_bin()), all(&oe, &oracle()), "{args:?}");
         // The pin's lines for the options hipp takes, verbatim.
         for opt in ["   --  ", "   -help  ", "   -version  "] {
             let pick = |s: &str| s.lines().find(|l| l.starts_with(opt)).map(str::to_string);
@@ -231,6 +227,12 @@ fn the_database_opens_lazily() {
         "SELECT 1 -- a\n;\n",
         ".tables\n",
         "CREATE TABLE t(a);\n",
+        // (v0.17 review fix: these need no database.)
+        ".quit\n",
+        ".exit\n",
+        ".exit 3\n",
+        ".bogus\n",
+        "#a comment line\n",
     ]
     .iter()
     .enumerate()
@@ -500,6 +502,121 @@ fn planner_fixes_through_the_shell() {
     .enumerate()
     {
         let (hd, od) = (temp_dir(&format!("pf{i}-h")), temp_dir(&format!("pf{i}-o")));
+        let input = format!("{setup}\n{q}\n");
+        let h = run_in(&hipp_bin(), &hd, &["x.db"], &input);
+        let o = run_in(&oracle(), &od, &["x.db"], &input);
+        assert_eq!(
+            String::from_utf8_lossy(&h.stdout),
+            String::from_utf8_lossy(&o.stdout),
+            "{q}"
+        );
+        assert_eq!(h.status.code(), o.status.code(), "{q}");
+        assert_eq!(h.stderr.is_empty(), o.stderr.is_empty(), "{q}");
+    }
+}
+
+/// Review fixes on the shell's input, each compared with the pin's
+/// shell (exit status, stdout, stderr unless it is an SQL error's,
+/// files made):
+/// - `.quit` / `.exit` read no database: no file is made and a file
+///   that is not a database is not read (it was opened, made or
+///   refused with `BadMagic` before);
+/// - `.exit N` ends with status N (its low byte, `0x` hexadecimal
+///   too), `.quit N` with the session's;
+/// - a dot-command is a line whose first character is `.` (one with
+///   leading blanks is SQL, a syntax error); a `#` line between
+///   statements is skipped;
+/// - an unknown command is the pin's error, byte for byte.
+#[test]
+fn review_fixes_on_the_command_line() {
+    let stdin: &[(&str, &str, bool)] = &[
+        ("q", ".quit\n", false),
+        ("e", ".exit\n", false),
+        ("e3", ".exit 3\n", false),
+        ("e300", ".exit 300\n", false),
+        ("eneg", ".exit -1\n", false),
+        ("ehex", ".exit 0x10\n", false),
+        ("eabc", ".exit abc\n", false),
+        ("e23", ".exit 2 3\n", false),
+        ("q5", ".quit 5\n", false),
+        ("errexit", "SELECT nosuch;\n.exit\n", true),
+        ("errexit0", "SELECT nosuch;\n.exit 0\n", true),
+        ("errquit", "SELECT nosuch;\n.quit\n", true),
+        ("exitmid", "SELECT 1;\n.exit 4\nSELECT 2;\n", false),
+        ("bogus", ".bogus\n", false),
+        ("bogusarg", ".bogus x y\n", false),
+        ("lead", "  .tables\n", true),
+        ("tab", "\t.quit\n", true),
+        ("hash", "#foo\nSELECT 1;\n", false),
+        ("hashmid", "SELECT 1;\n# note\nSELECT 2;\n", false),
+        ("leadmid", "SELECT 1;\n  .quit\nSELECT 2;\n", true),
+        ("sameline", "SELECT 1; .tables\n", true),
+    ];
+    for (tag, input, sql_error) in stdin {
+        same_line(&format!("rf-{tag}"), &["x.db"], input, *sql_error);
+    }
+    let args: &[(&str, &[&str])] = &[
+        ("aq", &["y.db", ".quit"]),
+        ("ae", &["y.db", ".exit"]),
+        ("ae4", &["y.db", ".exit 4"]),
+        ("aqs", &["y.db", ".quit", "SELECT 1"]),
+        ("asqs", &["y.db", "SELECT 1", ".quit", "SELECT 2"]),
+        ("abogus", &["y.db", ".bogus"]),
+        ("atables", &["y.db", ".tables"]),
+    ];
+    for (tag, a) in args {
+        same_line(&format!("rf-{tag}"), a, "", false);
+    }
+    // A file that is no database: `.quit` / `.exit` never read it.
+    let junk: Vec<u8> = (0..5000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    for (tag, input) in [
+        ("badq", ".quit\n"),
+        ("bade", ".exit\n"),
+        ("badx", ".exit 2\n"),
+    ] {
+        let (hd, od) = (temp_dir(&format!("{tag}-h")), temp_dir(&format!("{tag}-o")));
+        std::fs::write(hd.join("bad.db"), &junk).expect("write");
+        std::fs::write(od.join("bad.db"), &junk).expect("write");
+        let h = run_in(&hipp_bin(), &hd, &["bad.db"], input);
+        let o = run_in(&oracle(), &od, &["bad.db"], input);
+        assert_eq!(h.status.code(), o.status.code(), "{input:?}");
+        assert_eq!(h.stdout, o.stdout, "{input:?}");
+        assert_eq!(h.stderr, o.stderr, "{input:?}");
+        assert_eq!(files(&hd), files(&od), "{input:?}");
+        assert_eq!(std::fs::read(hd.join("bad.db")).ok(), Some(junk.clone()));
+    }
+}
+
+/// The review's planner and compound fixes as the shell shows them.
+#[test]
+fn review_planner_fixes_through_the_shell() {
+    let setup = "CREATE TABLE t(r REAL, i INTEGER, s TEXT); \
+        INSERT INTO t VALUES (1.0, 1, '1'), (2.5, 2, '2'); CREATE TABLE u(y); \
+        INSERT INTO u VALUES (1), (2); CREATE TABLE c(c TEXT, k); \
+        CREATE TABLE n(n INTEGER, b); CREATE INDEX nn ON n(n); \
+        INSERT INTO c VALUES ('5', 1), ('05', 2), (5, 4); INSERT INTO n VALUES (5, 'x'), (5, 'y'); \
+        CREATE TABLE p(x, y); CREATE TABLE q(x PRIMARY KEY, y); CREATE TABLE w(x, y); \
+        CREATE INDEX px ON p(x); INSERT INTO p VALUES (1, 'p'), (2, 'q'), (2, 'r'); \
+        INSERT INTO q VALUES (1, 'c1'), (2, 'c2'), (9, 'c9'); INSERT INTO w VALUES (1, 1), (2, 2);";
+    for (i, q) in [
+        "WITH q(x) AS (VALUES (3), (4) UNION ALL SELECT s FROM t) SELECT x FROM q WHERE x = 2;",
+        "SELECT column1, typeof(column1) FROM (VALUES (1), ('1') UNION ALL SELECT r FROM t) WHERE column1 = 1;",
+        "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL SELECT row_number() OVER () FROM u);",
+        "SELECT typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (1), (2));",
+        "SELECT * FROM c, n WHERE c.c = n.n AND (n.n = 5 OR 0);",
+        "EXPLAIN QUERY PLAN SELECT * FROM c, n WHERE c.c = n.n AND (n.n = 5 OR 0);",
+        "SELECT q.x, w.x, p.y FROM q CROSS JOIN w JOIN p ON p.x = 2 LIMIT 4;",
+        "EXPLAIN QUERY PLAN SELECT * FROM q CROSS JOIN w JOIN p ON p.x = 1;",
+        "EXPLAIN QUERY PLAN SELECT * FROM p WHERE x = 2 AND 0;",
+        "SELECT nosuch AND 0;",
+        "SELECT sum(i) FROM t GROUP BY s AND 0;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (hd, od) = (temp_dir(&format!("rpf{i}-h")), temp_dir(&format!("rpf{i}-o")));
         let input = format!("{setup}\n{q}\n");
         let h = run_in(&hipp_bin(), &hd, &["x.db"], &input);
         let o = run_in(&oracle(), &od, &["x.db"], &input);

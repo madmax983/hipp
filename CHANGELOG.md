@@ -37,6 +37,25 @@ All notable changes to hipp. Versions follow the milestones in
   sqlite_schema;`.
 - Tests: `tests/plan_gaps_v17.rs`, `hipp-cli/tests/cli_v17_plan_cli.rs`.
 - Size: tiny 0, full +32 B, max +772 B, xl +1,328 B (ratchets raised).
+- Review fixes (ungated unless named): a compound's column type reads
+  a multi-row VALUES arm as the pin does (an untyped co-routine; after
+  a WITH clause, in a view or with a CAST first a chain of one-row
+  selects) and a window or LIKE arm as a function, so `WITH q(x) AS
+  (VALUES (3), (4) UNION ALL SELECT s FROM t) ... WHERE x = 2` no
+  longer matches `'2'` and a REAL column's VALUES / window rows stay
+  integers; `planner` push-down reaches the other arms of a compound
+  with VALUES arms (a one-row VALUES arm takes the term too); `x OR 0`
+  is simplified after constant propagation, sources after a CROSS JOIN
+  keep its prerequisites and a LEFT JOIN's constant ON term counts
+  against its table (join order and unordered row order as the pin's);
+  `x AND 0` is the literal 0 as the pin's parser writes it (`SELECT
+  nosuch AND 0` reads; `GROUP BY y AND 0` is out of range). hipp-cli:
+  `.quit` / `.exit` open no database (no file, a non-database file not
+  read), `.exit N` exits N, a one-shot `.` argument is one command, a
+  dot-command must start the line (`  .tables` is SQL), `#` lines are
+  skipped, an unknown command and `-help` print the pin's texts.
+  Review-fix sizes: tiny 0, full +820 B, max +912 B, xl +2,100 B
+  (ratchets raised; `compound_affinity` out of line as the offset).
 
 ### Evaluator and statement-level parity (wave 17, unit `gaps_eval`)
 

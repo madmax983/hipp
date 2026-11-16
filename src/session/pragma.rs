@@ -1160,8 +1160,8 @@ impl<S: Storage> Connection<S> {
                 });
                 let aff = crate::rules::compound_affinity(
                     item.and_then(|e| item_aff(&plan, e)),
-                    item,
-                    plan.compound.iter().map(|(_, t)| &**t),
+                    &plan,
+                    plan.compound.as_slice(),
                     i,
                 );
                 let z = item.and_then(|e| self.ztype(&plan, e));
@@ -1841,7 +1841,14 @@ fn item_aff(plan: &crate::query::SubPlan, e: &RExpr) -> Option<Affinity> {
                                 .first()
                                 .and_then(|r| r.as_slice().get(k))
                         })?;
-                        return item_aff(d, it);
+                        // (A compound's column: its cores' affinity,
+                        // v0.17 review fix.)
+                        return crate::rules::compound_affinity(
+                            item_aff(d, it),
+                            d,
+                            d.compound.as_slice(),
+                            k,
+                        );
                     }
                     break;
                 }

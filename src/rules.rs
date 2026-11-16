@@ -1185,7 +1185,10 @@ pub fn item_datatype(e: &RExpr) -> u8 {
         RExpr::Literal(OwnedValue::Text(_)) => 0x02,
         RExpr::Literal(OwnedValue::Blob(_)) => 0x04,
         RExpr::Binary(crate::sql::BinOp::Concat, ..) => 0x06,
-        RExpr::Scalar(..) | RExpr::Agg { .. } => 0x07,
+        // (A window call and LIKE / GLOB are the pin's TK_FUNCTION
+        // too: v0.17 review fix, a window arm no longer reads as a
+        // REAL column's integers.)
+        RExpr::Scalar(..) | RExpr::Agg { .. } | RExpr::Like(..) | RExpr::Win(..) => 0x07,
         RExpr::Column(..) | RExpr::Cast(..) | RExpr::Rowid(_) | RExpr::SubScalar(_) => {
             match item_affinity(e) {
                 Affinity::Numeric | Affinity::Integer | Affinity::Real => 0x05,
@@ -1216,51 +1219,117 @@ pub fn item_datatype(e: &RExpr) -> u8 {
 /// of the other class (a TEXT column with a numeric item elsewhere,
 /// a numeric one with a text item), and a numeric CAST in the
 /// leftmost core becoming NUMERIC (the pin's FLEXNUM). `head` is the
-/// leftmost core's item, `tails` the later cores; `None` when no
-/// core's item has an affinity.
+/// leftmost core, `tails` the later cores; `None` when no core's
+/// item has an affinity.
+///
+/// A multi-row VALUES core (v0.17 review fix) is what the pin's
+/// `sqlite3MultiValues` makes of it: a co-routine, one item of no
+/// affinity that can be anything (`0x07`, demoting any other
+/// affinity); or, when it reads as a chain (`SubPlan::vchain`), its
+/// rows as cores of their own at the left of the compound, or else a
+/// subquery whose one column has the chain's own compound affinity.
 #[cfg(feature = "sql")]
-pub fn compound_affinity<'p>(
+#[inline(never)]
+pub fn compound_affinity(
     aff: Option<Affinity>,
-    head: Option<&RExpr>,
-    tails: impl Iterator<Item = &'p crate::query::SubPlan>,
+    head: &crate::query::SubPlan,
+    tails: &[(
+        crate::sql::CompoundOp,
+        alloc::boxed::Box<crate::query::SubPlan>,
+    )],
     i: usize,
 ) -> Option<Affinity> {
-    let mut any = false;
-    let mut found = aff;
-    // (Every core's bits: the leftmost's, and the found core's, agree
-    // with the affinity they give, so they never demote it.)
-    let mut m = head.map_or(0, item_datatype);
-    let mut arm = |e: Option<&RExpr>| {
-        if let Some(e) = e {
-            if found.is_none() {
-                found = crate::query::item_result_affinity(e);
+    // The units the pin's loop reads: `(affinity, sqlite3ExprDataType)`.
+    let mut n = 0usize;
+    let mut found: Option<Affinity> = None;
+    let mut m = 0u8;
+    let mut unit = |a: Option<Affinity>, d: u8| {
+        n += 1;
+        if found.is_none() {
+            found = a;
+        }
+        // (Every core's bits: the found core's agree with the
+        // affinity it gives, so they never demote it.)
+        m |= d;
+    };
+    let item = |e: Option<&RExpr>| {
+        e.map_or((None, 0), |e| {
+            (crate::query::item_result_affinity(e), item_datatype(e))
+        })
+    };
+    let wrapped = |a: Option<Affinity>| {
+        let d = match a {
+            Some(Affinity::Numeric | Affinity::Integer | Affinity::Real) => 0x05,
+            Some(Affinity::Text) => 0x06,
+            _ => 0x07,
+        };
+        (a, d)
+    };
+    let head_item = match head.values.as_slice() {
+        [] => {
+            let e = head.items.as_slice().get(i);
+            unit(aff, e.map_or(0, item_datatype));
+            e
+        }
+        [r] => {
+            let (a, d) = item(r.as_slice().get(i));
+            unit(a, d);
+            r.as_slice().get(i)
+        }
+        rows if head.vchain => {
+            for r in rows {
+                let (a, d) = item(r.as_slice().get(i));
+                unit(a, d);
             }
-            m |= item_datatype(e);
+            rows.first().and_then(|r| r.as_slice().get(i))
+        }
+        _ => {
+            unit(None, 0x07);
+            None
         }
     };
-    for tail in tails {
-        any = true;
-        if tail.values.is_empty() {
-            arm(tail.items.as_slice().get(i));
-        }
-        for row in tail.values.iter() {
-            arm(row.as_slice().get(i));
-        }
+    for (_, tail) in tails {
+        let (a, d) = match tail.values.as_slice() {
+            [] => item(tail.items.as_slice().get(i)),
+            [r] => item(r.as_slice().get(i)),
+            // The chain's own column type, its leftmost row first.
+            rows if tail.vchain => {
+                let mut f: Option<Affinity> = None;
+                let mut k = 0u8;
+                for r in rows {
+                    let (a, d) = item(r.as_slice().get(i));
+                    if f.is_none() {
+                        f = a;
+                    }
+                    k |= d;
+                }
+                wrapped(f.map(|f| demote(f, k, rows.first().and_then(|r| r.as_slice().get(i)))))
+            }
+            _ => (None, 0x07),
+        };
+        unit(a, d);
     }
     let aff = found?;
-    if !any || aff == Affinity::Blob {
+    if n < 2 {
         return Some(aff);
     }
+    Some(demote(aff, m, head_item))
+}
+
+/// `compound_affinity`'s demotion of a compound column's affinity
+/// `aff` by its cores' datatype bits `m` (`head`: the leftmost item).
+#[cfg(feature = "sql")]
+fn demote(aff: Affinity, m: u8, head: Option<&RExpr>) -> Affinity {
     let numeric = matches!(aff, Affinity::Numeric | Affinity::Integer | Affinity::Real);
-    Some(
-        if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
-            Affinity::Blob
-        } else if numeric && matches!(head, Some(RExpr::Cast(..))) {
-            Affinity::Numeric
-        } else {
-            aff
-        },
-    )
+    if aff == Affinity::Blob {
+        aff
+    } else if (aff == Affinity::Text && m & 0x01 != 0) || (numeric && m & 0x02 != 0) {
+        Affinity::Blob
+    } else if numeric && matches!(head, Some(RExpr::Cast(..))) {
+        Affinity::Numeric
+    } else {
+        aff
+    }
 }
 
 /// A FROM subquery's row as its reader sees it (v0.17 review fix,

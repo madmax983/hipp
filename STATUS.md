@@ -209,6 +209,195 @@ and could not take the lone-table one).
   options (`--data-only`, `--newlines`, `--nosys`,
   `--preserve-rowids`) are still ignored.
 
+**Review fixes (2026-11-16).** Nine findings, each reproduced on the
+live pin and on hipp first; eight fixed at the root (the same pattern
+searched for elsewhere, which added items 3 and 6's ON-term rule
+below), one (ORDER BY over a co-routine) left with evidence, and the
+push-down into VALUES chains that the first touches recorded as a
+gap. Ungated fixes on claimed paths (ADR 0001) except where a leaf is
+named.
+1. **Compound column types over VALUES arms** (`rules::compound_affinity`,
+   `sql`): a multi-row VALUES core is what the pin's
+   `sqlite3MultiValues` makes of it — a co-routine whose one column has
+   no affinity and can hold anything (`sqlite3ExprDataType` 0x07, which
+   demotes any other affinity to BLOB), or, after a WITH clause began
+   (`bHasWith`), in a stored view's text (read with `init.busy`), when
+   its first row has an item with an affinity (a CAST) or a later row
+   one the parser cannot call constant (a column, a function call, a
+   subquery), a UNION ALL chain of one-row selects
+   (`SelectStmt::vchain`, `SubPlan::vchain`): at the left of the
+   compound its rows are cores of their own; later, the subquery
+   `SELECT * FROM (chain)` that `parserDoubleLinkSelect` wraps it in,
+   with the chain's own column type (and, when that is REAL, its
+   integer literals read as reals: `parser::chain_reals`). hipp read a
+   VALUES head as nothing and a VALUES tail as its rows' literals, so
+   `WITH q(x) AS (VALUES (3), (4) UNION ALL SELECT s FROM t) ... WHERE x
+   = 2` matched the text `'2'` (the column is BLOB on the pin) and
+   `(VALUES (1), ('1') UNION ALL SELECT r FROM t) WHERE column1 = 1`
+   read `1` as `1.0` and matched `'1'`. (The unit's COLLATE / unary-plus
+   rule only exposed it for a COLLATE arm: the VALUES head was never
+   counted.) `PRAGMA table_info` of
+   a view over a compound now reads the compound's affinity too.
+2. **Window and LIKE arms are functions** (`rules::item_datatype`):
+   `SELECT r ... UNION ALL SELECT row_number() OVER () ...` is untyped
+   on the pin (0x07), so the window rows stay integers (they read as
+   reals, and `WHERE x = '1'` matched them); `y LIKE '1'` likewise.
+3. **WHERE push-down past VALUES arms** (`planner`, `push_down`): a
+   compound with a VALUES arm took no term at all, so a typed arm never
+   filtered with its own affinity (`(VALUES (2), (CAST(3 AS REAL)) UNION
+   ALL SELECT s COLLATE NOCASE ...) WHERE column1 <> 1` kept `'1'`). A
+   one-row VALUES arm now takes the term as the pin's one-row select
+   (`flatten::values_as_select`, named `column1`, ...); a multi-row
+   co-routine arm takes none, which is the same test (its column is
+   untyped, so the compound's is BLOB).
+4. **hipp-cli never reads the database for `.quit` / `.exit`**
+   (`needs_db`, `dot_nodb`): it opened, made (4,096 bytes) or refused
+   with `BadMagic` a database for a script or a one-shot argument that
+   is only `.quit` / `.exit`; the pin opens it only for SQL and its
+   database commands. A one-shot argument whose first character is `.`
+   is one dot-command (the database is opened for SQL arguments only),
+   `.exit N` ends with status N (its low byte, `0x` hexadecimal too;
+   `.quit N` and `.exit 0` with the session's), and an unknown command
+   is the pin's `unknown command or invalid arguments:  "NAME". Enter
+   ".help" for help`.
+5. **`x OR 0` is simplified after constant propagation** (`join.rs`):
+   the pin's `propagateConstants` reads the WHERE as written, where
+   `u.n = 5 OR 0` is an OR that fixes nothing; hipp simplified first,
+   so `t.c = u.n` lost its join constraint and the join order (and the
+   unordered row order) moved. The terms are now split as written,
+   propagated, then simplified.
+6. **Sources after a CROSS JOIN stay after it** (`xjoin::from_prereqs`):
+   probed on the pin, every FROM item after an explicit CROSS JOIN
+   keeps that join's prerequisites (`c CROSS JOIN d JOIN b ON b.x = 1`
+   scans c, searches b, scans d), while a plain join after a LEFT JOIN
+   alone resets them (`c LEFT JOIN d ... JOIN b ON b.x = 1` searches b
+   first); hipp reset them after either, so b moved to the front and a
+   LIMIT returned other rows. On the way (found by the generated join
+   corpus): a LEFT JOIN's ON term needs its right side even when it is
+   constant (the pin's `prereqAll |= getMask(iJoin)`), so `LEFT JOIN e
+   ON 0` lowers e's row estimate and the pin's order follows.
+7. **`x AND 0` is the literal 0 as the pin's parser writes it**
+   (`sqlite3ExprAnd`, `query`): an AND with an operand that is the
+   integer token 0 (`0`, `00`, `0x0`, `(0)`, or such a fold; not
+   `false`, `+0`, `0.0`) and no function call in either operand (LIKE
+   is one) is `0`, its other operand never resolved. Not EQP only, as
+   the review thought: `SELECT nosuch AND 0` and `WHERE nosuch AND 0`
+   read, `(1, 2) AND 0` is no row-value misuse, `GROUP BY y AND 0` /
+   `ORDER BY x AND 0` are constant terms out of range (hipp returned a
+   group), and `x = 2 AND 0` / `ON a.x = b.x AND 0` constrain no index.
+   Off where ALTER TABLE maps a text's names back
+   (`parse_with_tokens`, the pin's `IN_RENAME_OBJECT`); column names
+   keep the text.
+8. **A dot-command is a line whose first character is `.`**: a
+   `.tables` after leading blanks is SQL (a syntax error, exit 1), also
+   between statements (`SELECT 1;\n  .quit\nSELECT 2;` fails, as on the
+   pin); a `#` line between statements is skipped, as the pin's
+   `process_input` does.
+9. **`-help` prints the pin's usage text byte for byte** (the program
+   name aside), its whole option list included; hipp still refuses the
+   options it does not take (`PIN_OPTIONS`).
+
+Not fixed, with evidence:
+- **ORDER BY over a UNION co-routine** (finding 6, pre-existing): the
+  pin satisfies an outer `ORDER BY 1` from a co-routine's own ORDER BY
+  (its `wherePathMatchSubqueryOB`, `SQLITE_OrderBySubq`) matching only
+  the column number, never the collation, so `WITH q(x) AS (SELECT 2.5
+  UNION SELECT c FROM t) SELECT x FROM q ORDER BY 1` comes out in the
+  NOCASE merge order (A, b, C) with no sorter, `ORDER BY x COLLATE
+  BINARY` and `ORDER BY 1 DESC` sort (a co-routine cannot run
+  backwards); and a FROM subquery's ORDER BY without LIMIT is dropped
+  when the outer query has one or is a join (`SQLITE_OmitOrderBy`:
+  `(... UNION ALL ... ORDER BY 1) ORDER BY 1` is a plain COMPOUND
+  QUERY). hipp models neither: it always sorts the outer ORDER BY with
+  the column's collation (BINARY here) and keeps the subquery's ORDER
+  BY. A new planner capability (both the access planner and the
+  executor's sorter decision) beyond this unit's items; recorded as an
+  honest gap below.
+- The rest of the generated push-down corpus' divergences are all
+  VALUES chains with a WHERE term (below).
+
+Probing notes (live pin): `(VALUES (3), (4) UNION ALL SELECT r FROM t)`
+is `3|integer` (co-routine, BLOB), under `WITH w AS (SELECT 1)` or as
+a CTE `3.0|real` (chain, REAL; EQP `SCAN CONSTANT ROW` per row);
+`VALUES (3), (CAST(4 AS REAL)) UNION ALL SELECT 5` is BLOB, as a CTE
+REAL; `SELECT r UNION ALL VALUES (1), (CAST(2 AS REAL))` keeps `1`
+(co-routine), `SELECT s ... UNION ALL VALUES (2), (CAST(3 AS REAL))`
+in a CTE gives `2.0` (the wrapper's REAL column), `... VALUES
+(CAST(1 AS REAL)), (2) UNION ALL SELECT 9` gives `9.0` (FLEXNUM
+wrapper, outer REAL); a view's text is a chain even in the connection
+that made it (`OP_ParseSchema`). `(SELECT s ... UNION ALL SELECT 1)
+WHERE x = 1` is `1` only: the pushed copy filters each arm with its
+own affinity and the term stays in the reader with the compound's.
+`SELECT sum(x) AND 0 FROM a` is one row (a function blocks the fold),
+`nosuch AND +0` / `AND 0.0` / `AND false` fail, `x AND 0` in a CHECK
+fails every row. CROSS JOIN: 13 shapes (CROSS, LEFT, comma, mixed;
+see `join_review_fixes_match_pin`). CLI: `.quit`, `.exit`, `.help`,
+`.mode`, `.print`, `.bogus` open nothing; `.tables`, `.schema`,
+`.dump`, `.databases`, `.parameter`, `.indexes`, `.limit`,
+`.fullschema` open the database; `.exit 300` is 44, `-1` 255, `0x10`
+16, `abc` 0, `2 3` 2; `.quit 3` 0; `.exit` after an error 1.
+
+Tests: `tests/plan_gaps_v17.rs` +5 (`values_and_window_arms_type_like_the_pin`
+over 33 queries and 5 CREATE TABLE ... AS types,
+`generated_values_arms_match_pin` 200 xorshift compounds of VALUES /
+typed / window arms, `join_review_fixes_match_pin` 22 join shapes with
+plans, `and_false_folds_as_the_pin_parses` 38 queries with plans and
+stored texts, `generated_join_terms_match_pin` 240 xorshift joins of
+inner / CROSS / LEFT / comma joins with `OR 0` / `OR 1` / `AND 0` /
+`AND 1` terms, rows under LIMIT and plans); `hipp-cli/tests/cli_v17_plan_cli.rs`
++2 (`review_fixes_on_the_command_line`: 21 scripts, 7 argument lists,
+a non-database file; `review_planner_fixes_through_the_shell`), the
+usage compared whole, and five more lazy-open scripts. A scratch
+corpus of 600 generated VALUES compounds went from 45 divergences at
+the base to 8 (all VALUES chains under a WHERE term, below); one of
+1,500 generated joins (four seeds) went from 82 of its 400 at the base
+to 1 (a pre-existing automatic-index key order, below).
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` workspace suite included); `tests/depth_v16.rs`
+and `tests/triggers_v16.rs` with debug info: pass (the AND fold adds
+no recursion; no `STACK_*` change).
+
+Size Δ of the review fixes: tiny 0 (76,904); full +820 (480,228 →
+481,048); max +912 (967,536 → 968,448); xl +2,100 (1,064,600 →
+1,066,700). Ratchets raised to the measured figures, after an offset:
+`rules::compound_affinity` is no longer generic over its tails
+iterator and is kept out of line (it was inlined into five callers),
+which took the first measurement's +3,057 B on `full` down to +820.
+
+Honest gaps the review fixes leave (new or found on the way):
+- ORDER BY over a co-routine's own order (finding 6 above, the pin's
+  `SQLITE_OrderBySubq` and `SQLITE_OmitOrderBy`): hipp sorts with the
+  outer column's collation, so `WITH q(x) AS (SELECT 2.5 UNION SELECT c
+  FROM t) SELECT x FROM q ORDER BY 1` over a NOCASE `c` is in BINARY
+  order (the pin: the merge's NOCASE order, no sorter); EXPLAIN QUERY
+  PLAN shows hipp's sorter, and a subquery's ORDER BY the pin drops is
+  kept.
+- WHERE push-down into a VALUES chain: the pin filters each chained
+  row with its own affinity (a one-row select each) and a wrapped
+  later chain with its column's; hipp's term stays in the reader only,
+  with the compound's affinity (`WITH q(x) AS (VALUES (3), (4) UNION
+  ALL SELECT r FROM t) SELECT x FROM q WHERE x = '3'` is `3.0` in hipp,
+  no row on the pin). A chain's plan is the old `SCAN n-ROW VALUES
+  CLAUSE` (the pin: `SCAN CONSTANT ROW` per row, `SCAN n CONSTANT
+  ROWS` alone).
+- A trigger body's VALUES is a chain on the pin (read with the
+  schema); hipp applies the WITH / CAST / non-constant rules there. A
+  coroutine that a later non-constant row turns into a chain midway is
+  taken as a chain throughout. A wrapped chain's REAL column converts
+  only its integer literals (not, say, an outer column's integer).
+- `PRAGMA table_info` of a view over a compound whose arms differ in
+  affinity names the type by the standard name on the pin (`INT`,
+  `TEXT`), hipp by the declared type (`INTEGER`, `varchar(9)`):
+  pre-existing.
+- An automatic index's key order for a LEFT JOIN the WHERE made inner
+  with a propagated constant (`LEFT JOIN d ON d.x = 1 ... WHERE d.x =
+  d.y`: the pin `(x=? AND y=?)`, hipp `(y=? AND x=?)`): pre-existing,
+  EQP only.
+- hipp-cli: the pin's other dot-commands (`.help`, `.mode`, `.print`,
+  ...) are still unknown commands to hipp (they open no database, as
+  on the pin); `.indexes`, `.limit`, `.fullschema` open none in hipp.
+
 ### Parity: gaps_eval — evaluator and statement-level divergences (2026-11-15)
 
 Wave 17's first parity unit (after the owner's VM stop, ADR 0005 /

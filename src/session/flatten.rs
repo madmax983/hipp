@@ -600,7 +600,6 @@ impl<S: Storage> Connection<S> {
                     .as_ref()
                     .is_some_and(|c| c.mat != 0 || !matches!(c.rec, crate::sql::RecMark::None))
                 || d.limit.is_some()
-                || !d.values.is_empty()
                 || !matches!(f.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left)
             {
                 continue;
@@ -630,14 +629,17 @@ impl<S: Storage> Connection<S> {
             // no arm's column has a collation other than BINARY: the
             // pin's restriction (8); v0.17 fix.)
             ok &= arms.iter().all(|(a, q)| {
-                a.values.is_empty()
-                    && a.items.iter().all(|it| matches!(it, SelectItem::Expr(..)))
+                a.items.iter().all(|it| matches!(it, SelectItem::Expr(..)))
                     && !q.items.iter().any(has_win)
+                    && !q.values.iter().flat_map(|r| r.iter()).any(has_win)
                     && (union_all
-                        || q.items.iter().all(|it| {
-                            crate::query::expr_coll(it).unwrap_or_default()
-                                == crate::record::Coll::Binary
-                        }))
+                        || q.items
+                            .iter()
+                            .chain(q.values.iter().flat_map(|r| r.iter()))
+                            .all(|it| {
+                                crate::query::expr_coll(it).unwrap_or_default()
+                                    == crate::record::Coll::Binary
+                            }))
             });
             if !ok {
                 continue;
@@ -762,10 +764,20 @@ impl<S: Storage> Connection<S> {
                 {
                     continue;
                 }
-                // The term in each arm's own words.
-                let mut per: AVec<Expr> = AVec::new();
+                // The term in each arm's own words. A one-row VALUES arm
+                // is the pin's one-row select (v0.17 review fix: a
+                // VALUES arm no longer keeps the term from every arm);
+                // a multi-row one takes none (`None`): as a co-routine
+                // its column is untyped, so the term in the reader is
+                // the same test (a chain's rows are an honest gap).
+                let mut per: AVec<Option<Expr>> = AVec::new();
                 let mut cols: AVec<usize> = AVec::new();
                 for (a, q) in arms.iter() {
+                    if a.values.len() > 1 {
+                        per.push(None);
+                        continue;
+                    }
+                    let row = a.values.as_slice().first();
                     let mut x = (*t).clone();
                     let mut fine = true;
                     subst_cols(&mut x, &mut |e| {
@@ -780,8 +792,15 @@ impl<S: Storage> Connection<S> {
                             return None;
                         };
                         let c = slot.checked_sub(o_k).filter(|c| *c < nk);
-                        match c.and_then(|c| a.items.as_slice().get(c).map(|it| (c, it))) {
-                            Some((c, SelectItem::Expr(ie, ..))) => {
+                        let it = c.and_then(|c| match row {
+                            Some(r) => r.as_slice().get(c).map(|e| (c, e)),
+                            None => match a.items.as_slice().get(c) {
+                                Some(SelectItem::Expr(e, ..)) => Some((c, e)),
+                                _ => None,
+                            },
+                        });
+                        match it {
+                            Some((c, ie)) => {
                                 cols.push(c);
                                 // The column's collating sequence is
                                 // the leftmost arm's (the pin's
@@ -794,7 +813,11 @@ impl<S: Storage> Connection<S> {
                                 // pushed under an `i+0` arm is no
                                 // index range).
                                 let coll = |q: &SubPlan| {
-                                    q.items.as_slice().get(c).and_then(|e| match e {
+                                    let items = match q.values.as_slice() {
+                                        [r] => r.as_slice(),
+                                        _ => q.items.as_slice(),
+                                    };
+                                    items.get(c).and_then(|e| match e {
                                         RExpr::Column(_, _, k) => Some(k.unwrap_or_default()),
                                         e => crate::query::expr_coll(e),
                                     })
@@ -822,9 +845,9 @@ impl<S: Storage> Connection<S> {
                     if !fine {
                         break;
                     }
-                    per.push(x);
+                    per.push(Some(x));
                 }
-                if per.len() != arms.len() {
+                if per.len() != arms.len() || per.iter().all(Option::is_none) {
                     continue;
                 }
                 for ((x, (a, q)), add) in per
@@ -832,6 +855,7 @@ impl<S: Storage> Connection<S> {
                     .zip(arms.iter())
                     .zip(adds.as_mut_slice().iter_mut())
                 {
+                    let Some(x) = x else { continue };
                     let agg = q.has_agg || !q.group_by.is_empty() || a.having.is_some();
                     let grouped = cols.iter().all(|c| {
                         q.items.as_slice().get(*c).is_some_and(|it| {
@@ -859,6 +883,9 @@ impl<S: Storage> Connection<S> {
             };
             let mut it = adds.into_iter();
             if let Some((w, h)) = it.next() {
+                if !w.is_empty() {
+                    values_as_select::<S::Error>(arena, &mut d2)?;
+                }
                 for x in w {
                     d2.filter = Some(and(d2.filter.take(), x));
                 }
@@ -867,6 +894,9 @@ impl<S: Storage> Connection<S> {
                 }
             }
             for ((_, c), (w, h)) in d2.compound.as_mut_slice().iter_mut().zip(it) {
+                if !w.is_empty() {
+                    values_as_select::<S::Error>(arena, c)?;
+                }
                 for x in w {
                     c.filter = Some(and(c.filter.take(), x));
                 }
@@ -915,6 +945,27 @@ impl<S: Storage> Connection<S> {
         }
         Ok(())
     }
+}
+
+/// A one-row VALUES core as the pin's one-row select (`SF_Values`), so
+/// a pushed term can be its WHERE (v0.17 review fix): its values as
+/// result items named `column1`, `column2`, ... as the VALUES names
+/// them. Anything else is left as it is.
+fn values_as_select<E>(arena: &Arena, c: &mut SelectStmt) -> Result<(), E> {
+    if c.values.len() != 1 {
+        return Ok(());
+    }
+    let Some(row) = c.values.pop() else {
+        return Ok(());
+    };
+    for (i, e) in row.into_iter().enumerate() {
+        let mut name = AVec::new();
+        name.extend_from_slice(b"column");
+        crate::record::render_int((i as i64).saturating_add(1), &mut name);
+        let h = arena.alloc_copy_handle(name.as_slice())?;
+        c.items.push(SelectItem::Expr(e, Some(h), h));
+    }
+    Ok(())
 }
 
 /// The columns of the co-routines and materialisations of the core

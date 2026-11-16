@@ -132,6 +132,23 @@ struct Parser<'a> {
     /// Parsing a view's text to read it (`parse_view`).
     #[cfg(feature = "query")]
     view_use: bool,
+    /// The pin's parse-time `x AND 0` fold (`sqlite3ExprAnd`; v0.17
+    /// review fix): off where ALTER TABLE reads a text to map its
+    /// names back (`parse_with_tokens`, the pin's
+    /// `IN_RENAME_OBJECT`). `fold_span`: the tokens of the last AND
+    /// folded to `0`, still a constant false for an enclosing AND;
+    /// `r_false`: the right operand of the AND just parsed is one.
+    #[cfg(feature = "query")]
+    no_fold: bool,
+    #[cfg(feature = "query")]
+    fold_span: (usize, usize),
+    #[cfg(feature = "query")]
+    r_false: bool,
+    /// A WITH clause has begun (v0.17 review fix, `sql`): the pin's
+    /// `bHasWith`, set at a CTE's name, after which multi-row VALUES
+    /// read as a chain of selects (`SelectStmt::vchain`).
+    #[cfg(feature = "sql")]
+    with_seen: bool,
     /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
     /// a view's tree in its reduced form, whose leaves lose their
     /// height, so a leaf the pin resolves on its own (`SELECT a`,
@@ -519,6 +536,7 @@ pub fn parse_with_tokens<E>(
 ) -> Result<(Ast, AVec<Token>), E> {
     let toks = lex_checked::<E>(sql, arena)?;
     let mut p = Parser::new(toks, arena, sql, lim);
+    p.no_fold = true;
     let ast = p.statement::<E>()?;
     p.expect_end::<E>()?;
     Ok((ast, p.toks))
@@ -785,6 +803,14 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "query")]
             view_use: false,
             #[cfg(feature = "query")]
+            no_fold: false,
+            #[cfg(feature = "query")]
+            fold_span: (0, 0),
+            #[cfg(feature = "query")]
+            r_false: false,
+            #[cfg(feature = "sql")]
+            with_seen: false,
+            #[cfg(feature = "query")]
             reduced: false,
             #[cfg(feature = "query")]
             core_h: 0,
@@ -978,6 +1004,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
             };
+            self.with_seen = true;
             let mut columns = AVec::new();
             if self.eat(Tok::LParen) {
                 loop {
@@ -3128,7 +3155,25 @@ impl<'a> Parser<'a> {
                 break;
             }
             if bp == BP_OR || bp == BP_AND {
-                self.mark_and_or_operand(&mut l, p0);
+                let _lf = self.mark_and_or_operand(&mut l, p0);
+                l = self.expr_infix::<E>(l, bp)?;
+                // The pin's `sqlite3ExprAnd` (v0.17 review fix): an
+                // AND with an operand that is the integer token 0 (or
+                // such a fold) and no function call in either is the
+                // literal 0, its operands never resolved — `nosuch AND
+                // 0` reads, `GROUP BY y AND 0` is a constant term.
+                #[cfg(feature = "query")]
+                if bp == BP_AND
+                    && (_lf || self.r_false)
+                    && !self.no_fold
+                    && !crate::rules::expr_any(&l, &mut |x| {
+                        matches!(x, Expr::Func { .. } | Expr::Like(..))
+                    })
+                {
+                    l = Expr::Literal(Literal::Integer(0));
+                    self.fold_span = (p0, self.pos);
+                }
+                continue;
             }
             l = self.expr_infix::<E>(l, bp)?;
         }
@@ -3143,9 +3188,13 @@ impl<'a> Parser<'a> {
     /// `-1 OR x`, `+0 AND x`, `1_0 OR x` and `2147483648 OR x` still
     /// evaluate `x` there (the evaluator's short-circuit, `int_lit`,
     /// sees only a bare literal).
-    fn mark_and_or_operand(&self, e: &mut Expr, p0: usize) {
+    ///
+    /// Returns whether the operand is a constant false for the pin's
+    /// `sqlite3ExprAnd` (`EP_IsFalse`: the integer token 0, or an AND
+    /// it folded to 0; v0.17).
+    fn mark_and_or_operand(&self, e: &mut Expr, p0: usize) -> bool {
         if !matches!(e, Expr::Literal(Literal::Integer(_))) {
-            return;
+            return false;
         }
         let toks = self.toks.as_slice().get(p0..self.pos).unwrap_or(&[]);
         let mut a = 0;
@@ -3175,10 +3224,18 @@ impl<'a> Parser<'a> {
                 }
                 _ => false,
             });
+        #[cfg(feature = "query")]
+        if self.fold_span == (p0 + a, p0 + b) && self.fold_span.1 > self.fold_span.0 {
+            return true;
+        }
         if !simple {
             let inner = core::mem::replace(e, Expr::Literal(Literal::Null));
             *e = Expr::Pos(Box::new(inner));
+            return false;
         }
+        cfg!(feature = "query")
+            && b == a + 1
+            && matches!(toks.get(a).map(|t| t.tok), Some(Tok::Integer(0)))
     }
 
     /// The binding power of the operator at the cursor, if it
@@ -3249,7 +3306,13 @@ impl<'a> Parser<'a> {
             let r0 = self.pos;
             // `expr AND expr`: two symbols below the right operand.
             let mut r = self.operand::<E>(2, bp + 1)?;
-            self.mark_and_or_operand(&mut r, r0);
+            let rf = self.mark_and_or_operand(&mut r, r0);
+            #[cfg(feature = "query")]
+            {
+                self.r_false = rf;
+            }
+            #[cfg(not(feature = "query"))]
+            let _ = rf;
             self.node::<E>(lh, lk)?;
             return Ok(bin(if bp == BP_OR { BinOp::Or } else { BinOp::And }, l, r));
         }
@@ -4556,7 +4619,10 @@ impl<'a> Parser<'a> {
                     Some((_, c)) => c.sel = self.core_sel(c),
                     None => head.sel = self.core_sel(&head),
                 }
-                let core = self.select_core::<E>(last)?;
+                #[allow(unused_mut)]
+                let mut core = self.select_core::<E>(last)?;
+                #[cfg(feature = "sql")]
+                chain_reals(self.arena, &mut core);
                 if op == CompoundOp::UnionAll {
                     pending = pending.max(self.core_h);
                 } else {
@@ -4642,6 +4708,41 @@ impl<'a> Parser<'a> {
     #[cfg(feature = "sql")]
     fn values_core<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
         let values = self.values_rows::<E>(base, false)?;
+        // The pin's `sqlite3MultiValues` conditions for the UNION ALL
+        // chain (v0.17 review fix): a WITH clause began, the text is a
+        // stored view's (read with `db->init.busy`), the first row has
+        // an item with an affinity, or a later row one that is not
+        // constant as the parser sees it.
+        fn aff(e: &Expr) -> bool {
+            match e {
+                Expr::Cast(..) => true,
+                Expr::Collate(x, _) => aff(x),
+                Expr::ScalarSubquery(q) => {
+                    match (q.values.as_slice().first(), q.items.as_slice().first()) {
+                        (Some(r), _) => r.as_slice().first().is_some_and(aff),
+                        (None, Some(SelectItem::Expr(x, ..))) => aff(x),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            }
+        }
+        let vchain = self.with_seen
+            || self.view_use
+            || values.as_slice().first().is_some_and(|r| r.iter().any(aff))
+            || values.iter().skip(1).flat_map(|r| r.iter()).any(|e| {
+                crate::rules::expr_any(e, &mut |x| {
+                    matches!(
+                        x,
+                        Expr::Column { .. }
+                            | Expr::Func { .. }
+                            | Expr::Like(..)
+                            | Expr::ScalarSubquery(_)
+                            | Expr::ExistsSubquery(_)
+                            | Expr::InSubquery(..)
+                    )
+                })
+            });
         Ok(SelectStmt {
             distinct: false,
             items: AVec::new(),
@@ -4666,6 +4767,7 @@ impl<'a> Parser<'a> {
             sel: 0,
             #[cfg(feature = "expr_index")]
             first_row: false,
+            vchain,
         })
     }
 
@@ -4794,6 +4896,8 @@ impl<'a> Parser<'a> {
             sel: 0,
             #[cfg(feature = "expr_index")]
             first_row: false,
+            #[cfg(feature = "sql")]
+            vchain: false,
         })
     }
 
@@ -5012,6 +5116,8 @@ impl<'a> Parser<'a> {
             sel: self.next_sel(),
             #[cfg(feature = "expr_index")]
             first_row: false,
+            #[cfg(feature = "sql")]
+            vchain: false,
         }
     }
 
@@ -6390,6 +6496,69 @@ UPDATE USING VALUES WHEN WHERE",
             });
         }
         Ok(false)
+    }
+}
+
+/// A later compound arm that is a chain of VALUES rows
+/// (`SelectStmt::vchain`) is, on the pin, the subquery `SELECT * FROM
+/// (chain)` (`parserDoubleLinkSelect` wraps it), whose column of REAL
+/// affinity reads its integers as reals (v0.17 review fix): its
+/// integer literals become reals here. Only a column of literals and
+/// CASTs is typed (another item leaves it as it is).
+#[cfg(feature = "sql")]
+fn chain_reals(arena: &Arena, c: &mut SelectStmt) {
+    use crate::record::Affinity;
+    if !c.vchain || c.values.len() < 2 {
+        return;
+    }
+    let w = c.values.as_slice().first().map_or(0, |r| r.len());
+    for i in 0..w {
+        let mut found: Option<Affinity> = None;
+        let mut m = 0u8;
+        let mut known = true;
+        for r in c.values.iter() {
+            let (a, d) = match r.as_slice().get(i) {
+                Some(Expr::Literal(Literal::Null)) => (None, 0),
+                Some(Expr::Literal(Literal::Integer(_) | Literal::Real(_))) => (None, 1),
+                Some(Expr::Literal(Literal::Text(_))) => (None, 2),
+                Some(Expr::Literal(Literal::Blob(_))) => (None, 4),
+                Some(Expr::Cast(_, ty)) => {
+                    let a = crate::record::affinity_of(handle_bytes(arena, *ty));
+                    let d = match a {
+                        Affinity::Text => 6,
+                        Affinity::Blob => 7,
+                        _ => 5,
+                    };
+                    (Some(a), d)
+                }
+                _ => {
+                    known = false;
+                    break;
+                }
+            };
+            if found.is_none() {
+                found = a;
+            }
+            m |= d;
+        }
+        // (A CAST leftmost makes the column the pin's FLEXNUM.)
+        let head_cast = matches!(
+            c.values
+                .as_slice()
+                .first()
+                .and_then(|r| r.as_slice().get(i)),
+            Some(Expr::Cast(..))
+        );
+        if !known || found != Some(Affinity::Real) || m & 0x02 != 0 || head_cast {
+            continue;
+        }
+        for r in c.values.as_mut_slice() {
+            if let Some(e) = r.as_mut_slice().get_mut(i)
+                && let Expr::Literal(Literal::Integer(v)) = *e
+            {
+                *e = Expr::Literal(Literal::Real(v as f64));
+            }
+        }
     }
 }
 

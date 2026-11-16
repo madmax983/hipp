@@ -326,15 +326,21 @@ fn wc_pos(js: &JSrc<'_>, ti: usize, nconj: usize) -> usize {
 /// The FROM-order prerequisites of each source (`whereLoopAddAll`):
 /// a LEFT JOIN's right side and an explicit CROSS JOIN need every
 /// source before them (and so does each one after it in such a run);
-/// a plain join resets them (no RIGHT JOIN reaches the planner).
+/// a plain join resets them (no RIGHT JOIN reaches the planner) —
+/// unless a CROSS JOIN came before it: every later source then keeps
+/// the CROSS JOIN's prerequisites (v0.17 review fix, probed on the
+/// pin: `c CROSS JOIN d JOIN b ON b.x = 1` scans c before it searches
+/// b, where `c LEFT JOIN d ... JOIN b` searches b first).
 pub fn from_prereqs(srcs: &[JSrc<'_>]) -> AVec<u64> {
     let mut out = AVec::new();
     let mut pre = 0u64;
     let mut prior = 0u64;
+    let mut crossed = false;
     for (i, js) in srcs.iter().enumerate() {
+        crossed |= js.cross;
         if js.left || js.cross {
             pre |= prior;
-        } else {
+        } else if !crossed {
             pre = 0;
         }
         out.push(pre | js.after);

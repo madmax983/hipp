@@ -700,3 +700,411 @@ fn lone_table_constant_terms() {
         ],
     );
 }
+
+// ------------------------------------------------------ review fixes
+
+/// `same`, rows only (a VALUES chain's plan is an honest gap).
+fn same_rows(tag: &str, schema: &str, qs: &[&str]) {
+    let path = fresh(tag, schema);
+    let owned: Vec<String> = qs.iter().map(|q| q.to_string()).collect();
+    let bad = diffs_on(&path, &owned, false);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+const VA: &str = "CREATE TABLE t(r REAL, i INTEGER, s TEXT); \
+    INSERT INTO t VALUES (1.0, 1, '1'), (2.5, 2, '2'); \
+    CREATE TABLE u(y); INSERT INTO u VALUES (1), (2); \
+    CREATE VIEW v1 AS SELECT * FROM (VALUES (3), (4) UNION ALL SELECT r FROM t); \
+    CREATE VIEW v2(a) AS VALUES (3), (4) UNION ALL SELECT s FROM t;";
+
+/// Review fix: a multi-row VALUES arm and a window arm take their part
+/// in a compound's column type as on the pin (`sqlite3MultiValues`: a
+/// co-routine of untyped values, or after a WITH clause / in a view a
+/// chain of one-row selects; a window call is a function). They were
+/// read as the leftmost arm's type, so integers came back as reals
+/// and a WHERE matched rows the pin rejects.
+#[test]
+fn values_and_window_arms_type_like_the_pin() {
+    same_rows(
+        "va",
+        VA,
+        &[
+            // The review's repros.
+            "WITH q(x) AS (VALUES (3), (4) UNION ALL SELECT s FROM t) SELECT x FROM q WHERE x = 2",
+            "WITH q(x) AS (VALUES (3), ('abc') UNION ALL SELECT s COLLATE NOCASE FROM t) \
+             SELECT x, typeof(x) FROM q WHERE 2 = x COLLATE NOCASE",
+            "SELECT column1, typeof(column1) FROM (VALUES (1), ('1') UNION ALL SELECT r FROM t) \
+             WHERE column1 = 1",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL SELECT row_number() OVER () FROM u)",
+            "SELECT typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (1), (2))",
+            "SELECT x FROM (SELECT r x FROM t UNION ALL SELECT row_number() OVER () FROM u) \
+             WHERE x = '1'",
+            // A co-routine VALUES first, and one in a chain.
+            "SELECT column1, typeof(column1) FROM (VALUES (3), (4) UNION ALL SELECT r FROM t)",
+            "WITH q(x) AS (VALUES (3), (4) UNION ALL SELECT r FROM t) SELECT x, typeof(x) FROM q",
+            "WITH w AS (SELECT 1) SELECT column1, typeof(column1) \
+             FROM (VALUES (3), (4) UNION ALL SELECT r FROM t)",
+            "SELECT column1, typeof(column1) FROM (VALUES (3), (CAST(4 AS REAL)) UNION ALL SELECT 5)",
+            "WITH q(x) AS (VALUES (3), (CAST(4 AS REAL)) UNION ALL SELECT 5) SELECT x, typeof(x) FROM q",
+            "SELECT column1, typeof(column1) FROM (VALUES (CAST(4 AS TEXT)), (3)) WHERE column1 = 3",
+            "SELECT column1, typeof(column1) FROM (VALUES (3.5), (4) UNION ALL SELECT r FROM t)",
+            "SELECT column1, typeof(column1) FROM (VALUES (3), (abs(-4)) UNION ALL SELECT r FROM t)",
+            // Later arms: co-routine, chain, one row.
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (1))",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (1), (2) UNION ALL SELECT 7)",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (1), (CAST(2 AS REAL)))",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (CAST(1 AS REAL)), (2))",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (CAST(1 AS REAL)), (2) \
+             UNION ALL SELECT 9)",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (CAST(1 AS TEXT)), (2) \
+             UNION ALL SELECT 9)",
+            "SELECT x, typeof(x) FROM (SELECT 1 x UNION ALL VALUES (1), (2) UNION ALL SELECT r FROM t)",
+            "SELECT x, typeof(x) FROM (SELECT s x FROM t UNION ALL VALUES (1), (2)) WHERE x = 1",
+            "WITH q(x) AS (SELECT r FROM t UNION ALL VALUES (1), (2)) SELECT x, typeof(x) FROM q",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL VALUES (1), ('z'))",
+            // Function arms (a window call, LIKE, an aggregate).
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL SELECT y FROM u)",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL SELECT y + 0 FROM u)",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL SELECT count(*) FROM u)",
+            "SELECT x, typeof(x) FROM (SELECT r x FROM t UNION ALL SELECT y LIKE '1' FROM u)",
+            "WITH q(x) AS (SELECT r FROM t UNION ALL SELECT row_number() OVER (ORDER BY y) FROM u) \
+             SELECT x, typeof(x) FROM q WHERE x = '1'",
+            // A UNION with a non-BINARY VALUES column takes no term
+            // (the pin's restriction 8).
+            "SELECT * FROM (VALUES ('b' COLLATE NOCASE) UNION SELECT s FROM t) WHERE column1 = 'B'",
+            "SELECT * FROM (VALUES ('b' COLLATE NOCASE), ('c') UNION SELECT s FROM t) \
+             WHERE column1 = 'B'",
+            "SELECT * FROM (VALUES ('2'), ('c') UNION SELECT s FROM t) WHERE column1 = '2'",
+            // Views read their text as the pin's schema does: a chain.
+            "SELECT column1, typeof(column1) FROM v1",
+            "SELECT a, typeof(a) FROM v2 WHERE a = 3",
+            "PRAGMA table_info(v1)",
+            "PRAGMA table_info(v2)",
+        ],
+    );
+    // CREATE TABLE ... AS takes the same types.
+    let path = fresh("vac", VA);
+    let q = "CREATE TABLE c1 AS SELECT * FROM (VALUES (1), (2) UNION ALL SELECT r FROM t); \
+             CREATE TABLE c2 AS WITH q AS (VALUES (1), (2) UNION ALL SELECT r FROM t) SELECT * FROM q; \
+             CREATE TABLE c3 AS SELECT * FROM (SELECT r FROM t UNION ALL VALUES (1), (2)); \
+             CREATE TABLE c4 AS SELECT * FROM (SELECT r FROM t UNION ALL \
+             SELECT row_number() OVER () FROM u); \
+             CREATE TABLE c5 AS SELECT * FROM (VALUES (CAST(1 AS REAL)), (2) UNION ALL SELECT r FROM t); \
+             SELECT sql FROM sqlite_schema WHERE name LIKE 'c%' ORDER BY name";
+    let path2 = fresh("vach", VA);
+    let p = pin(&path, q);
+    let h = block_on(async {
+        let fs = FileStorage::open(&path2).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        let mut out = Vec::new();
+        for s in q.split("; ") {
+            out = collect(&mut db, s).await.expect("statement");
+        }
+        String::from_utf8(out).expect("utf8")
+    });
+    assert_eq!(p.as_deref(), Ok(h.as_str()));
+}
+
+/// Generated compounds of VALUES (one row, several, first or later),
+/// typed and untyped SELECT arms and window arms, read bare, through
+/// typeof() and under a WHERE term — in FROM subqueries (co-routine
+/// VALUES) and, with no WHERE, in CTEs (chained VALUES).
+#[test]
+fn generated_values_arms_match_pin() {
+    let path = fresh("vag", VA);
+    let vals = [
+        "1",
+        "2",
+        "'1'",
+        "'abc'",
+        "1.0",
+        "2.5",
+        "NULL",
+        "CAST(3 AS REAL)",
+        "CAST(1 AS TEXT)",
+        "x'31'",
+    ];
+    let arms = [
+        "SELECT r FROM t",
+        "SELECT i FROM t",
+        "SELECT s FROM t",
+        "SELECT y FROM u",
+        "SELECT y + 0 FROM u",
+        "SELECT row_number() OVER () FROM u",
+        "SELECT s COLLATE NOCASE FROM t",
+        "SELECT 1",
+        "SELECT '1'",
+        "SELECT CAST(i AS REAL) FROM t",
+    ];
+    let consts = ["1", "'1'", "2", "'2'", "1.0", "3", "'abc'", "2.5"];
+    let ops = ["=", "<>", "<", ">=", "IS"];
+    let mut r = Rng(0x2545_f491_4f6c_dd1d);
+    let mut qs = Vec::new();
+    for _ in 0..200 {
+        let values = |r: &mut Rng| -> String {
+            let k = 1 + r.n(3);
+            let mut v = String::from("VALUES ");
+            for j in 0..k {
+                if j > 0 {
+                    v.push_str(", ");
+                }
+                v.push_str(&format!("({})", r.pick(&vals)));
+            }
+            v
+        };
+        let n = 2 + r.n(2);
+        let mut sub = String::new();
+        let mut first_values = false;
+        for a in 0..n {
+            if a > 0 {
+                sub.push_str(if r.n(5) == 0 {
+                    " UNION "
+                } else {
+                    " UNION ALL "
+                });
+            }
+            if r.n(3) == 0 {
+                first_values |= a == 0;
+                sub.push_str(&values(&mut r));
+            } else if a == 0 {
+                sub.push_str(&format!(
+                    "SELECT {} AS column1 FROM t",
+                    r.pick(&["r", "i", "s", "1", "'1'"])
+                ));
+            } else {
+                sub.push_str(r.pick(&arms));
+            }
+        }
+        let _ = first_values;
+        let w = format!("column1 {} {}", r.pick(&ops), r.pick(&consts));
+        match r.n(5) {
+            0 => qs.push(format!("SELECT column1, typeof(column1) FROM ({sub})")),
+            1 | 2 => qs.push(format!(
+                "SELECT column1, typeof(column1) FROM ({sub}) WHERE {w}"
+            )),
+            3 => qs.push(format!(
+                "WITH q AS ({sub}) SELECT column1, typeof(column1) FROM q"
+            )),
+            _ => qs.push(format!("SELECT count(*) FROM ({sub}) WHERE {w}")),
+        }
+    }
+    let bad = diffs_on(&path, &qs, false);
+    assert!(
+        bad.is_empty(),
+        "{} of 200 differ:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}
+
+const JO: &str = "CREATE TABLE b(x, y, z); CREATE TABLE c(x PRIMARY KEY, y, z); \
+    CREATE TABLE d(x, y); CREATE INDEX bx ON b(x); \
+    CREATE TABLE e(x INTEGER, y TEXT); CREATE INDEX ex ON e(x); \
+    CREATE TABLE t(c TEXT, k); CREATE TABLE u(n INTEGER, b, r REAL); CREATE INDEX un ON u(n); \
+    INSERT INTO b VALUES (1, 'p', 1), (2, 'q', 2), (2, 'r', 3), (5, NULL, 4); \
+    INSERT INTO c VALUES (1, 'c1', 1), (2, 'c2', 2), (9, 'c9', 3), ('a', 'x', 1); \
+    INSERT INTO d VALUES (1, 1), (2, 2), (1, 2), (3, 1); \
+    INSERT INTO e VALUES (1, '1'), (2, '2'), (5, '5'), (NULL, 'n'); \
+    INSERT INTO t VALUES ('5', 1), ('05', 2), ('5.0', 3), (5, 4), ('abc', 5); \
+    INSERT INTO u VALUES (5, '5', 5.0), (5, 5, 5.5), ('abc', 'abc', 0);";
+
+/// Review fixes in the join planner, rows in order and plans:
+/// - `x OR 0` fixes no column for constant propagation (the pin runs
+///   it before `whereClauseInsert` simplifies the term), so `t.c =
+///   u.n` stays a join constraint;
+/// - every source after a CROSS JOIN keeps its prerequisites (a later
+///   inner join no longer moves before the CROSS JOIN's left side);
+/// - a LEFT JOIN's constant ON term counts against its right side.
+#[test]
+fn join_review_fixes_match_pin() {
+    same(
+        "jo",
+        JO,
+        &[
+            "SELECT * FROM t, u WHERE t.c = u.n AND (u.n = 5 OR 0)",
+            "SELECT * FROM t, u WHERE (u.n = 5 OR 0) AND t.c = u.n",
+            "SELECT * FROM t, u WHERE t.c = u.n AND (u.n = 5 OR 1)",
+            "SELECT * FROM t, u WHERE t.c = u.n AND u.n = 5",
+            "SELECT * FROM d, b WHERE d.x = b.x AND (b.x = 2 OR 0)",
+            "SELECT * FROM d, b WHERE b.x = 2 AND (d.x = b.x OR 0)",
+            "SELECT * FROM t JOIN u ON t.c = u.n AND (u.n = 5 OR 0)",
+            "SELECT * FROM c CROSS JOIN d JOIN b ON b.x = 1",
+            "SELECT c.x, d.x, b.y FROM c CROSS JOIN d JOIN b ON b.x = 2 LIMIT 6",
+            "SELECT * FROM c CROSS JOIN d, b WHERE b.x = 1",
+            "SELECT * FROM c, d JOIN b ON b.x = 1",
+            "SELECT * FROM c CROSS JOIN d JOIN b ON b.x = 1 JOIN e ON e.x = 2",
+            "SELECT * FROM c JOIN d CROSS JOIN b JOIN e ON e.x = 2",
+            "SELECT * FROM c LEFT JOIN d ON d.x = c.x CROSS JOIN b JOIN e ON e.x = 2",
+            "SELECT * FROM c CROSS JOIN d LEFT JOIN b ON b.x = d.x JOIN e ON e.x = 2",
+            "SELECT * FROM d, c CROSS JOIN b JOIN e ON e.x = 2",
+            "SELECT * FROM c LEFT JOIN d ON d.x = c.x JOIN b ON b.x = 1 JOIN e ON e.x = 2",
+            "SELECT * FROM c LEFT JOIN d ON d.x = c.x JOIN b ON b.x = 1 CROSS JOIN e JOIN u ON u.n = 3",
+            "SELECT * FROM c CROSS JOIN d, b, e WHERE b.x = 1 AND e.x = 2",
+            "SELECT d.x FROM d CROSS JOIN b LEFT JOIN e ON 0, c WHERE c.y = b.x",
+            "SELECT d.x FROM d CROSS JOIN b LEFT JOIN e ON 1, c WHERE c.y = b.x",
+            "SELECT d.x, b.x, e.x, c.x FROM d CROSS JOIN b LEFT JOIN e ON e.y = b.x AND 0, c \
+             WHERE c.y = b.x LIMIT 7",
+        ],
+    );
+}
+
+/// Review fix: `x AND 0` is the literal 0 as the pin's parser writes
+/// it (`sqlite3ExprAnd`: an operand that is the integer token 0, no
+/// function call in either), so its other operand is never resolved —
+/// `nosuch AND 0` reads, `GROUP BY y AND 0` is a constant term out of
+/// range — and the column term is no index constraint.
+#[test]
+fn and_false_folds_as_the_pin_parses() {
+    same(
+        "af",
+        "CREATE TABLE a(x, y); CREATE TABLE b(x, y); CREATE INDEX bx ON b(x); \
+         INSERT INTO a VALUES (1, 2), (2, 3); INSERT INTO b VALUES (1, 1), (2, 2);",
+        &[
+            "SELECT * FROM b WHERE x = 2 AND 0",
+            "SELECT * FROM a JOIN b ON a.x = b.x AND 0",
+            "SELECT * FROM a LEFT JOIN b ON a.x = b.x AND 0",
+            "SELECT * FROM b WHERE 0 AND x = 2",
+            "SELECT * FROM b WHERE x = 2 AND false",
+            "SELECT * FROM b WHERE x = 2 AND 0x0",
+            "SELECT * FROM b WHERE x = 2 AND (0)",
+            "SELECT * FROM b WHERE x = 2 AND 00",
+            "SELECT * FROM b WHERE x = 2 AND (y = 1 AND 0)",
+            "SELECT * FROM b WHERE x = 2 AND (y = 1 OR 0)",
+            "SELECT * FROM b WHERE x = 2 AND +0",
+            "SELECT * FROM b WHERE x = 2 AND 0.0",
+            "SELECT * FROM b WHERE x = 2 AND 0 AND y = 1",
+            "SELECT * FROM b WHERE (x = 2 AND 0) OR y = 1",
+            "SELECT 1, nosuch AND 0",
+            "SELECT 2, (SELECT z FROM nosuch) AND 0",
+            "SELECT 3, (1, 2) AND 0",
+            "SELECT 4, 0 AND nosuch",
+            "SELECT 5, x AND 0 FROM a",
+            "SELECT 7, nosuch AND 00",
+            "SELECT 8, nosuch AND 0x0",
+            "SELECT 9, nosuch AND false",
+            "SELECT 10, nosuch AND 0.0",
+            "SELECT 11, upper(nosuch) AND 0",
+            "SELECT 12, nosuch() AND 0",
+            "SELECT 13, nosuch LIKE 'a' AND 0",
+            "SELECT 14, (nosuch AND 0) AND 1",
+            "SELECT 15, nosuch AND (0)",
+            "SELECT 16, nosuch AND +0",
+            "SELECT 17, nosuch COLLATE NOCASE AND 0",
+            "SELECT 18, x FROM a WHERE nosuch AND 0",
+            "SELECT 19, x FROM a ORDER BY nosuch AND 0",
+            "SELECT 20, sum(x) AND 0 FROM a",
+            "SELECT 21, count(*) FROM a WHERE x = 1 AND 0",
+            "SELECT 22, sum(x) FROM a GROUP BY y AND 0",
+            "SELECT 23, nosuch BETWEEN 1 AND 0",
+            "SELECT 24, x FROM a GROUP BY x HAVING sum(y) AND 0",
+            "SELECT 25, 1 WHERE 0 AND nosuch OR 1",
+        ],
+    );
+    // Stored texts: column names keep the text, a view and a CHECK
+    // read the fold, ALTER TABLE ... RENAME COLUMN still sees `x`.
+    let path = fresh(
+        "afs",
+        "CREATE TABLE a(x, y); INSERT INTO a VALUES (1, 2), (2, 3);",
+    );
+    let path2 = fresh(
+        "afsh",
+        "CREATE TABLE a(x, y); INSERT INTO a VALUES (1, 2), (2, 3);",
+    );
+    let q = "CREATE TABLE t2 AS SELECT x AND 0, (x) AND (0), y AND 0 AND 1 FROM a; \
+             CREATE VIEW v AS SELECT x FROM a WHERE x AND 0 OR y = 3; \
+             ALTER TABLE a RENAME COLUMN x TO xx; \
+             CREATE VIEW w AS SELECT xx FROM a WHERE nosuch AND 0; \
+             SELECT name, sql FROM sqlite_schema ORDER BY name; SELECT * FROM v; SELECT * FROM w";
+    let p = pin(&path, q);
+    let h = block_on(async {
+        let fs = FileStorage::open(&path2).expect("fs open");
+        let mut db = Connection::open(fs, Config::default()).await.expect("open");
+        let mut all = Vec::new();
+        for s in q.split("; ") {
+            all.extend(collect(&mut db, s).await.expect("statement"));
+        }
+        String::from_utf8(all).expect("utf8")
+    });
+    assert_eq!(p.as_deref(), Ok(h.as_str()));
+}
+
+/// Generated joins of inner, CROSS and LEFT joins and comma lists
+/// with ON / WHERE terms that are `OR 0`, `OR 1`, `AND 0` or `AND 1`
+/// forms: rows (LIMIT 7, in order) and plans as the pin's.
+#[test]
+fn generated_join_terms_match_pin() {
+    let path = fresh("jog", JO);
+    let tabs = ["b", "c", "d", "e"];
+    let mut r = Rng(0x0bad_cafe_f00d_1234);
+    let mut qs = Vec::new();
+    for _ in 0..240 {
+        let k = 2 + r.n(3) as usize;
+        let mut ts: Vec<&str> = Vec::new();
+        while ts.len() < k {
+            let t = r.pick(&tabs);
+            if !ts.contains(&t) {
+                ts.push(t);
+            }
+        }
+        let term = |r: &mut Rng, a: &str, b: &str| -> String {
+            let s = match r.n(5) {
+                0 => format!("{a}.x = {b}.x"),
+                1 => format!("{a}.x = {b}.y"),
+                2 => format!("{a}.x = {}", 1 + r.n(5)),
+                3 => format!("{a}.y = {b}.x"),
+                _ => format!("{a}.x > {}", r.n(4)),
+            };
+            match r.n(20) {
+                0..=2 => format!("({s} OR 0)"),
+                3..=4 => format!("({s} OR 1)"),
+                5..=6 => format!("{s} AND 0"),
+                7 => format!("({s} AND 1)"),
+                _ => s,
+            }
+        };
+        let mut from = ts[0].to_string();
+        let mut wh: Vec<String> = Vec::new();
+        for i in 1..k {
+            let prev = ts[r.n(i as u64) as usize];
+            match r.n(5) {
+                0 => {
+                    from.push_str(&format!(", {}", ts[i]));
+                    if r.n(10) < 6 {
+                        wh.push(term(&mut r, ts[i], prev));
+                    }
+                }
+                1 => {
+                    from.push_str(&format!(" CROSS JOIN {}", ts[i]));
+                    if r.n(10) < 3 {
+                        from.push_str(&format!(" ON {}", term(&mut r, ts[i], prev)));
+                    }
+                }
+                2 => from.push_str(&format!(
+                    " LEFT JOIN {} ON {}",
+                    ts[i],
+                    term(&mut r, ts[i], prev)
+                )),
+                _ => from.push_str(&format!(" JOIN {} ON {}", ts[i], term(&mut r, ts[i], prev))),
+            }
+        }
+        if r.n(2) == 0 {
+            let a = r.pick(&ts);
+            let b = r.pick(&ts);
+            wh.push(term(&mut r, a, b));
+        }
+        let cols: Vec<String> = ts.iter().map(|t| format!("{t}.x")).collect();
+        let w = if wh.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", wh.join(" AND "))
+        };
+        qs.push(format!("SELECT {} FROM {from}{w} LIMIT 7", cols.join(", ")));
+    }
+    let bad = diffs_on(&path, &qs, true);
+    assert!(
+        bad.is_empty(),
+        "{} of 240 differ:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}

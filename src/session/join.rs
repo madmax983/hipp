@@ -1124,8 +1124,11 @@ impl<S: Storage> Connection<S> {
         // Per term: its truth probability, and whether a COLLATE /
         // likely() wrapper was removed above it.
         let mut meta: AVec<(i32, bool)> = AVec::new();
+        // (As written: the pin's constant propagation runs before
+        // `whereClauseInsert` simplifies a term, so `u.n = 5 OR 0`
+        // fixes no column — v0.17 review fix.)
         if let Some(f) = filter.as_ref() {
-            conjuncts(f, &mut conj);
+            crate::xplan::conjuncts_as(f, &mut conj, false);
             crate::xplan::conjuncts_meta(f, &mut meta);
         }
         while on_of.len() < conj.len() {
@@ -1134,7 +1137,7 @@ impl<S: Storage> Connection<S> {
         for (i, sp) in sources.iter().enumerate() {
             if let Some(on) = &sp.on {
                 let left = sp.kind == crate::sql::JoinKind::Left;
-                crate::xplan::conjuncts_as(on, &mut conj, !left);
+                crate::xplan::conjuncts_as(on, &mut conj, false);
                 crate::xplan::conjuncts_meta(on, &mut meta);
                 while on_of.len() < conj.len() {
                     on_of.push(if left { Some(i) } else { None });
@@ -1163,6 +1166,13 @@ impl<S: Storage> Connection<S> {
         // `sqlite3ExprCanBeNull`), unless the column is of a LEFT
         // JOIN's right side.
         let mut prop = prop;
+        // Then each term is simplified (`sqlite3ExprSimplifiedAndOr`;
+        // a LEFT JOIN's ON terms keep their literals).
+        for (e, x) in prop.as_mut_slice().iter_mut().zip(excl.iter()) {
+            if !*x {
+                *e = crate::xplan::and_or_simplified(e).clone();
+            }
+        }
         for e in prop.as_mut_slice().iter_mut() {
             let RExpr::IsNull(x, not) = e else { continue };
             let never = match &**x {
@@ -1203,8 +1213,17 @@ impl<S: Storage> Connection<S> {
             |e: &RExpr| crate::query::any_scalar(e, &crate::query::ScalarFn::nondeterministic);
         let mut cmask: AVec<u64> = AVec::new();
         let mut pure: AVec<bool> = AVec::new();
-        for c in conj.iter() {
-            cmask.push(src_mask(c, bands.as_slice()));
+        for (ci, c) in conj.iter().enumerate() {
+            // (A LEFT JOIN's ON term needs its right side, constant or
+            // not: the pin's `prereqAll |= getMask(iJoin)`, v0.17
+            // review fix — `LEFT JOIN e ON 0` lowers e's row estimate.)
+            let own = on_of
+                .as_slice()
+                .get(ci)
+                .copied()
+                .flatten()
+                .map_or(0, |i| 1u64 << i);
+            cmask.push(src_mask(c, bands.as_slice()) | own);
             pure.push(!expr_refs_range(c, &enclosing) && !crate::query::has_sub(c) && !nondet(c));
         }
         // The order the join may deliver.

@@ -1695,8 +1695,8 @@ impl<S: Storage> Connection<S> {
             for (i, a) in plan.result_affs.iter().enumerate() {
                 demoted.push(crate::rules::compound_affinity(
                     *a,
-                    plan.items.as_slice().get(i),
-                    tails.iter().map(|(_, t): &(CompoundOp, Box<_>)| &**t),
+                    &plan,
+                    tails.as_slice(),
                     i,
                 ));
             }

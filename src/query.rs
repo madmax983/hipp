@@ -1196,6 +1196,10 @@ pub struct SubPlan {
     /// derived table the pin does not flatten (`Connection::plan_derived_source`).
     #[cfg(feature = "sql")]
     pub real_cols: AVec<usize>,
+    /// A multi-row VALUES core the pin reads as a UNION ALL chain
+    /// (`SelectStmt::vchain`; v0.17 review fix, `sql`).
+    #[cfg(feature = "sql")]
+    pub vchain: bool,
     /// The pin's select number of this core (v0.16, `explain`;
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]

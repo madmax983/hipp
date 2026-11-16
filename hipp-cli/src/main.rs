@@ -959,7 +959,64 @@ fn split_script(script: &str) -> (Vec<String>, bool) {
 /// What a dot-command wants the shell loop to do next.
 enum Flow {
     Continue,
+    /// `.exit` / `.quit`: stop with the session's status.
     Exit,
+    /// `.exit N` with N not 0 (v0.17): stop at once with status N
+    /// (its low byte), as the pin's `exit(N)`.
+    ExitWith(u8),
+}
+
+/// The pin shell's `integerValue` of an `.exit` argument (v0.17):
+/// a decimal or `0x` hexadecimal integer prefix, 0 for none.
+fn exit_status(arg: &str) -> i64 {
+    let (neg, digits) = match arg.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, arg.strip_prefix('+').unwrap_or(arg)),
+    };
+    let (radix, digits) = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(h) => (16, h),
+        None => (10, digits),
+    };
+    let mut v: i64 = 0;
+    for c in digits.chars() {
+        match c.to_digit(radix) {
+            Some(d) => v = v.wrapping_mul(i64::from(radix)).wrapping_add(i64::from(d)),
+            None => break,
+        }
+    }
+    if neg { v.wrapping_neg() } else { v }
+}
+
+/// Whether a dot-command reads the database (v0.17): the pin's shell
+/// opens it for these and for SQL only, so `.quit`, `.exit` or an
+/// unknown command make no file.
+fn needs_db(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        ".tables" | ".schema" | ".dump" | ".databases" | ".parameter" | ".param" | ".open"
+    )
+}
+
+/// A dot-command that needs no database (v0.17; `needs_db`).
+fn dot_nodb(line: &str) -> Result<Flow, String> {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().map(str::trim).unwrap_or("");
+    match cmd {
+        // (`.quit` takes no status; `.exit 0` is `.exit`.)
+        ".exit" => match exit_status(shell_args(arg).first().map_or("", String::as_str)) {
+            0 => Ok(Flow::Exit),
+            n => Ok(Flow::ExitWith(n as u8)),
+        },
+        ".quit" => Ok(Flow::Exit),
+        _ => Err(format!(
+            "unknown command or invalid arguments:  \"{}\". Enter \".help\" for help",
+            cmd.get(1..).unwrap_or("")
+        )),
+    }
 }
 
 /// Split a dot-command line into arguments the way the oracle
@@ -1023,7 +1080,6 @@ where
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().map(str::trim).unwrap_or("");
     match cmd {
-        ".exit" | ".quit" => Ok(Flow::Exit),
         ".parameter" | ".param" => {
             let args = shell_args(arg);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1369,7 +1425,7 @@ where
             let _ = out.write_all(b"COMMIT;\n");
             Ok(Flow::Continue)
         }
-        _ => Err(format!("unknown command: {cmd}")),
+        _ => dot_nodb(line),
     }
 }
 
@@ -1391,25 +1447,30 @@ fn no_sql(sql: &str) -> bool {
 
 /// `dispatch`, opening the database `path` first if no input has
 /// needed it yet (v0.17: as the pin's shell, which opens it on the
-/// first statement or command, so an empty script, `-help` or
-/// `-version` makes no file).
+/// first statement or database command, so an empty script, `-help`,
+/// `-version`, `.quit` or `.exit` makes no file). `dot`: `input` is a
+/// dot-command (a line whose first character is `.`), else SQL.
 async fn dispatch_lazy(
     db: &mut Option<Db>,
     path: &str,
     input: &str,
+    dot: bool,
     params: &mut Params,
     out: &mut impl Write,
 ) -> Result<Flow, String> {
+    if dot && !needs_db(input.split_whitespace().next().unwrap_or("")) {
+        return dot_nodb(input);
+    }
     let db = match db {
         Some(d) => d,
         // (Blank and comment-only input needs no database.)
-        None if no_sql(input) => return Ok(Flow::Continue),
+        None if !dot && no_sql(input) => return Ok(Flow::Continue),
         // (A first `.open` replaces the database before anything
         // reads it.)
         None if input.split_whitespace().next() == Some(".open") => db.insert(open_db(":memory:")?),
         None => db.insert(open_db(path)?),
     };
-    dispatch(db, input, params, out).await
+    dispatch(db, input, dot, params, out).await
 }
 
 /// Execute one input unit (statement or dot-command) against the
@@ -1417,11 +1478,12 @@ async fn dispatch_lazy(
 async fn dispatch(
     db: &mut Db,
     input: &str,
+    dot: bool,
     params: &mut Params,
     out: &mut impl Write,
 ) -> Result<Flow, String> {
     let trimmed = input.trim();
-    if trimmed.starts_with('.') {
+    if dot {
         let mut parts = trimmed.splitn(2, char::is_whitespace);
         if parts.next() == Some(".open") {
             let path = parts.next().map(str::trim).unwrap_or("");
@@ -1459,18 +1521,66 @@ async fn dispatch(
     }
 }
 
-/// `-help` (v0.17): the pin shell's usage text, to stderr, listing
-/// the options hipp takes.
+/// `-help` (v0.17): the pin shell's usage text, to stderr, byte for
+/// byte (its option list too: hipp refuses the options it does not
+/// take, `PIN_OPTIONS`, rather than reading one as a file name).
 fn usage(argv0: &str) {
     eprintln!("Usage: {argv0} [OPTIONS] [FILENAME [SQL...]]");
-    eprintln!("FILENAME is the name of an SQLite database. A new database is created");
-    eprintln!("if the file does not previously exist. Defaults to :memory:.");
-    eprintln!("OPTIONS include:");
-    eprintln!("   --                   treat no subsequent arguments as options");
-    eprintln!("   -help                show this message");
-    eprintln!("   -version             show SQLite version");
+    eprint!("{}", PIN_USAGE);
 }
 
+/// The pin's `-help` text after its first line.
+const PIN_USAGE: &str = "FILENAME is the name of an SQLite database. A new database is created
+if the file does not previously exist. Defaults to :memory:.
+OPTIONS include:
+   --                   treat no subsequent arguments as options
+   -append              append the database to the end of the file
+   -ascii               set '.mode ascii'
+   -bail                stop after hitting an error
+   -batch               force batch I/O
+   -box                 set '.mode box'
+   -cmd COMMAND         run \"COMMAND\" before reading stdin
+   -cmdline-edit BOOL   enable or disable command-line editing
+   -column              set '.mode column'
+   -csv                 set '.mode csv -limits off'
+   -deserialize         open the database using sqlite3_deserialize()
+   -echo                print inputs before execution
+   -escape T            ctrl-char escape; T is one of: symbol, ascii, off
+   -init FILENAME       read/process named file
+   -[no]header          turn headers on or off
+   -help                show this message
+   -html                set '.mode html'
+   -ifexists            only open if database already exists
+   -interactive         force interactive I/O
+   -json                set '.mode json'
+   -line                set '.mode line'
+   -list                set '.mode list'
+   -lookaside SIZE N    use N entries of SZ bytes for lookaside memory
+   -markdown            set '.mode markdown'
+   -maxsize N           maximum size for a --deserialize database
+   -memtrace            trace all memory allocations and deallocations
+   -mmap N              default mmap size set to N
+   -newline SEP         set output row separator. Default: '\\n'
+   -nofollow            refuse to open symbolic links to database files
+   -noinit              Do not read the ~/.sqliterc file at startup
+   -nonce STRING        set the safe-mode escape nonce
+   -no-rowid-in-view    Disable rowid-in-view using sqlite3_config()
+   -nullvalue TEXT      set text string for NULL values. Default ''
+   -pagecache SIZE N    use N slots of SZ bytes each for page cache memory
+   -pcachetrace         trace all page cache operations
+   -quote               set '.mode quote'
+   -readonly            open the database read-only
+   -safe                enable safe-mode
+   -screenwidth N       use N as the default screenwidth 
+   -separator SEP       set output column separator. Default: '|'
+   -stats               print memory stats before each finalize
+   -table               set '.mode table'
+   -tabs                set '.mode tabs'
+   -unsafe-testing      allow unsafe commands and modes for testing
+   -version             show SQLite version
+   -vfs NAME            use NAME as the default VFS
+   -vfstrace            enable tracing of all VFS calls
+";
 /// The pin shell's other options (its `-help` list and the ones it
 /// takes unlisted): hipp takes none of them, and says so rather than
 /// reading one as a file name.
@@ -1616,26 +1726,37 @@ fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
     let mut out = std::io::stdout().lock();
     let mut params = Params::new();
 
-    // One-shot mode: run the SQL arguments (each possibly several
-    // statements) in order, stop at the first error. (The pin opens
-    // the database for any argument, blank ones too.)
+    // One-shot mode: run the arguments in order, stop at the first
+    // error. An argument whose first character is `.` is one
+    // dot-command; any other is SQL (possibly several statements),
+    // for which the pin opens the database even when it is blank
+    // (v0.17: a dot-command opens it only if it reads it).
     if !cmds.is_empty() {
-        if db.is_none() {
-            match open_db(path) {
-                Ok(d) => *db = Some(d),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    return ExitCode::FAILURE;
+        for arg in cmds {
+            let dot = arg.starts_with('.');
+            if !dot && db.is_none() {
+                match open_db(path) {
+                    Ok(d) => *db = Some(d),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
-        }
-        for stmt in cmds.iter().flat_map(|sql| split_statements(sql)) {
-            match block_on(dispatch_lazy(db, path, &stmt, &mut params, &mut out)) {
-                Ok(Flow::Continue) => {}
-                Ok(Flow::Exit) => return ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    return ExitCode::FAILURE;
+            let units = if dot {
+                vec![arg.trim_end().to_string()]
+            } else {
+                split_statements(arg)
+            };
+            for unit in units {
+                match block_on(dispatch_lazy(db, path, &unit, dot, &mut params, &mut out)) {
+                    Ok(Flow::Continue) => {}
+                    Ok(Flow::Exit) => return ExitCode::SUCCESS,
+                    Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
         }
@@ -1678,10 +1799,24 @@ fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
         // Lines keep their trailing spaces (the pin's input buffer
         // does, and a schema text can hold them).
         let line = line.as_str();
-        if buffer.is_empty() && line.trim_start().starts_with('.') {
-            match block_on(dispatch_lazy(db, path, line.trim(), &mut params, &mut out)) {
+        // The pin's `process_input`: between statements, a line whose
+        // first character is `.` is a dot-command (one with leading
+        // blanks is SQL: v0.17 fix) and one starting `#` is skipped.
+        if buffer.is_empty() && line.starts_with('#') {
+            continue;
+        }
+        if buffer.is_empty() && line.starts_with('.') {
+            match block_on(dispatch_lazy(
+                db,
+                path,
+                line.trim_end(),
+                true,
+                &mut params,
+                &mut out,
+            )) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return status(failed),
+                Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     failed = true;
@@ -1696,9 +1831,10 @@ fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
         if buffer.trim_end().ends_with(';') && split_script(&buffer).1 {
             let script = std::mem::take(&mut buffer);
             for stmt in split_statements(&script) {
-                match block_on(dispatch_lazy(db, path, &stmt, &mut params, &mut out)) {
+                match block_on(dispatch_lazy(db, path, &stmt, false, &mut params, &mut out)) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return status(failed),
+                    Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
                     Err(e) => {
                         // The rest of this input chunk is skipped (the
                         // pin's shell runs a chunk as one exec, which
@@ -1714,9 +1850,10 @@ fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
     // A trailing unterminated statement still runs at EOF.
     if !buffer.trim().is_empty() {
         for stmt in split_statements(&buffer) {
-            match block_on(dispatch_lazy(db, path, &stmt, &mut params, &mut out)) {
+            match block_on(dispatch_lazy(db, path, &stmt, false, &mut params, &mut out)) {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Exit) => return status(failed),
+                Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     return ExitCode::FAILURE;
