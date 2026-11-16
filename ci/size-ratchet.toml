@@ -13,7 +13,9 @@
 # +828 B (Bolt): table-leaf insert fast path in btree_insert.
 # 76,952 -> 76,904 (Bolt): vec_zeroed builds page images with one
 # zeroed allocation (-12.2% instructions on bolt_workload): -48 B.
-ratchet = 76904
+# +24 B (Bolt): leaf_cells_meta reserves its cell table once
+# (dhat bytes -20.2% on bolt_workload).
+ratchet = 76928
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -62,7 +64,9 @@ justify_over = 4096
 # 478,268 -> 478,556 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +288 B.
-ratchet = 478556
+# +16 B (Bolt): leaf_cells_meta reserves its cell table once
+# (dhat bytes -20.2% on bolt_workload).
+ratchet = 478572
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -110,7 +114,9 @@ justify_over = 16384
 # 964,732 -> 965,196 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +464 B.
-ratchet = 965196
+# +16 B (Bolt): leaf_cells_meta reserves its cell table once
+# (dhat bytes -20.2% on bolt_workload).
+ratchet = 965212
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -152,7 +158,9 @@ justify_over = 32768
 # 1,061,392 -> 1,061,864 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +472 B.
-ratchet = 1061864
+# +16 B (Bolt): leaf_cells_meta reserves its cell table once
+# (dhat bytes -20.2% on bolt_workload).
+ratchet = 1061880
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
