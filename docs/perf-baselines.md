@@ -438,3 +438,35 @@ t-gmax 852,164 B.
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: reserve the cell table once
+
+`leaf_cells_meta` reserves `min(ncell, pointers that fit on the page)`
+entries up front, so the table is one allocation and a corrupt `ncell`
+reserves no more than the loop could have pushed. Every caller
+benefits (table INSERT, the scan cache, row rewrites); the workload
+exercises table INSERT. Workload checksums identical (176089 / 657610
+/ 4083309 at n=500/1000/2000). Test pass/fail set identical
+before/after (1036 tests; the 899 failures are the absent `sqlite3`
+oracle, same on the baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 187,442,516   | 184,216,372   | -1.72%  |
+| 1000 | 440,999,108   | 435,412,115   | -1.27%  |
+| 2000 | 1,114,110,743 | 1,099,772,573 | -1.29%  |
+
+dhat (n=1000): 133,470,797 -> 106,515,532 bytes (**-20.2%**);
+437,354 -> 427,368 blocks (-2.28%); t-gmax unchanged at 852,164 B.
+n=1000: `leaf_cells_meta` inclusive 36,477,188 -> 30,218,092
+(-17.2%); `btree_insert` inclusive 69,096,129 -> 63,178,295. The
+gate cleared is allocation bytes (>= 10%); the instruction delta is
+below the 5% floor and is not claimed as the win.
+
+Negative result, not shipped: decoding the 1- and 2-byte varints
+(payload length, rowid) inline in `leaf_cells_meta` on top of the
+reservation brings n=1000 to 428,109,167 Ir (a further -1.68%;
+`leaf_cells_meta` inclusive 22,488,993). Below the floor on its own.
+
+Size gates: tiny +24 B, full +16 B, max +16 B, xl +16 B; ratchets
+raised by those amounts (each well under `justify_over`).

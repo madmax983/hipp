@@ -182,7 +182,11 @@ pub fn leaf_cells_meta<E>(bytes: &[u8], page: u32, usable: usize) -> Result<AVec
     if h.kind != KIND_LEAF_TABLE {
         return Err(Error::CorruptPage { page });
     }
-    let mut out = AVec::new();
+    // One allocation for the whole cell table instead of ~log2(ncell)
+    // regrowths; capped at the pointers the page can hold, so a corrupt
+    // `ncell` reserves no more than the loop could have pushed.
+    let fits = bytes.len().saturating_sub(h.cell_ptrs_off()) / 2;
+    let mut out = AVec::with_capacity(usize::from(h.ncell).min(fits));
     for i in 0..usize::from(h.ncell) {
         let at = cell_ptr::<E>(bytes, &h, i, page)?;
         let cell_bytes = bytes.get(at..).ok_or(Error::CorruptPage { page })?;
