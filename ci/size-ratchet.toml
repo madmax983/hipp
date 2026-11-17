@@ -66,7 +66,10 @@ justify_over = 4096
 # -15.9% allocations on bolt_workload): +288 B.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 478572
+# +640 B (Bolt): prepare lexes each statement once for the TEMP /
+# ATTACH routers and the parse (prepare -18.8% instructions on
+# bolt_workload).
+ratchet = 479212
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -116,7 +119,10 @@ justify_over = 16384
 # -15.9% allocations on bolt_workload): +464 B.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 965212
+# +448 B (Bolt): prepare lexes each statement once for the TEMP /
+# ATTACH routers and the parse (prepare -18.8% instructions on
+# bolt_workload).
+ratchet = 965660
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -160,7 +166,10 @@ justify_over = 32768
 # -15.9% allocations on bolt_workload): +472 B.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 1061880
+# +600 B (Bolt): prepare lexes each statement once for the TEMP /
+# ATTACH routers and the parse (prepare -18.8% instructions on
+# bolt_workload).
+ratchet = 1062480
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
