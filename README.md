@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 481,048 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 968,448 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,066,700 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 483,784 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 971,976 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,070,172 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,17 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **ORDER BY / OFFSET parity** (unit `order_offset`, ungated fixes).
+  The OFFSET skips a row before its result columns are computed on
+  every path the pin does so (FROM-less cores, subqueries, views,
+  CTEs, UNION ALL chains, windows, aggregates), so `SELECT
+  abs(-9223372036854775808) LIMIT 1 OFFSET 1` is no row; an ORDER BY
+  past the rowid or a UNIQUE NOT NULL key never computes its later
+  terms (the pin's `isOrderDistinct`); a FROM subquery's ORDER BY the
+  pin omits (`SQLITE_OmitOrderBy`) is dropped, and a co-routine's own
+  order delivers its reader's ORDER BY by column number
+  (`SQLITE_OrderBySubq`), whatever the reader's collation; a UNION ALL
+  ORDER BY keeps equal rows in core order.
 - **Planner and CLI parity** (unit `gaps_plan_cli`, ungated fixes).
   `INDEXED BY` names an index of the source's own table on every path
   (a plain scan accepted another table's index); WHERE / ON terms are

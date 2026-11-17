@@ -11,6 +11,160 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: order_offset — ORDER BY / OFFSET result divergences (2026-11-17)
+
+Wave 18's unit (owner decision 2026-11-17: close the result-level
+wrong answers recorded against 3.54.1): the three ORDER BY / OFFSET
+items `gaps_eval` and `gaps_plan_cli` left, each probed on the live
+pin first (notes below), fixed at the root and differential-tested.
+All ungated fixes on claimed paths (ADR 0001); no new leaf.
+
+**Shipped.**
+1. **The OFFSET skips a row before its result columns are
+   computed** (the pin's `selectInnerLoop` codes `codeOffset` ahead of
+   the columns when neither a sorter nor DISTINCT handles the rows):
+   `pre_skip` / `arm_bounds` give each projection the rows it leaves
+   as empty placeholders the row window drops — FROM-less cores,
+   subqueries over tables (FROM, scalar, IN, EXISTS), views, CTEs,
+   window queries (the outer columns; the window values still see
+   every row), aggregates (a skipped group's aggregates still step and
+   finalize, so `sum()`'s overflow is raised; also the streamed fold),
+   an ORDER BY the loop or the grouping delivers, and across a UNION
+   ALL chain's cores. In such a chain a plain core also stops at the
+   rows the LIMIT still takes and a core past them never runs, and a
+   DISTINCT subquery under a LIMIT drops duplicates as they come
+   (`SELECT n, c FROM t UNION ALL SELECT abs(-9223372036854775808), 9
+   LIMIT 3 OFFSET 1` answers; both were found by the generated
+   corpus). DISTINCT, a sorter and UNION / INTERSECT / EXCEPT still
+   compute first, as on the pin.
+2. **An ORDER BY whose loop makes the rows distinct delivers its
+   later terms** (the pin's `isOrderDistinct` / `orderDistinctMask` in
+   `wherePathSatisfiesOrderBy`): past the rowid, a UNIQUE index whose
+   key columns past the equalities are NOT NULL (no `IS` equality),
+   or a WITHOUT ROWID key whose table columns are all NOT NULL, every
+   later term that reads the table or is constant
+   (`sqlite3ExprIsConstant`: `query::factorable`) is delivered and
+   never computed — `ORDER BY rowid, abs(-9223372036854775808)` and
+   `ORDER BY a, abs(..)` over a UNIQUE NOT NULL `a` answer. A later
+   term of another kind (`random()`, a subquery) sorts every term (the
+   pin's -1, costed as delivered: `xplan::UNSAT`), so `ORDER BY rowid,
+   random()` keeps `SCAN u` and a sorter. A delivered ORDER BY is then
+   reduced to its plain column terms (`order_delivered`, the natural
+   rowid scan included), and a join drops the terms its path delivers
+   only by distinctness (`xjoin::path_order`'s `od`, `JPlan::ob_od`).
+3. **A FROM subquery's ORDER BY the pin omits is dropped**
+   (`SQLITE_OmitOrderBy` in select.c's `sqlite3Select`: no LIMIT, the
+   reader has an ORDER BY, the merge key of a compound other than
+   UNION ALL, or more than one source, and no aggregate but count(),
+   min(), max() — `SF_OrderByReqd` — and no window function; not a
+   recursive CTE nor a MATERIALIZED one): `cte.rs` `Outer::omit`,
+   before the subquery is walked (a view's or CTE's body once
+   expanded). The flattener's test reads the dropped order
+   (`flattens`), so `sum(n), group_concat(x) FROM (... ORDER BY n
+   DESC) ORDER BY 1` keeps its co-routine and order.
+4. **A lone co-routine's own order delivers its reader's ORDER BY**
+   (`SQLITE_OrderBySubq`, where.c's `wherePathMatchSubqueryOB`;
+   `sub_delivers`): the subquery's written ORDER BY (kept: under a
+   LIMIT) or a compound's merge key (`multiSelectOrderBy`: its terms,
+   then every other column ascending, for an operator other than
+   UNION ALL) matches each reader term by result column number alone —
+   a bare column, same direction and NULLS placement, never the
+   collation, never backwards — so `WITH q(x) AS (SELECT 2.5 UNION
+   SELECT c FROM t) SELECT x FROM q ORDER BY 1` over a NOCASE `c` is
+   the merge's NOCASE order (2.5, A, b, C) with no sorter.
+5. **A UNION ALL compound's ORDER BY keeps equal rows in core order**
+   (found on the way, pre-existing): the pin merges a TK_ALL node by
+   the ORDER BY terms alone, left core first; `run_compound` merged it
+   by the full-row key, which ordered ties by their other columns
+   (`... UNION ALL SELECT 'a', 1 ORDER BY 1`). Only operators other
+   than UNION ALL merge now; the final stable sort is the ORDER BY.
+
+**Oracle-probing notes** (live pin, rows and EQP): `SELECT
+abs(-9223372036854775808) LIMIT 1 OFFSET 1`, its FROM / scalar / IN /
+CTE / view forms, `X UNION ALL SELECT 2 LIMIT 1 OFFSET 1` (2), `SELECT
+count(*), X LIMIT 1 OFFSET 1`, `abs(count(*)-..) ... OFFSET 1`, a
+window's `abs(row_number() OVER (ORDER BY n DESC) - ..)` OFFSET 4 all
+answer; `SELECT DISTINCT X ...`, `X UNION SELECT 2 ...`, `ORDER BY n
+... OFFSET` (sorter), `sum(abs(..)) ... OFFSET 1` and `sum(huge)`
+(finalized) fail; `GROUP BY c ... LIMIT 2 OFFSET 1` prints a group
+then fails on the next one's columns. `ORDER BY rowid, X`, `rowid
+DESC, X`, `rowid NULLS LAST, X`, `rowid, X + a`, `rowid, (SELECT X
+WHERE u.a)` answer; `rowid, (SELECT X)` fails; `rowid, random()` is
+`SCAN u` + `USE TEMP B-TREE FOR ORDER BY`; `a, X` over a nullable
+UNIQUE `a` fails, over NOT NULL answers; `b, rowid, X` over a plain
+index answers, `b, a, X` fails; `WHERE a = 2 ORDER BY (SELECT X)` and
+`random()` answer with no sorter (`whereShortCut` sets `nOBSat`);
+WITHOUT ROWID `k, X` / `k DESC, v + X` fail with a nullable `v`;
+joins: `u.rowid, t.rowid, X` and `u.rowid, X, w.a` answer, `u.rowid,
+t.n, X` fails. Omission: `(... ORDER BY n DESC) ORDER BY x` (ties in
+rowid order), `(... UNION ALL ... ORDER BY n DESC) ORDER BY x` (EQP
+`COMPOUND QUERY`), the join and `(SELECT 1)` readers, CTEs and views
+drop it; `LIMIT`, `group_concat` / `sum` / `total` / `avg` readers,
+GROUP BY with `group_concat`, `MATERIALIZED`, a recursive CTE keep it;
+count() / max() readers drop it. Co-routine order: `ORDER BY 1`, `x`,
+`x COLLATE NOCASE` no sorter (NOCASE order), `x COLLATE BINARY`, `x
+DESC`, `x NULLS LAST` sort (BINARY); `(... ORDER BY x LIMIT 99) ORDER
+BY x, n` is `LAST TERM OF ORDER BY`; `ORDER BY 1 COLLATE BINARY` in
+the subquery is column 1 (`resolveOrderGroupBy` strips the COLLATE of
+an integer), `x COLLATE BINARY` is none. UNION ALL ties: `t2 UNION
+ALL t ORDER BY n DESC` is `B|5` before `|5` (left core first).
+
+**Tests.** `tests/order_offset_v17.rs` (9 tests, rows in order and,
+where shapes allow, EQP trees against the live pin): 60 OFFSET shapes
+over every executor path; 37 distinct-tail shapes (rowid, UNIQUE,
+WITHOUT ROWID, joins, subqueries, DISTINCT, GROUP BY, windows); 31
+omitted-ORDER-BY shapes (8 with plans); 24 co-routine-order shapes
+with plans; 11 UNION ALL tie shapes; generated corpora (xorshift): 160
+OFFSET queries, 140 ORDER BY tails with plans, 160 FROM subqueries
+with and without ORDER BY / LIMIT under ordering, joining, aggregating
+and compound readers. `hipp-cli/tests/cli_v17_order_offset.rs` (4
+tests): the same fixes on stdin scripts (rows, error presence, exit
+status, EQP text) and one-shot arguments, byte for byte.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (its `--features vm` workspace suite included: the frozen VM's
+suites stay green, the new shapes fall back); `tests/depth_v16.rs` and
+`tests/triggers_v16.rs` with debug info: pass (no recursion added; no
+`STACK_*` change).
+
+**Size Δ.** tiny 0 (76,928); full +2,720 (481,064 → 483,784); max
++3,504 (968,472 → 971,976); xl +3,456 (1,066,716 → 1,070,172).
+Ratchets raised to the measured figures with a justification
+(`ci/size-ratchet.toml`); offsets taken first: one `arm_bounds` for
+both compound executors and the skipped group's aggregates in the
+existing finalize loop (-440 B on full).
+
+**Honest gaps.**
+- A GROUP BY over a co-routine's order: the pin's `wherePathMatchSubqueryOB`
+  also delivers a GROUP BY (direction ignored), so its groups come in
+  the subquery's order (`SELECT x, group_concat(n) FROM (SELECT c AS
+  x, n FROM t ORDER BY 1 DESC) GROUP BY x` is C, b, A, NULL); hipp
+  sorts its groups. Likewise a DISTINCT over one (EQP only).
+- A partial match of a co-routine's order (`(... ORDER BY x LIMIT 99)
+  ORDER BY x, n`): the pin sorts only the later terms within runs of
+  the matched ones (`LAST TERM OF ORDER BY`); hipp sorts the whole
+  ORDER BY (rows differ only if the reader's collation splits the
+  subquery's runs differently; EQP differs). A co-routine in a join
+  delivers nothing in hipp (it keeps FROM order, pre-existing).
+- A subquery's `ORDER BY 1 COLLATE BINARY` is result column 1 on the
+  pin (the COLLATE of an integer term is stripped before
+  `iOrderByCol`); hipp's resolved term is a COLLATE expression, so a
+  reader's `ORDER BY x` is sorted again (rows in the reader's
+  collation).
+- A WITHOUT ROWID table read in its own order (no access path) whose
+  columns are all NOT NULL: `ORDER BY k, abs(..)` answers on the pin,
+  fails in hipp (the natural scan's delivered order is not kept; the
+  DESC form, an access path, matches).
+- The omission is not applied under a window function's reader (the
+  pin's rewrite moves the FROM clause into a subquery that keeps or
+  drops the ORDER BY by its own rules), nor for UPDATE ... FROM.
+- Without `sql` (the `query`-only builds) the synchronous projection
+  still computes an OFFSET row's columns.
+- The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) keeps its
+  own OFFSET handling (it computes a skipped row's columns and skips a
+  skipped group's finalize); its strict suites stay green and
+  `tests/order_offset_v17.rs` runs on today's executor under `vm`.
+
 ### Parity: gaps_plan_cli — planner and CLI divergences (2026-11-15)
 
 Wave 17's second parity unit: the planner and hipp-cli divergences
@@ -298,7 +452,8 @@ named.
    options it does not take (`PIN_OPTIONS`).
 
 Not fixed, with evidence:
-- **ORDER BY over a UNION co-routine** (finding 6, pre-existing): the
+- **ORDER BY over a UNION co-routine** (closed in v0.17: order_offset)
+  (finding 6, pre-existing): the
   pin satisfies an outer `ORDER BY 1` from a co-routine's own ORDER BY
   (its `wherePathMatchSubqueryOB`, `SQLITE_OrderBySubq`) matching only
   the column number, never the collation, so `WITH q(x) AS (SELECT 2.5
@@ -366,7 +521,8 @@ iterator and is kept out of line (it was inlined into five callers),
 which took the first measurement's +3,057 B on `full` down to +820.
 
 Honest gaps the review fixes leave (new or found on the way):
-- ORDER BY over a co-routine's own order (finding 6 above, the pin's
+- ORDER BY over a co-routine's own order (closed in v0.17:
+  order_offset) (finding 6 above, the pin's
   `SQLITE_OrderBySubq` and `SQLITE_OmitOrderBy`): hipp sorts with the
   outer column's collation, so `WITH q(x) AS (SELECT 2.5 UNION SELECT c
   FROM t) SELECT x FROM q ORDER BY 1` over a NOCASE `c` is in BINARY
@@ -513,7 +669,7 @@ in `session/join.rs` is `planner`-only, so sharing it would save in
 
 **Honest gaps.**
 - Over a table, an ORDER BY led by the rowid (or a unique index the
-  loop reads) is the pin's scan order, so its later terms go
+  loop reads) (closed in v0.17: order_offset) is the pin's scan order, so its later terms go
   uncomputed there (`SELECT a FROM t ORDER BY a, abs(..)` answers on
   the pin, fails in hipp): a planner rule (`isOrderDistinct`) left
   for a planner unit.
@@ -625,8 +781,8 @@ Honest gaps the review fixes leave (new or found on the way):
 - A group that finalizes its aggregates first computes the ones its
   terms then read twice (no cache); only groups with an aggregate in
   a skippable position pay it.
-- The pin skips an OFFSET row before computing its result columns;
-  hipp computes a FROM-less core's (and a subquery's over a table, and
+- The pin skips an OFFSET row before computing its result columns
+  (closed in v0.17: order_offset); hipp computes a FROM-less core's (and a subquery's over a table, and
   a UNION ALL arm's) first, so `SELECT abs(-9223372036854775808)
   LIMIT 1 OFFSET 1` fails where the pin returns no row (pre-existing;
   a top-level query over a table already matches).

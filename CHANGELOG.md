@@ -5,6 +5,28 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### ORDER BY / OFFSET parity (wave 18, unit `order_offset`)
+
+- Fixes (ungated): the OFFSET skips a row before its result columns
+  are computed — FROM-less cores, subqueries, views, CTEs, UNION ALL
+  chains (whose plain cores also stop at the LIMIT), window queries,
+  aggregates (their aggregates still step) and delivered ORDER BYs —
+  as the pin's `selectInnerLoop` does; an ORDER BY whose loop makes the
+  rows distinct (the rowid, a UNIQUE NOT NULL key, a NOT NULL WITHOUT
+  ROWID key, a join's distinct loops) delivers its later
+  table-reading or constant terms uncomputed (`isOrderDistinct`), and
+  any other later term sorts the whole ORDER BY; a FROM subquery's
+  ORDER BY is dropped where the pin's `SQLITE_OmitOrderBy` drops it
+  (kept under a LIMIT, an order-sensitive aggregate, a window or a
+  MATERIALIZED CTE); a lone co-routine's ORDER BY or compound merge key
+  delivers the reader's ORDER BY by column number
+  (`SQLITE_OrderBySubq`); a DISTINCT subquery under a LIMIT stops at
+  it; a UNION ALL compound's ORDER BY keeps ties in core order.
+- Tests: `tests/order_offset_v17.rs` (rows and EQP against the live
+  pin, generated corpora), `hipp-cli/tests/cli_v17_order_offset.rs`.
+- Size: tiny 0, full +2,720 B, max +3,504 B, xl +3,456 B (ratchets
+  raised to the measured figures).
+
 ### Planner and CLI parity (wave 17, unit `gaps_plan_cli`)
 
 - Fixes (ungated): `INDEXED BY` an index of another table (or of a

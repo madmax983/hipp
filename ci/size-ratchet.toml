@@ -88,7 +88,13 @@ justify_over = 4096
 # `compound_affinity` made non-generic and out of line (-2,237 B).
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 481064
+# +2,720 B (v0.17 order_offset, ungated fixes): the OFFSET skips rows
+# before their result columns (pre_skip / arm_bounds, UNION ALL chain
+# caps), the omitted FROM-subquery ORDER BY (cte.rs), the co-routine
+# order (sub_delivers), the delivered-ORDER-BY trim and the UNION ALL
+# ORDER BY merge; offsets taken: shared arm_bounds, the skipped group's
+# aggregates in the existing finalize loop (-440 B).
+ratchet = 483784
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -161,7 +167,9 @@ justify_over = 16384
 # +24 B (Bolt, measured after merging main into v0.17 wave 17; +16 B on
 # main): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 968472
+# +3,504 B (v0.17 order_offset): full's fixes plus the planner's
+# isOrderDistinct rule (xplan::order_sat, the UNSAT cost case).
+ratchet = 971976
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -229,7 +237,9 @@ justify_over = 32768
 # JOIN's constant ON term. Same offset.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 1066716
+# +3,456 B (v0.17 order_offset): max's fixes plus the join path's
+# orderDistinctMask terms (xjoin::path_order od, join.rs drop).
+ratchet = 1070172
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

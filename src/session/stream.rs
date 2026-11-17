@@ -202,7 +202,7 @@ fn agg_streams(p: &crate::query::AggParts<'_>) -> bool {
 /// order of the index or rowid loop that reads it, when that loop
 /// delivers every term; else its rowid (or INTEGER PRIMARY KEY),
 /// ascending, over a table read in rowid order.
-fn rowid_order(sp: &SourcePlan, order: &[(RExpr, crate::sql::SortOrder)]) -> bool {
+pub(super) fn rowid_order(sp: &SourcePlan, order: &[(RExpr, crate::sql::SortOrder)]) -> bool {
     // An index (or rowid) loop that delivers every term (v0.16
     // `expr_index`'s access planner).
     #[cfg(feature = "expr_index")]
@@ -1041,6 +1041,11 @@ impl<S: Storage> Statement<'_, S> {
                         Acc::Ext(b) => b.clone().unwrap_or(OwnedValue::Null),
                     });
                 }
+                // The one row an OFFSET skips: its aggregates finish,
+                // its columns are never computed (`pre_skip`).
+                if s.window.0 > 0 {
+                    return Ok(());
+                }
                 let mut out = AVec::new();
                 let mut at = 0usize;
                 for it in s.qp.items.iter() {
@@ -1070,7 +1075,16 @@ impl<S: Storage> Statement<'_, S> {
                     s.qp.distinct,
                     s.window,
                 );
-                self.project_qp_async(&s.qp, rows.as_slice(), cap).await?
+                let pre = pre_skip(
+                    s.qp.items.as_slice(),
+                    s.qp.group_by.as_slice(),
+                    s.qp.order_by.as_slice(),
+                    s.qp.sources.as_slice(),
+                    s.qp.distinct,
+                    s.window.0,
+                );
+                self.project_qp_async(&s.qp, rows.as_slice(), cap, pre)
+                    .await?
             }
             Mode::Sort(out) => core::mem::take(out),
         };

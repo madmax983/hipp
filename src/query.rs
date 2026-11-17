@@ -8289,8 +8289,8 @@ pub fn and_terms<'e>(e: &'e RExpr, out: &mut AVec<&'e RExpr>) {
 }
 
 /// A constant the pin computes once per statement: no column, no
-/// subquery, nothing non-deterministic.
-fn factorable(e: &RExpr) -> bool {
+/// subquery, nothing non-deterministic (its `sqlite3ExprIsConstant`).
+pub(crate) fn factorable(e: &RExpr) -> bool {
     #[cfg(feature = "sql")]
     if any_scalar(e, &|f| f.nondeterministic()) {
         return false;
