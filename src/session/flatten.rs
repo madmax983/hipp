@@ -601,6 +601,9 @@ impl<S: Storage> Connection<S> {
                     .is_some_and(|c| c.mat != 0 || !matches!(c.rec, crate::sql::RecMark::None))
                 || d.limit.is_some()
                 || !matches!(f.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left)
+                // (A VALUES chain of one-row selects throughout, the
+                // pin's `SF_MultiValue`, takes no term: v0.17, probed.)
+                || (d.vchain && d.compound.iter().all(|(_, c)| c.vchain))
             {
                 continue;
             }

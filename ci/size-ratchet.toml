@@ -94,7 +94,12 @@ justify_over = 4096
 # order (sub_delivers), the delivered-ORDER-BY trim and the UNION ALL
 # ORDER BY merge; offsets taken: shared arm_bounds, the skipped group's
 # aggregates in the existing finalize loop (-440 B).
-ratchet = 483784
+# 483,784 -> 486,884 (v0.17 values_chain, ungated correctness; STATUS.md):
+# +3,100 B. Unknown collations looked up only where the pin does
+# (`coll_misses`, `key_coll`, `lead_colls`), VALUES parsed as the pin's
+# chain / co-routine segments with the later chain's wrapper, VALUES
+# column names from a first-row column; `chain_reals` removed.
+ratchet = 486884
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -169,7 +174,10 @@ justify_over = 16384
 # (dhat bytes -20.2% on bolt_workload).
 # +3,504 B (v0.17 order_offset): full's fixes plus the planner's
 # isOrderDistinct rule (xplan::order_sat, the UNSAT cost case).
-ratchet = 971976
+# 971,976 -> 975,540 (v0.17 values_chain, ungated correctness; STATUS.md):
+# +3,564 B, the `full` growth plus the chain plan lines (`explain`);
+# `window::each_child` shared with `coll_misses` (-232 B).
+ratchet = 975540
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -239,7 +247,10 @@ justify_over = 32768
 # (dhat bytes -20.2% on bolt_workload).
 # +3,456 B (v0.17 order_offset): max's fixes plus the join path's
 # orderDistinctMask terms (xjoin::path_order od, join.rs drop).
-ratchet = 1070172
+# 1,070,172 -> 1,073,688 (v0.17 values_chain, ungated correctness;
+# STATUS.md): +3,516 B, the `max` growth plus the chain push-down rule
+# and the result aliases kept for the flattener (`planner`).
+ratchet = 1073688
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

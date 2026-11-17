@@ -1780,6 +1780,8 @@ impl<S: Storage> Connection<S> {
             &head_keys,
             keys.as_slice(),
             width,
+            scope,
+            d,
         )?;
         plan.limit = self.plan_limit(d.limit.as_deref(), arena)?;
         plan.offset = self.plan_limit(d.offset.as_deref(), arena)?;

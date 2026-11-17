@@ -5,6 +5,39 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### VALUES chains, lazy collations, inert aggregates (wave 18, unit `values_chain`)
+
+- Fixes (ungated): a multi-row VALUES is parsed as the pin's
+  `sqlite3MultiValues` builds it, row by row — a co-routine, or a
+  UNION ALL chain of one-row selects after a WITH clause, in a view's
+  or a trigger's text, for a non-constant row (a column, a subquery,
+  a non-deterministic or aggregate / window call) or after a one-row
+  select that is not constant or has an affinity, a later constant row
+  starting a co-routine again; a later chain is the pin's `SELECT *
+  FROM (chain)`. A reader's WHERE term is pushed into each chained
+  row with its own affinity, into a later chain's wrapper with the
+  chain's column affinity (whose REAL column reads every integer as a
+  real), never into a chain of one-row selects throughout; plans show
+  `SCAN CONSTANT ROW`, `SCAN n CONSTANT ROWS`, `0-ROW VALUES CLAUSE`
+  and a FROM-less core's WHERE subqueries. A VALUES column a first-row
+  column reference fills is named by that column (`(VALUES (t.r),
+  (2))` has `r`). An unknown collation (`Coll::Unknown`) is looked up
+  only where the pin does — comparisons, an IN list's left operand,
+  min / max / nullif, ORDER BY / GROUP BY / DISTINCT / merge / window
+  / aggregate keys, a FROM subquery's or CREATE TABLE AS's columns —
+  so `SELECT 1 COLLATE bogus` runs and a CHECK naming one fails only
+  the write that codes it. An enclosing query's aggregate in a dropped
+  ORDER BY or an EXISTS result list steps in its aggregate owner; a
+  nested window query's ORDER BY inside a dropped term raises no
+  code-generation error; a view column read through a compound FROM
+  subquery takes its type from the rightmost core (`INT`, `REAL`,
+  `NUM`); a result alias in a WHERE term is pushed down as the item it
+  names (`planner`).
+- Tests: `tests/values_chain_v17.rs` (rows and plans against the live
+  pin, generated corpora), `hipp-cli/tests/cli_v17_values_chain.rs`.
+- Size: tiny 0, full +3,100 B, max +3,564 B, xl +3,516 B (ratchets
+  raised to the measured figures).
+
 ### ORDER BY / OFFSET parity (wave 18, unit `order_offset`)
 
 - Fixes (ungated): the OFFSET skips a row before its result columns

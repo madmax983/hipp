@@ -183,6 +183,8 @@ struct Core<'x> {
     has_agg: bool,
     values: &'x [AVec<RExpr>],
     sel: u32,
+    /// A core of a VALUES chain of one-row selects (`SF_MultiValue`).
+    vchain: bool,
 }
 
 /// A select statement: its cores and their compound operators.
@@ -205,6 +207,7 @@ fn core_of_sub(p: &SubPlan) -> Core<'_> {
         has_agg: p.has_agg,
         values: p.values.as_slice(),
         sel: p.sel,
+        vchain: p.vchain,
     }
 }
 
@@ -234,6 +237,7 @@ fn core_of_qp(p: &QueryPlan) -> Core<'_> {
         has_agg: p.has_agg,
         values: p.values.as_slice(),
         sel: p.sel,
+        vchain: p.vchain,
     }
 }
 
@@ -607,6 +611,21 @@ impl<'a> Walk<'a> {
             }
             return;
         }
+        // A VALUES chain of one-row selects throughout is one line
+        // (the pin's `multiSelectValues`, v0.17).
+        if s.cores
+            .iter()
+            .all(|(op, c)| c.vchain && *op == CompoundOp::UnionAll)
+        {
+            self.add_n(parent, b"SCAN ", n as u32, b" CONSTANT ROWS");
+            for (_, c) in s.cores.iter() {
+                self.shown(c.sel);
+                for r in c.values.iter() {
+                    self.exprs(r.as_slice(), parent, &[]);
+                }
+            }
+            return;
+        }
         // The pin merges the compound up to its last operator other
         // than UNION ALL (all of it under an ORDER BY), as hipp's
         // executor does (`session::run_compound`); the UNION ALL
@@ -768,6 +787,10 @@ impl<'a> Walk<'a> {
             for r in c.values.iter() {
                 self.exprs(r.as_slice(), parent, &[]);
             }
+            // (A WHERE, a pushed term's, codes before the result.)
+            if let Some(f) = c.filter {
+                self.exprs(core::slice::from_ref(f), parent, &[]);
+            }
             self.exprs(c.items, parent, &[]);
             return;
         }
@@ -816,6 +839,7 @@ impl<'a> Walk<'a> {
             has_agg: c.has_agg,
             values: &[],
             sel: c.sel,
+            vchain: false,
         };
         self.body(&inner, p, false, c);
         // The innermost class's keys, which the loop may deliver.
@@ -1004,7 +1028,7 @@ impl<'a> Walk<'a> {
             let co = d.mat == 0 && at;
             let mut h = AVec::new();
             h.extend_from_slice(if co { b"CO-ROUTINE " } else { b"MATERIALIZE " });
-            self.sub_name(&mut h, sp.eqp.mat.as_slice(), last_sel(d));
+            self.sub_name(&mut h, sp.eqp.mat.as_slice(), d);
             let id = self.add(parent, &[h.as_slice()]);
             match d.rec {
                 Some(r) => {
@@ -1347,9 +1371,15 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// `name`, or `(subquery-n)` when it is empty.
-    fn sub_name(&mut self, out: &mut AVec<u8>, name: &[u8], sel: u32) {
-        if name.is_empty() {
+    /// `name`, or `(subquery-n)` when it is empty — for a VALUES
+    /// chain of one-row selects the pin's `0-ROW VALUES CLAUSE`
+    /// (v0.17: its `u1.nRow` counts a co-routine's rows only).
+    fn sub_name(&mut self, out: &mut AVec<u8>, name: &[u8], d: &SubPlan) {
+        let sel = last_sel(d);
+        if name.is_empty() && d.vchain && d.compound.iter().all(|(_, c)| c.vchain) {
+            self.shown(sel);
+            out.extend_from_slice(b"0-ROW VALUES CLAUSE");
+        } else if name.is_empty() {
             out.extend_from_slice(b"(subquery-");
             let n = self.shown(sel);
             num(out, u64::from(n), false);
@@ -1360,8 +1390,10 @@ impl<'a> Walk<'a> {
     }
 
     fn scan_name(&mut self, sp: &SubSource, out: &mut AVec<u8>) {
-        let sel = sp.derived.as_deref().map_or(0, last_sel);
-        self.sub_name(out, sp.eqp.scan.as_slice(), sel);
+        match sp.derived.as_deref() {
+            Some(d) => self.sub_name(out, sp.eqp.scan.as_slice(), d),
+            None => out.extend_from_slice(sp.eqp.scan.as_slice()),
+        }
     }
 
     /// The loop over one FROM source.
@@ -1969,6 +2001,7 @@ impl<'a> Walk<'a> {
                 has_agg: false,
                 values: &[],
                 sel: 0,
+                vchain: false,
             };
             self.body(&c, 0, false, &c);
         }
@@ -2140,6 +2173,7 @@ pub(super) fn describe<S: Storage>(
                     has_agg: false,
                     values: &[],
                     sel: 0,
+                    vchain: false,
                 };
                 w.body(&c, 0, false, &c);
                 if let Some(f) = &j.filter {

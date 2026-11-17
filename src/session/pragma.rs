@@ -592,6 +592,8 @@ fn shown_type(decl: &[u8]) -> AVec<u8> {
 
 fn coll_name(c: crate::record::Coll) -> &'static [u8] {
     match c {
+        #[cfg(feature = "sql")]
+        crate::record::Coll::Unknown => b"BINARY",
         crate::record::Coll::Binary => b"BINARY",
         crate::record::Coll::NoCase => b"NOCASE",
         crate::record::Coll::Rtrim => b"RTRIM",
@@ -1206,6 +1208,12 @@ impl<S: Storage> Connection<S> {
                             return None;
                         }
                         if let Some(d) = &sp.derived {
+                            // A compound's select is its rightmost
+                            // core on the pin (`pSel` of the FROM
+                            // item), whose item `columnType` reads
+                            // (v0.17: `(SELECT a ... UNION ALL SELECT
+                            // 2.5)` names no type, so `INT`).
+                            let d = d.compound.as_slice().last().map_or(&**d, |(_, c)| &**c);
                             let it = d.items.as_slice().get(k).or_else(|| {
                                 d.values
                                     .as_slice()

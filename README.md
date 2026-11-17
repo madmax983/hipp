@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 483,784 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 971,976 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,070,172 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 486,884 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 975,540 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,073,688 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,25 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **VALUES chains, lazy collations, inert aggregates** (unit
+  `values_chain`, ungated fixes). A multi-row VALUES is the pin's
+  `sqlite3MultiValues` row by row — a co-routine, or one-row selects
+  chained by UNION ALL after a WITH clause, in a view's or trigger's
+  text, for a non-constant row or after a typed one — so a reader's
+  WHERE term filters each chained row with its own affinity, a later
+  chain through its wrapper's column affinity (a REAL one reads every
+  integer as a real), and a chain of one-row selects throughout not
+  at all; EXPLAIN QUERY PLAN shows `SCAN CONSTANT ROW` per row, `SCAN
+  n CONSTANT ROWS`, `0-ROW VALUES CLAUSE`. A VALUES column a
+  first-row column reference fills is named by that column. An
+  unknown collation is looked up only where the pin does (a
+  comparison, a sort / group / DISTINCT / merge key, min / max /
+  nullif, a subquery's columns), so `SELECT 1 COLLATE bogus` runs;
+  an enclosing query's aggregate in a dropped ORDER BY or an EXISTS
+  result list steps in its owner (its overflow fails, as on the pin);
+  a nested window ORDER BY inside a dropped term raises nothing; a
+  view column read through a compound subquery takes the pin's type
+  name; a result alias in a WHERE term is pushed down as its item.
 - **ORDER BY / OFFSET parity** (unit `order_offset`, ungated fixes).
   The OFFSET skips a row before its result columns are computed on
   every path the pin does so (FROM-less cores, subqueries, views,

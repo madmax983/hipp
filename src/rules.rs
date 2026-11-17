@@ -673,6 +673,16 @@ pub fn validate_def<E>(
         {
             continue;
         }
+        // So is one naming an unknown collation (v0.17): the pin looks
+        // it up only when a write codes the check.
+        #[cfg(feature = "sql")]
+        if parse_rule::<E>(handle_bytes(arena, *h), arena, lim).is_ok_and(|e| {
+            expr_any(&e, &mut |x| {
+                matches!(x, Expr::Collate(_, crate::record::Coll::Unknown))
+            })
+        }) {
+            continue;
+        }
         texts.push(handle_bytes(arena, *h));
     }
     plan_rules::<E>(
@@ -1222,12 +1232,12 @@ pub fn item_datatype(e: &RExpr) -> u8 {
 /// leftmost core, `tails` the later cores; `None` when no core's
 /// item has an affinity.
 ///
-/// A multi-row VALUES core (v0.17 review fix) is what the pin's
-/// `sqlite3MultiValues` makes of it: a co-routine, one item of no
-/// affinity that can be anything (`0x07`, demoting any other
-/// affinity); or, when it reads as a chain (`SubPlan::vchain`), its
-/// rows as cores of their own at the left of the compound, or else a
-/// subquery whose one column has the chain's own compound affinity.
+/// A multi-row VALUES core (v0.17 review fix) is the pin's VALUES
+/// co-routine: one item of no affinity that can be anything (`0x07`,
+/// demoting any other affinity). A chain of one-row selects is cores
+/// of its own already (the parser's `values_core`), at the left of
+/// the compound, or later the subquery `SELECT * FROM (chain)` whose
+/// columns have the chain's own affinity.
 #[cfg(feature = "sql")]
 #[inline(never)]
 pub fn compound_affinity(
@@ -1257,14 +1267,6 @@ pub fn compound_affinity(
             (crate::query::item_result_affinity(e), item_datatype(e))
         })
     };
-    let wrapped = |a: Option<Affinity>| {
-        let d = match a {
-            Some(Affinity::Numeric | Affinity::Integer | Affinity::Real) => 0x05,
-            Some(Affinity::Text) => 0x06,
-            _ => 0x07,
-        };
-        (a, d)
-    };
     let head_item = match head.values.as_slice() {
         [] => {
             let e = head.items.as_slice().get(i);
@@ -1276,13 +1278,6 @@ pub fn compound_affinity(
             unit(a, d);
             r.as_slice().get(i)
         }
-        rows if head.vchain => {
-            for r in rows {
-                let (a, d) = item(r.as_slice().get(i));
-                unit(a, d);
-            }
-            rows.first().and_then(|r| r.as_slice().get(i))
-        }
         _ => {
             unit(None, 0x07);
             None
@@ -1292,19 +1287,6 @@ pub fn compound_affinity(
         let (a, d) = match tail.values.as_slice() {
             [] => item(tail.items.as_slice().get(i)),
             [r] => item(r.as_slice().get(i)),
-            // The chain's own column type, its leftmost row first.
-            rows if tail.vchain => {
-                let mut f: Option<Affinity> = None;
-                let mut k = 0u8;
-                for r in rows {
-                    let (a, d) = item(r.as_slice().get(i));
-                    if f.is_none() {
-                        f = a;
-                    }
-                    k |= d;
-                }
-                wrapped(f.map(|f| demote(f, k, rows.first().and_then(|r| r.as_slice().get(i)))))
-            }
             _ => (None, 0x07),
         };
         unit(a, d);

@@ -399,6 +399,13 @@ pub enum Coll {
     Binary,
     NoCase,
     Rtrim,
+    /// A name no built-in matches, written in a `COLLATE` operator
+    /// (v0.17, `sql`): the pin looks a collation up only where a
+    /// comparison or a sort uses it ("no such collation sequence"
+    /// there, `query::coll_misses`), so `SELECT 1 COLLATE bogus`
+    /// runs. Compares as BINARY where nothing refused it.
+    #[cfg(feature = "sql")]
+    Unknown,
 }
 
 impl Coll {
@@ -422,6 +429,8 @@ impl Coll {
 /// Compare two TEXT byte strings under a collation (v0.16).
 pub fn compare_text(a: &[u8], b: &[u8], coll: Coll) -> core::cmp::Ordering {
     match coll {
+        #[cfg(feature = "sql")]
+        Coll::Unknown => a.cmp(b),
         Coll::Binary => a.cmp(b),
         Coll::NoCase => {
             // The pin's sqlite3StrNICmp over the shorter length:

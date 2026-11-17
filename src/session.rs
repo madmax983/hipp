@@ -1093,6 +1093,10 @@ pub(crate) struct QueryPlan {
     /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
     #[cfg(feature = "explain")]
     sel: u32,
+    /// A core of a VALUES chain of one-row selects (v0.17, `explain`;
+    /// `SubPlan::vchain`).
+    #[cfg(feature = "explain")]
+    vchain: bool,
 }
 
 #[cfg(all(feature = "vm", feature = "sql"))]
@@ -1124,6 +1128,8 @@ impl QueryPlan {
             comp_order: p.comp_order.clone(),
             #[cfg(feature = "explain")]
             sel: p.sel,
+            #[cfg(feature = "explain")]
+            vchain: p.vchain,
         }
     }
 
@@ -3215,6 +3221,7 @@ impl<S: Storage> Connection<S> {
     ) -> Result<Plan, S::Error> {
         use crate::record::Affinity;
         let plan = self.plan_subquery(sel, arena, &[])?;
+        crate::query::lead_colls::<S::Error>(&plan)?;
         let w = plan.width();
         let mut names = self.result_col_names(&plan, (0, 0))?;
         let mut affs: AVec<Affinity> = AVec::new();
@@ -3927,9 +3934,62 @@ impl<S: Storage> Connection<S> {
             }
             rows_r.push(rr);
         }
+        // `columnN`, but a column reference in the first row (an
+        // enclosing query's, a trigger's `new.k`) names its column, as
+        // the pin's `sqlite3ColumnsFromExprList` names a select's
+        // (v0.17: `(VALUES (t.r), (2))` has a column `r`).
         let mut names = AVec::new();
         for i in 0..width.unwrap_or(0) {
-            names.push(Some(values_col_name(i)));
+            let mut e = rows_r.as_slice().first().and_then(|r| r.as_slice().get(i));
+            while let Some(RExpr::Collate(x, _)) = e {
+                e = Some(&**x);
+            }
+            let outer = match e {
+                Some(RExpr::Column(slot, ..)) => enclosing.iter().find_map(|g| {
+                    g.sources.iter().zip(g.offsets.iter()).find_map(|(s, o)| {
+                        s.columns
+                            .as_slice()
+                            .get(slot.checked_sub(*o)?)
+                            .map(|(n, _)| n.clone())
+                    })
+                }),
+                // (`rowid` as written, else the rowid alias's name.)
+                Some(RExpr::Rowid(src)) => Some(
+                    enclosing
+                        .iter()
+                        .find_map(|g| {
+                            let s = g.sources.as_slice().get(src.checked_sub(g.first_src)?)?;
+                            s.columns
+                                .as_slice()
+                                .get(s.rowid_alias?)
+                                .map(|(n, _)| n.clone())
+                        })
+                        .filter(|_| {
+                            let mut x = stmt
+                                .values
+                                .as_slice()
+                                .first()
+                                .and_then(|r| r.as_slice().get(i));
+                            while let Some(Expr::Collate(y, _)) = x {
+                                x = Some(&**y);
+                            }
+                            matches!(x, Some(Expr::Column { name, .. })
+                                if !crate::query::is_rowid_name(handle_bytes(arena, *name)))
+                        })
+                        .unwrap_or_else(|| copy_vec(b"rowid")),
+                ),
+                _ => None,
+            };
+            names.push(Some(outer.unwrap_or_else(|| values_col_name(i))));
+        }
+        // A co-routine is read through a FROM subquery on the pin,
+        // whose column types look its first row's collations up
+        // (v0.17; a chain's rows are cores of their own).
+        #[cfg(feature = "sql")]
+        if rows_r.len() > 1 && !stmt.vchain {
+            crate::query::lead_row::<S::Error>(
+                rows_r.as_slice().first().map_or(&[], |r| r.as_slice()),
+            )?;
         }
         let colls = core_colls(&[], rows_r.as_slice());
         Ok((
@@ -3986,6 +4046,8 @@ impl<S: Storage> Connection<S> {
             head,
             keys.as_slice(),
             width,
+            enclosing,
+            stmt,
         )?;
         Ok((tails, comp_order))
     }
@@ -4027,6 +4089,8 @@ impl<S: Storage> Connection<S> {
             head,
             keys.as_slice(),
             width,
+            &[],
+            stmt,
         )?;
         Ok((tails, comp_order))
     }
@@ -5001,6 +5065,8 @@ impl<S: Storage> Connection<S> {
                 comp_order,
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
+                #[cfg(feature = "explain")]
+                vchain: stmt.vchain,
             };
             return Ok((qp, keys));
         }
@@ -5043,6 +5109,8 @@ impl<S: Storage> Connection<S> {
             comp_order,
             #[cfg(feature = "explain")]
             sel: stmt.sel,
+            #[cfg(feature = "explain")]
+            vchain: false,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -5324,7 +5392,22 @@ impl<S: Storage> Connection<S> {
                     kind: SchemaKind::MisusedAggregate,
                 });
             }
+            #[cfg(feature = "sql")]
+            crate::query::key_coll::<S::Error>(
+                crate::query::expr_coll(&r).unwrap_or_default(),
+                enclosing,
+            )?;
             group_by.push(r);
+        }
+        // DISTINCT's key is every result column (v0.17).
+        #[cfg(feature = "sql")]
+        if stmt.distinct {
+            for it in items.iter() {
+                crate::query::key_coll::<S::Error>(
+                    crate::query::expr_coll(it).unwrap_or_default(),
+                    enclosing,
+                )?;
+            }
         }
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut having = match &stmt.having {
@@ -5397,6 +5480,8 @@ impl<S: Storage> Connection<S> {
                 // v0.16: the term sorts by its collation.
                 let mut dir = *dir;
                 dir.coll = crate::query::expr_coll(&r).unwrap_or_default();
+                #[cfg(feature = "sql")]
+                crate::query::key_coll::<S::Error>(dir.coll, enclosing)?;
                 order_by.push((r, dir));
             }
             #[cfg(feature = "window")]
@@ -5504,11 +5589,20 @@ impl<S: Storage> Connection<S> {
         }
         // A code-generation error of a term the pin codes after all.
         #[cfg(feature = "sql")]
+        // (Inside an enclosing ORDER BY the pin never codes, the error
+        // waits there instead: v0.17, a nested window query's own
+        // ORDER BY, `SELECT 1 ORDER BY (SELECT row_number() OVER ()
+        // ORDER BY (1,2))` is 1.)
         if let Some(kind) = late
             && !dropped
         {
-            return Err(Error::Schema { kind });
+            crate::query::late::<S::Error>(kind, &cur, enclosing)?;
         }
+        // (The result aliases stay visible to the flattener's WHERE
+        // push-down, v0.17: the pin's WHERE reads `x` of `column1 AS
+        // x` as the item it names, `resolveAlias`, before it pushes
+        // the term.)
+        #[cfg(not(feature = "planner"))]
         cur.aliases.clear();
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
@@ -5536,6 +5630,8 @@ impl<S: Storage> Connection<S> {
                 raw,
             },
         )?;
+        #[cfg(feature = "planner")]
+        cur.aliases.clear();
         // v0.16 (`expr_index`): each table source's index access
         // path, the pin's choice (`xplan`).
         // A merged compound member's loop delivers the merge key if
@@ -5864,6 +5960,11 @@ impl<S: Storage> Connection<S> {
         let realify = s.derived.is_some() && (!dplan.compound.is_empty() || !s.flat);
         #[cfg(not(feature = "planner"))]
         let realify = s.derived.is_some() && !dplan.compound.is_empty();
+        // Its columns' collations are looked up as its column types
+        // are taken (the pin's `sqlite3SubqueryColumnTypes`, at
+        // prepare: an unknown one fails, v0.17), its leftmost core's.
+        #[cfg(feature = "sql")]
+        crate::query::lead_colls::<S::Error>(&dplan)?;
         let mut real_cols = AVec::new();
         for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
             // A compound's column affinity is demoted across
@@ -14901,7 +15002,28 @@ fn resolve_compound_order<E>(
     head: &CompKeys,
     tails: &[CompKeys],
     width: usize,
+    enclosing: &[crate::query::ScopeGroup],
+    stmt: &SelectStmt,
 ) -> Result<AVec<(usize, crate::sql::SortOrder)>, E> {
+    // The merge key (an operator other than UNION ALL: every column)
+    // and the ORDER BY's terms look their collations up (v0.17: an
+    // unknown one fails there; `query::key_coll`).
+    #[cfg(feature = "sql")]
+    if stmt
+        .compound
+        .iter()
+        .any(|(op, _)| *op != crate::sql::CompoundOp::UnionAll)
+    {
+        for i in 0..width {
+            crate::query::key_coll::<E>(
+                compound_col_coll(
+                    core::iter::once(head).chain(tails.iter()).map(|k| &k.colls),
+                    i,
+                ),
+                enclosing,
+            )?;
+        }
+    }
     let mut out = AVec::new();
     for (e, desc) in order_by.iter() {
         // v0.16: `<term> COLLATE name` sorts the matched column
@@ -14938,6 +15060,8 @@ fn resolve_compound_order<E>(
                         i,
                     )
                 });
+                #[cfg(feature = "sql")]
+                crate::query::key_coll::<E>(o.coll, enclosing)?;
                 out.push((i, o));
             }
             None => {

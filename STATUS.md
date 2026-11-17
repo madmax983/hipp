@@ -11,6 +11,187 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: values_chain — VALUES chains, lazy collations, inert aggregates (2026-11-17)
+
+Wave 18's second unit (owner decision 2026-11-17: close the
+result-level wrong answers recorded against 3.54.1): the VALUES-chain,
+unknown-collation, inert-aggregate, nested-window and view-type items
+`gaps_eval` and `gaps_plan_cli` left, each probed on the live pin
+first (notes below), fixed at the root and differential-tested. All
+ungated fixes on claimed paths (ADR 0001; `sql`, the chain push-down
+under `planner`, its plan lines under `explain`); no new leaf.
+
+**Shipped.**
+1. **A multi-row VALUES is the pin's `sqlite3MultiValues`, row by
+   row** (parser `values_core`): a co-routine, or a one-row select
+   chained by UNION ALL — after a WITH clause began, in a view's or a
+   trigger's text (both read with `init.busy`), for a row that is not
+   constant (`sqlite3ExprIsConstant` with a parse context: a column,
+   a subquery, `random()` / `changes()` / ..., an aggregate or window
+   call; a deterministic function of constants is constant), or after
+   a one-row select that is not constant or has an affinity (a CAST:
+   `exprListIsNoAffinity`). A constant row after a constant one-row
+   select starts a co-routine with it again, so `VALUES (1),
+   ((SELECT 3)), (4), (5)` is a row, a row and a 2-row co-routine. The
+   parser now builds that structure (the chain's rows as compound
+   cores; a later chain as the pin's `SELECT * FROM (chain)`,
+   `parserDoubleLinkSelect`, `chain_wrap`), replacing the `vchain`
+   flag's partial modelling (`chain_reals` and two
+   `compound_affinity` branches are gone). Results: a reader's WHERE
+   term is pushed into each chained row with its own affinity
+   (`WITH q(x) AS (VALUES (3), (4) UNION ALL SELECT r FROM t) SELECT x
+   FROM q WHERE x = '3'` is `3.0` once, the recorded gap), into a
+   later chain's wrapper with the chain's column affinity, and never
+   into a chain of one-row selects throughout (`SF_MultiValue`,
+   probed: `WITH w AS (SELECT 1) SELECT column1 FROM (VALUES (3),
+   (CAST(4 AS REAL))) WHERE column1 = '3'` is `3.0`); a wrapper's REAL
+   column reads every integer as a real (`SubPlan::real_cols`: a
+   correlated column's too, the recorded gap); a trigger body's VALUES
+   is a chain (`(VALUES (3), (4) UNION ALL SELECT r FROM t)` there is
+   `3.0|real`, hipp gave `3|integer`); a chain of more than 500 terms
+   followed by a SELECT is "too many terms" as on the pin. Plans:
+   `SCAN CONSTANT ROW` per chained row, `SCAN n CONSTANT ROWS` for a
+   chain of one-row selects throughout (`multiSelectValues`), `0-ROW
+   VALUES CLAUSE` for a FROM item over one, co-routine segments as
+   `SCAN n-ROW VALUES CLAUSE`, select numbers as the pin's, and a
+   FROM-less core's WHERE subqueries (a pushed term's) before its
+   result's.
+2. **A VALUES column a first-row column reference fills is named by
+   that column** (`plan_values`, the pin's `sqlite3ColumnsFromExprList`):
+   `(VALUES (t.r), (2))` has a column `r` (`column1` is "no such
+   column" there), `t.rowid` gives `rowid`, a written rowid alias its
+   name. Found by the trigger corpus.
+3. **An unknown collation is looked up only where the pin does**
+   (`Coll::Unknown` from the COLLATE operator; `query::coll_misses`,
+   `key_coll`, `lead_colls`): a comparison (`sqlite3BinaryCompareCollSeq`:
+   `=`, `<`, `IS`, BETWEEN, a CASE operand, row values), an IN list's
+   left operand (never its items), an IN subquery against its
+   rightmost core's item, min() / max() / nullif()'s first argument
+   with a collation, an aggregate's DISTINCT / ORDER BY key, a window's
+   PARTITION / ORDER key, an ORDER BY / GROUP BY / DISTINCT /
+   compound merge key (the pin builds the KeyInfo whenever it codes
+   the SELECT, even where the ORDER BY is then dropped), and a FROM
+   subquery's, CTE's, view's or CREATE TABLE AS's columns at once
+   (`sqlite3SubqueryColumnTypes`). An expression-level use waits in an
+   ORDER BY the pin never codes (`late`), a key's in an enclosing one.
+   So `SELECT 1 COLLATE bogus`, `x COLLATE bogus IS NULL`, LIKE,
+   function arguments, `'a' COLLATE nocase = 'b' COLLATE bogus` and
+   `max(col, 'q' COLLATE bogus)` run; a CHECK naming one is accepted
+   at CREATE TABLE and fails the write that codes it; an index key or
+   a generated column's comparison fails at once. Column definitions,
+   index columns and upsert targets keep the parse-time refusal.
+4. **An enclosing query's aggregate in a dropped ORDER BY or an
+   EXISTS subquery's result list steps in its aggregate owner**
+   (`subst_owned_aggs`, `has_owned_sub_agg`, the VM's `owned_aggs`):
+   `SELECT (SELECT 1 ORDER BY sum(abs(t.a - 9223372036854775807 -
+   3))) FROM t` and `SELECT EXISTS (SELECT sum(<overflow>)) FROM t`
+   fail as on the pin; in a WHERE (no aggregate owner) it stays inert.
+5. **Inside a dropped ORDER BY, a nested window query's own ORDER BY
+   raises no code-generation error**: its waiting error moves to the
+   enclosing ORDER BY's (`late`), so `SELECT 1 ORDER BY (SELECT
+   row_number() OVER () ORDER BY (1,2))` is 1.
+6. **A view column read through a compound FROM subquery (or CTE)
+   takes its declared type from the subquery's rightmost core**
+   (`ztype`; the pin's `columnType` reads the FROM item's `pSel`), so
+   `PRAGMA table_info` of `SELECT * FROM (SELECT a FROM t UNION ALL
+   SELECT 2.5)` is `INT` (hipp: `INTEGER`), `DOUBLE PRECISION` reads
+   as `REAL`, `DATETIME` as `NUM`. (The recorded gap's top-level form,
+   a view that is itself a compound, already matched.)
+7. **A result alias in a WHERE term is pushed down as the item it
+   names** (found by the generated chain corpus, `planner`): the
+   flattener now runs with the result aliases visible, as the pin's
+   `resolveAlias` substitutes them before `pushDownWhereTerms`, so
+   `SELECT column1 AS x FROM (VALUES (3.0), (4) UNION ALL SELECT i
+   FROM t) WHERE x <> '3'` filters the INTEGER arm with its affinity.
+
+**Oracle-probing notes** (live pin; rows, errors and EQP trees): the
+chain rule from `EXPLAIN QUERY PLAN VALUES ...`: `(1),(2),(random())`
+and `(changes())` a 2-row co-routine and a row; `abs(-4)`,
+`sqlite_version()`, `1+2`, `+3`, `?1`, `x'01'`, CASE, IN lists, LIKE,
+`coalesce`, `json('[]')` constant (one co-routine); `row_number() OVER
+()` a row (a co-routine of its own); `(CAST(1 AS INT)),(2),(3)` a row
+and a 2-row co-routine, `(1),(CAST(2 AS INT)),(3)` one co-routine;
+`(1),((SELECT 3)),(4),(5)` row, row, 2-row co-routine; a pure chain
+`SCAN n CONSTANT ROWS`, a FROM item over it `CO-ROUTINE 0-ROW VALUES
+CLAUSE` (the pin's `%S` of an `SF_MultiValue` select prints its
+`u1.nRow`, 0 for a chain). Push-down: `(SELECT 3 AS column1 UNION ALL
+SELECT CAST(4 AS REAL)) WHERE column1 = '3'` no row, the same as a
+VALUES chain `3.0`; a hand-written wrapper `SELECT * FROM (SELECT 3
+UNION ALL ...)` is pushed through, a chain's never. A chain's 600
+rows then `UNION ALL SELECT 1` is "too many terms"; a 600-row chain
+alone is not. `VALUES (t.r)` names its column `r`; `(VALUES (t.rowid),
+(2))` `rowid`. Collations (about 250 shapes): the rules above;
+`SELECT 1 ORDER BY 'a' COLLATE bogus` and `count(*) ... ORDER BY b
+COLLATE bogus` fail (the KeyInfo), `SELECT 1 ORDER BY (SELECT b FROM t
+ORDER BY b COLLATE bogus)` answers, `SELECT 1 ORDER BY (SELECT x FROM
+(SELECT 1 COLLATE bogus AS x))` fails (the subquery's column types, at
+prepare); `rowid = 1 COLLATE bogus` in a WHERE answers (the rowid
+lookup codes no comparison). Aggregates: `... FROM t GROUP BY a` prints
+the first group then fails on the next (hipp: fails before printing,
+pre-existing for every group error); a WHERE's EXISTS keeps them inert.
+View types: `SELECT * FROM (SELECT r, s, z, p, q FROM w UNION ALL
+SELECT 1, ...)` is `REAL|BLOB|REAL|NUM|NUM`.
+
+**Tests.** `tests/values_chain_v17.rs` (11 tests, rows and where shapes
+allow plans against the live pin): 53 chain push-down shapes (head and
+later chains, wrappers, pure chains, co-routine segments, column
+naming, result aliases, views, with plans), 32 chain plans, 12 trigger
+bodies, 240 generated chain compounds (xorshift; 60 of them with
+plans), 117 unknown-collation shapes, 24 write / DDL scripts, 200
+generated collation placements, 26 + 120 generated inert-aggregate
+shapes, 15 nested-window shapes, 42 view-type scripts (21 views, each
+directly and through another view). `hipp-cli/tests/cli_v17_values_chain.rs` (5 tests):
+the same fixes on stdin scripts and one-shot arguments, byte for byte
+(rows, EQP text, error presence, exit status).
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (its `--features vm` workspace suite included: the frozen VM's
+suites stay green; the VM folds inert aggregates too, chains reach it
+as compounds); `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info: pass (`coll_misses` walks a
+resolved expression once per top-level resolution, shallower than the
+resolver itself; no `STACK_*` change).
+
+**Size Δ.** tiny 0 (76,928); full +3,100 (483,784 → 486,884); max
++3,564 (971,976 → 975,540); xl +3,516 (1,070,172 → 1,073,688).
+Ratchets raised to the measured figures (`ci/size-ratchet.toml`): the
+collation-use checks (`coll_misses`, `key_coll`, `lead_colls`), the
+parser's chain segments and wrapper, the VALUES column names. Offsets
+taken first: `chain_reals` and `compound_affinity`'s chain branches
+removed (the structure carries them), `window::each_child` shared with
+`coll_misses` (-232 B on max / xl; +104 B on full, where it is new);
+a shared `late` helper measured +104 B and was not kept.
+
+**Honest gaps.**
+- A compound arm written `SELECT * FROM (...)` takes no pushed WHERE
+  term (the push-down substitutes only explicit items): `SELECT x FROM
+  (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 3 UNION ALL SELECT
+  CAST(4 AS REAL))) WHERE x = '3'` is `3.0` in hipp, no row on the pin
+  (pre-existing; the chain wrapper hipp builds names its items).
+- A trigger's `new.k` in a VALUES first row names the column
+  `column1` in hipp, `k` on the pin (the trigger value reaches the
+  planner as a literal).
+- Two unaliased FROM items over pure chains make the pin's `*`
+  expansion "ambiguous column name: *.0-ROW VALUES CLAUSE.column1";
+  hipp expands them. The pin refuses a view whose text is a VALUES
+  chain of 20,000 rows when it is read ("Expression tree is too
+  large"); hipp reads it.
+- `rowid = 1 COLLATE bogus` in a WHERE is refused in hipp; the pin's
+  rowid lookup codes no comparison and answers.
+- A grouped query that fails on a later group prints nothing in
+  hipp-cli; the pin prints the groups before it (pre-existing).
+- The pin's flattening of a compound CTE into its reader, and of a
+  `(VALUES ...)` co-routine in FROM, stay EQP-only gaps (pre-existing).
+- The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) folds inert
+  aggregates like today's executor; `tests/values_chain_v17.rs` runs on
+  today's executor under `vm`.
+- Item 7's scan of the older honest gaps found the alias push-down
+  (fixed, item 7); left as recorded: a GROUP BY over a co-routine's
+  order and its partial ORDER BY match, a subquery's `ORDER BY 1
+  COLLATE BINARY` as column 1, a WITHOUT ROWID natural scan's ORDER BY
+  (`order_offset`'s gaps, planner work), and the push-down without
+  `planner` (by design, ADR 0004).
+
 ### Parity: order_offset — ORDER BY / OFFSET result divergences (2026-11-17)
 
 Wave 18's unit (owner decision 2026-11-17: close the result-level
@@ -529,7 +710,7 @@ Honest gaps the review fixes leave (new or found on the way):
   order (the pin: the merge's NOCASE order, no sorter); EXPLAIN QUERY
   PLAN shows hipp's sorter, and a subquery's ORDER BY the pin drops is
   kept.
-- WHERE push-down into a VALUES chain: the pin filters each chained
+- WHERE push-down into a VALUES chain (closed in v0.17: values_chain): the pin filters each chained
   row with its own affinity (a one-row select each) and a wrapped
   later chain with its column's; hipp's term stays in the reader only,
   with the compound's affinity (`WITH q(x) AS (VALUES (3), (4) UNION
@@ -537,12 +718,14 @@ Honest gaps the review fixes leave (new or found on the way):
   no row on the pin). A chain's plan is the old `SCAN n-ROW VALUES
   CLAUSE` (the pin: `SCAN CONSTANT ROW` per row, `SCAN n CONSTANT
   ROWS` alone).
-- A trigger body's VALUES is a chain on the pin (read with the
+- A trigger body's VALUES is a chain on the pin (closed in v0.17:
+  values_chain) (read with the
   schema); hipp applies the WITH / CAST / non-constant rules there. A
   coroutine that a later non-constant row turns into a chain midway is
   taken as a chain throughout. A wrapped chain's REAL column converts
   only its integer literals (not, say, an outer column's integer).
-- `PRAGMA table_info` of a view over a compound whose arms differ in
+- `PRAGMA table_info` of a view over a compound (closed in v0.17:
+  values_chain, through a compound FROM subquery) whose arms differ in
   affinity names the type by the standard name on the pin (`INT`,
   `TEXT`), hipp by the declared type (`INTEGER`, `varchar(9)`):
   pre-existing.
@@ -679,7 +862,7 @@ in `session/join.rs` is `planner`-only, so sharing it would save in
   LEFT JOIN's ON terms aside, inner-join ON terms fix columns in hipp
   where the pin's `mExcludeOn` keeps them out (pre-existing; no probe
   found a visible difference).
-- `SELECT 1 COLLATE bogus` is still refused at prepare where the pin
+- `SELECT 1 COLLATE bogus` (closed in v0.17: values_chain) is still refused at prepare where the pin
   runs it (it looks a collation up only where a comparison or sort
   uses it).
 - `INDEXED BY` an index of another table is still accepted (a
@@ -772,7 +955,8 @@ justification (`ci/size-ratchet.toml`); offsets taken on the way:
 finalize loop for HAVING and the skippable aggregates (-248 B).
 
 Honest gaps the review fixes leave (new or found on the way):
-- An enclosing query's aggregate in a dropped ORDER BY (and in an
+- An enclosing query's aggregate in a dropped ORDER BY (closed in
+  v0.17: values_chain) (and in an
   EXISTS subquery's result list, pre-existing) is inert: the pin
   still steps it in an aggregate owner, so `SELECT (SELECT 1 ORDER BY
   sum(abs(t.a - 9223372036854775807 - 3))) FROM t` fails there and
@@ -786,7 +970,7 @@ Honest gaps the review fixes leave (new or found on the way):
   a UNION ALL arm's) first, so `SELECT abs(-9223372036854775808)
   LIMIT 1 OFFSET 1` fails where the pin returns no row (pre-existing;
   a top-level query over a table already matches).
-- Inside a dropped ORDER BY, a nested window query that keeps its
+- Inside a dropped ORDER BY (closed in v0.17: values_chain), a nested window query that keeps its
   own ORDER BY still raises that ORDER BY's code-generation error,
   though the pin never codes the outer term (not probed further).
 
@@ -6416,7 +6600,8 @@ register references, the foreign-collation table handling).
   <unknown>` in CREATE TABLE: it has no comparisons a collation
   could change, and validating the name did not fit its
   ratchet.
-- An unknown name in the `COLLATE` operator is refused at
+- An unknown name in the `COLLATE` operator (closed in v0.17:
+  values_chain) is refused at
   prepare even where the pin, which looks names up only when a
   comparison or sort uses them, runs the statement (`SELECT 1
   COLLATE bogus`).
