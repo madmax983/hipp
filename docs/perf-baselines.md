@@ -470,3 +470,27 @@ reservation brings n=1000 to 428,109,167 Ir (a further -1.68%;
 
 Size gates: tiny +24 B, full +16 B, max +16 B, xl +16 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## prepare lexes every statement three times (baseline at 53303df)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every
+`Connection::prepare` lexes the statement text once in
+`route_attach` (attached-database routing), once in `route` (TEMP
+routing), and once more in `parse_params` (the parse itself): 3
+`lex_inner` calls per prepare (7,230 at n=1000 for 2,410 prepares).
+The two routing lexes only read the tokens to decide the statement
+stays on main; the parse lexes the same bytes again.
+
+| n    | total Ir      | prepare inclusive Ir   | lex_inner inclusive Ir |
+|------|---------------|------------------------|------------------------|
+| 500  | 183,768,300   | 47,175,161 (25.67%)    | 12,882,265 (7.01%)     |
+| 1000 | 435,845,467   | 94,235,444 (21.62%)    | 25,921,167 (5.95%)     |
+| 2000 | 1,100,189,123 | 191,555,872 (17.41%)   | 54,504,500 (4.95%)     |
+
+n=1000: `lex_inner` called from `route_attach` 8,887,954, `route`
+8,526,274, `parse_params` 8,327,492 (2,410 calls each). dhat
+(n=1000): 427,368 blocks, 106,515,485 bytes; t-gmax 852,164 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'prepare::\{closure#0\} \[|lex_inner'`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
