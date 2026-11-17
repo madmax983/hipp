@@ -455,15 +455,16 @@ impl<S: Storage> Connection<S> {
     pub(super) fn route_attach(
         &self,
         sql: &[u8],
+        toks: Option<&[Token]>,
         arena: &Arena,
     ) -> Result<Option<AttRoute>, S::Error> {
         if self.alias.is_some() || self.is_temp {
             return Ok(None);
         }
-        let Ok(toks) = crate::sql::parser::tokens::<S::Error>(sql, arena) else {
+        // `sql`'s tokens, lexed by the caller (`None`: they did not lex).
+        let Some(t) = toks else {
             return Ok(None);
         };
-        let t = toks.as_slice();
         // Nothing attached and no qualifier but main / temp: nothing
         // to route.
         let foreign = (0..t.len()).any(|i| {

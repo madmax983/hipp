@@ -478,9 +478,38 @@ pub fn parse_params<E>(
     arena: &Arena,
     lim: Limits,
 ) -> Result<(Ast, lexer::ParamTable), E> {
-    let mut params = lexer::ParamTable::default();
     too_long::<E>(sql.len())?;
+    parse_params_lexed(sql, lex_statement::<E>(sql, arena), arena, lim)
+}
+
+/// A statement's tokens and parameter table, lexed once
+/// (`lex_statement`) for both the routers' look at the tokens and
+/// the parse (`parse_params_lexed`).
+#[cfg(feature = "params")]
+pub struct Lexed {
+    pub toks: AVec<Token>,
+    pub params: lexer::ParamTable,
+}
+
+/// Lex `sql` as `parse_params` does (without its length check).
+#[cfg(feature = "params")]
+pub fn lex_statement<E>(sql: &[u8], arena: &Arena) -> Result<Lexed, E> {
+    let mut params = lexer::ParamTable::default();
     let toks = lexer::lex_params::<E>(sql, arena, &mut params)?;
+    Ok(Lexed { toks, params })
+}
+
+/// `parse_params` over `lex_statement(sql, arena)`'s result: the
+/// length check first, then the lex error (if any), then the parse.
+#[cfg(feature = "params")]
+pub fn parse_params_lexed<E>(
+    sql: &[u8],
+    lexed: Result<Lexed, E>,
+    arena: &Arena,
+    lim: Limits,
+) -> Result<(Ast, lexer::ParamTable), E> {
+    too_long::<E>(sql.len())?;
+    let Lexed { toks, params } = lexed?;
     let mut p = Parser::new(toks, arena, sql, lim);
     let ast = p.statement::<E>()?;
     p.expect_end::<E>()?;
