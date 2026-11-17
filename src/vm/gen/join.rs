@@ -1365,6 +1365,18 @@ impl<'p> G<'p, '_> {
                     }
                     self.test(h, cx, top);
                 }
+                // Without HAVING, every aggregate a result term may
+                // skip finalized first (`session::lazy_aggs`, v0.17
+                // review fix).
+                if qp.having.is_none()
+                    && crate::session::lazy_aggs(qp.items.as_slice(), qp.order_by.as_slice())
+                {
+                    let scratch = self.b.reg();
+                    for a in crate::session::group_aggs(qp.items.as_slice(), qp.order_by.as_slice())
+                    {
+                        self.val(a, cx, scratch);
+                    }
+                }
                 #[cfg(feature = "window")]
                 if let Some(w) = self.win {
                     self.win_unit(w, cx, gc.saturating_add(1));

@@ -189,9 +189,8 @@ INSERT INTO c VALUES (1, 'y'), (2, NULL), (3, 'x');";
     let (hd, ok_h) = run_arg(&hipp_bin(), &h, ".dump");
     let (od, ok_o) = run_arg(&oracle(), &o, ".dump");
     assert!(ok_h && ok_o);
-    // The pin's dump starts by turning the keys off; hipp's does not
-    // write that line (a fresh connection has them off).
-    assert_eq!(hd, od.trim_start_matches("PRAGMA foreign_keys=OFF;\n"));
+    // Both dumps start by turning the keys off (v0.17: hipp's too).
+    assert_eq!(hd, od);
     let script = format!(
         "{hd}PRAGMA foreign_keys = ON;\nPRAGMA foreign_key_check;\nDELETE FROM p WHERE a = 1;\nSELECT * FROM c;\n"
     );

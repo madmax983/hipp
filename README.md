@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,952 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 478,212 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 964,684 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,061,344 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 481,048 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 968,448 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,066,700 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,39 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **Planner and CLI parity** (unit `gaps_plan_cli`, ungated fixes).
+  `INDEXED BY` names an index of the source's own table on every path
+  (a plain scan accepted another table's index); WHERE / ON terms are
+  simplified as the pin's planner simplifies them, so `x OR 1` keeps
+  the FROM join order and `x OR 0` can use an index; WHERE push-down
+  reaches compound arms of mixed affinity (each comparing with its
+  own) and UNION / INTERSECT / EXCEPT arms; a merged compound member
+  is read in the merge key's collation (UNION kept another row of a
+  NOCASE-equal group); and smaller EXPLAIN QUERY PLAN rules (never-NULL
+  `IS NULL`, ORDER BY constants, `IS NOT NULL` ranges, merged
+  aggregates). hipp-cli reads its command line as the pin's shell
+  (`-help`, `-version`, unknown-option errors, `--`, several SQL
+  arguments, `:memory:` by default) and opens the database only when
+  input needs it, so `--help` no longer makes a file; its `.dump` is
+  the pin's byte for byte (the `PRAGMA foreign_keys=OFF;` header,
+  `%.16g` reals, `unistr()` text, quoted names, `sqlite_sequence`,
+  `sqlite_stat1`). Its review fixes type compound columns over VALUES
+  and window arms as the pin does, keep the pin's join order after a
+  CROSS JOIN and around `x OR 0`, fold `x AND 0` to 0 as the pin's
+  parser does, and make `.quit` / `.exit` open no database.
+- **Evaluator and statement-level parity** (unit `gaps_eval`,
+  ungated; empty statements on `sql`). `hex(NULL)` is `''` and
+  `substr` of an empty BLOB is NULL, as on the pin; a FROM-less core
+  never computes its ORDER BY terms; LIMIT 0 computes nothing else
+  (not even its OFFSET); the WHERE clause's constant propagation
+  covers the rowid, non-literal constants, one-item IN lists and every
+  operand kind, so `WHERE a = 5 AND a < 5 AND <failing constant>` is
+  no row; AND / OR drop a neutral operand (`x AND (0 OR 0)` is 0)
+  while a group still computes every aggregate, as the pin steps
+  them; a dropped ORDER BY raises none of the pin's code-generation
+  errors (`SELECT 1 ORDER BY (1,2)` is 1); and empty statements (`;`,
+  `;;`, comments) do nothing, in the library and in the CLI's
+  scripts.
 - **Streamed rows.** A top-level SELECT hands its rows to
   `Statement::step` one at a time, as the pin does: the join is a
   resumable nested loop whose first source is read through its
@@ -1532,11 +1565,14 @@ and `cargo test --workspace`.
 
 A std binary shell (`hipp-cli/`, decision D4): interactive,
 stdin-batch and one-shot modes with list-format output
-byte-diffable against the pinned oracle CLI, plus `.tables`,
+byte-diffable against the pinned oracle CLI, the pin shell's command
+line (v0.17: `hipp [OPTIONS] [FILENAME [SQL...]]`, `-help`,
+`-version`, `--`; the pin's other options are refused), plus `.tables`,
 `.schema`, `.dump`, `.open`, `.databases` (v0.16, with attached
 databases in `.schema` / `.tables`), `.parameter` (v0.16: `set`,
 `unset`, `clear`, `list`, `init`, bound by name as the oracle
-shell binds them), `.exit`. Its first job is
+shell binds them), `.exit [N]` / `.quit` (v0.17: neither opens the
+database). Its first job is
 differential testing. It is a separate crate and contributes
 0 bytes to the core's tiny build.
 
@@ -1557,8 +1593,9 @@ shared page cache (a file is attached once); the pin's own bytecode
 listing (plain EXPLAIN lists hipp's program, in the pin's columns, under
 the hidden `vm` feature, which no profile enables: turning the VM on
 measured larger in every profile, Stage 2 alone and with Stage 3,
-ADR 0005, and as a redesigned smaller VM, ADR 0007; its content is
-hipp's, not the pin's); loadable
+ADR 0005, and as a redesigned smaller VM, ADR 0007, so the migration
+stopped there and the VM stays frozen; its content is hipp's, not the
+pin's); loadable
 extensions and application-defined SQL functions; and **no `sqlite3_*`
 C ABI, ever** (D3): hipp is a Rust library, not a drop-in
 replacement.

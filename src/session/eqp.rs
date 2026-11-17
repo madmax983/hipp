@@ -707,7 +707,8 @@ impl<'a> Walk<'a> {
     /// A merged compound member's sort (hipp sorts each member).
     fn merge_sort(&mut self, c: &Core<'_>, parent: i64, klen: usize) {
         let klen = klen.min(c.items.len());
-        if c.values.len() <= 1 && c.sources.is_empty() {
+        // (An aggregate without GROUP BY is one row: v0.17 fix.)
+        if (c.values.len() <= 1 && c.sources.is_empty()) || (c.has_agg && c.group_by.is_empty()) {
             return;
         }
         // The merge key, when the member's lone loop delivers it

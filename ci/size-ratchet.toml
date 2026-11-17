@@ -64,9 +64,31 @@ justify_over = 4096
 # 478,268 -> 478,556 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +288 B.
+# 478,556 -> 479,332 (v0.17 gaps_eval, ungated correctness fixes on the
+# evaluator / executor, plus empty statements on `sql`; STATUS.md): +776 B.
+# hex(NULL) is '', substr of an empty BLOB is NULL; the WHERE constant
+# propagation covers the rowid, non-literal constants, one-item IN and
+# every node kind; LIMIT 0 computes nothing; a FROM-less core drops its
+# ORDER BY; AND / OR simplify neutral operands. No offsetting saving found.
+# 479,332 -> 479,364 (v0.17 gaps_plan_cli, ungated correctness fixes;
+# STATUS.md): +32 B. An INDEXED BY source leaves the plain-scan path that
+# never looked the index up; compound column types read through COLLATE /
+# unary plus. No offsetting saving found.
+# 479,364 -> 480,228 (v0.17 gaps_eval review fixes, ungated correctness;
+# STATUS.md): +864 B. A FROM-less core's dropped ORDER BY keeps an
+# enclosing query's aggregates (inert) and raises none of the pin's
+# code-generation errors (`query::late`); `c IN (col)` fixes nothing and a
+# one-item [NOT] IN item loses its affinity (`in_one`); a group steps
+# every aggregate a result term may skip (`lazy_aggs`, shared with the
+# HAVING finalize loop and mirrored in the VM). Offsets taken (on full): has_agg
+# reused for the ORDER BY rule (-80 B), one finalize loop (-248 B).
+# 480,228 -> 481,048 (v0.17 gaps_plan_cli review fixes, ungated correctness;
+# STATUS.md): +820 B. Compound column types over VALUES / window arms
+# (`vchain`, `chain_reals`), the parser's `x AND 0` fold. Offset taken:
+# `compound_affinity` made non-generic and out of line (-2,237 B).
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 478572
+ratchet = 481064
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -114,9 +136,32 @@ justify_over = 16384
 # 964,732 -> 965,196 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +464 B.
-# +16 B (Bolt): leaf_cells_meta reserves its cell table once
+# 965,196 -> 965,876 (v0.17 gaps_eval, ungated correctness fixes on the
+# evaluator / executor, plus empty statements on `sql`; STATUS.md): +680 B.
+# hex(NULL) is '', substr of an empty BLOB is NULL; the WHERE constant
+# propagation covers the rowid, non-literal constants, one-item IN and
+# every node kind; LIMIT 0 computes nothing; a FROM-less core drops its
+# ORDER BY; AND / OR simplify neutral operands. No offsetting saving found.
+# 965,876 -> 966,648 (v0.17 gaps_plan_cli, ungated correctness fixes on the
+# `expr_index` planner; STATUS.md): +772 B. WHERE terms simplified as the
+# pin's sqlite3ExprSimplifiedAndOr; a merged compound member planned for
+# the merge key's collation (a silent wrong answer under UNION); IS NULL on
+# never-NULL columns constant; ORDER BY constants only on columns; plus
+# the +32 B of `full`. No offsetting saving found.
+# 966,648 -> 967,536 (v0.17 gaps_eval review fixes, ungated correctness;
+# STATUS.md): +888 B. A FROM-less core's dropped ORDER BY keeps an
+# enclosing query's aggregates (inert) and raises none of the pin's
+# code-generation errors (`query::late`); `c IN (col)` fixes nothing and a
+# one-item [NOT] IN item loses its affinity (`in_one`); a group steps
+# every aggregate a result term may skip (`lazy_aggs`, shared with the
+# HAVING finalize loop and mirrored in the VM). Offsets taken (on full): has_agg
+# reused for the ORDER BY rule (-80 B), one finalize loop (-248 B).
+# 967,536 -> 968,448 (v0.17 gaps_plan_cli review fixes, ungated correctness;
+# STATUS.md): +912 B, the `full` fixes above. Same offset taken.
+# +24 B (Bolt, measured after merging main into v0.17 wave 17; +16 B on
+# main): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 965212
+ratchet = 968472
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -158,9 +203,33 @@ justify_over = 32768
 # 1,061,392 -> 1,061,864 (Bolt): index_search_raw compares local binary-search
 # probes in place, UTF-8 databases only (-4.7..5.5% instructions,
 # -15.9% allocations on bolt_workload): +472 B.
+# 1,061,864 -> 1,062,520 (v0.17 gaps_eval, ungated correctness fixes on the
+# evaluator / executor, plus empty statements on `sql`; STATUS.md): +656 B.
+# hex(NULL) is '', substr of an empty BLOB is NULL; the WHERE constant
+# propagation covers the rowid, non-literal constants, one-item IN and
+# every node kind; LIMIT 0 computes nothing; a FROM-less core drops its
+# ORDER BY; AND / OR simplify neutral operands. No offsetting saving found.
+# 1,062,520 -> 1,063,848 (v0.17 gaps_plan_cli, ungated correctness fixes;
+# STATUS.md): +1,328 B. The `max` fixes above, and the `planner` push-down
+# into compound arms of mixed affinity and into UNION / INTERSECT / EXCEPT
+# (the constant-propagation check it needs shares `findConstInWhere`'s
+# code with the evaluator's). No offsetting saving found.
+# 1,063,848 -> 1,064,600 (v0.17 gaps_eval review fixes, ungated correctness;
+# STATUS.md): +752 B. A FROM-less core's dropped ORDER BY keeps an
+# enclosing query's aggregates (inert) and raises none of the pin's
+# code-generation errors (`query::late`); `c IN (col)` fixes nothing and a
+# one-item [NOT] IN item loses its affinity (`in_one`); a group steps
+# every aggregate a result term may skip (`lazy_aggs`, shared with the
+# HAVING finalize loop and mirrored in the VM). Offsets taken (on full): has_agg
+# reused for the ORDER BY rule (-80 B), one finalize loop (-248 B).
+# 1,064,600 -> 1,066,700 (v0.17 gaps_plan_cli review fixes, ungated
+# correctness; STATUS.md): +2,100 B. The `max` fixes, and the `planner`
+# ones: push-down past VALUES arms (a UNION's VALUES collations checked),
+# `x OR 0` after constant propagation, CROSS JOIN prerequisites, a LEFT
+# JOIN's constant ON term. Same offset.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 1061880
+ratchet = 1066716
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

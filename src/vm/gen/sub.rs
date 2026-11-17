@@ -573,6 +573,7 @@ fn placeholder(id: usize) -> SubPlan {
         rec: None,
         mat: 0,
         real_cols: AVec::new(),
+        vchain: false,
         #[cfg(feature = "explain")]
         sel: 0,
         #[cfg(feature = "planner")]

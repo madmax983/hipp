@@ -195,13 +195,9 @@ fn dump_replays_triggers_after_the_data() {
     assert!(ok);
     let (dump, _) = run_stdin(&hipp_bin(), &src, ".dump\n");
     let (odump, _) = run_stdin(&oracle(), &src, ".dump\n");
-    // The pin's object order and `--` rule; it also writes a PRAGMA
-    // first.
-    assert_eq!(
-        odump.trim_start_matches("PRAGMA foreign_keys=OFF;\n"),
-        dump,
-        "{dump}"
-    );
+    // The pin's object order and `--` rule, and (v0.17) its leading
+    // PRAGMA line.
+    assert_eq!(odump, dump, "{dump}");
     let check = "INSERT INTO t VALUES (3); SELECT * FROM log; SELECT count(*) FROM t;";
     let mut outs = Vec::new();
     for (tag, bin) in [("h", hipp_bin()), ("o", oracle())] {
