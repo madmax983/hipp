@@ -1501,7 +1501,13 @@ impl<'c, S: Storage> Statement<'c, S> {
                 }
             }
             match self
-                .sub_project(&plan, &empty, core::slice::from_ref(&acc), None, 0)
+                .sub_project(
+                    &plan,
+                    &empty,
+                    core::slice::from_ref(&acc),
+                    None,
+                    (0, usize::MAX),
+                )
                 .await
             {
                 Ok(p) => produced.extend_from_slice(p.as_slice()),

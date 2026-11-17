@@ -99,7 +99,13 @@ justify_over = 4096
 # (`coll_misses`, `key_coll`, `lead_colls`), VALUES parsed as the pin's
 # chain / co-routine segments with the later chain's wrapper, VALUES
 # column names from a first-row column; `chain_reals` removed.
-ratchet = 486884
+# 486,884 -> 487,404 (v0.17 order_offset review fixes, ungated correctness;
+# STATUS.md): +520 B. A delivered ORDER BY (COLLATE'd / multi-term rowid
+# lead, a correlated scope's own rowid) skips its OFFSET and stops at its
+# LIMIT; DISTINCT cores and groups count distinct rows under a LIMIT.
+# Offsets: one `dup_row` for every DISTINCT check, `dedup_compound_rows`
+# and stream's `rowid_order` removed.
+ratchet = 487404
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -177,7 +183,10 @@ justify_over = 16384
 # 971,976 -> 975,540 (v0.17 values_chain, ungated correctness; STATUS.md):
 # +3,564 B, the `full` growth plus the chain plan lines (`explain`);
 # `window::each_child` shared with `coll_misses` (-232 B).
-ratchet = 975540
+# 975,540 -> 976,508 (v0.17 order_offset review fixes, ungated correctness;
+# STATUS.md): +968 B, the `full` fixes plus windows stopping at their
+# LIMIT and isOrderDistinct over IN terms and WITHOUT ROWID columns.
+ratchet = 976508
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -250,7 +259,9 @@ justify_over = 32768
 # 1,070,172 -> 1,073,688 (v0.17 values_chain, ungated correctness;
 # STATUS.md): +3,516 B, the `max` growth plus the chain push-down rule
 # and the result aliases kept for the flattener (`planner`).
-ratchet = 1073688
+# 1,073,688 -> 1,074,624 (v0.17 order_offset review fixes, ungated
+# correctness; STATUS.md): +936 B, the `max` fixes.
+ratchet = 1074624
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

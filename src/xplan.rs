@@ -1527,6 +1527,10 @@ pub(crate) fn is_in(ts: &[Term], t: usize) -> bool {
 enum Ord<'x> {
     Key(&'x IdxKey, KeyOrder),
     Rowid,
+    /// A WITHOUT ROWID table's column its clustered index holds
+    /// after the key (v0.17 review fix: the pin's `wherePathSatisfiesOrderBy`
+    /// walks them too, in table order, under their own collations).
+    Col(usize),
     /// Past a WITHOUT ROWID index's full key (v0.16): the rows are
     /// unique, every later term is tie-free.
     End,
@@ -1632,6 +1636,19 @@ pub(crate) fn order_sat(
                 for (key, o) in m.suffix.iter() {
                     cols.push((Ord::Key(key, *o), false));
                 }
+                // (The clustered index's other columns: not for a
+                // GROUP BY, whose distinct rule hipp does not model.)
+                if m.covers_all && !q.group {
+                    for c in 0..s.ncols {
+                        if !m
+                            .keys
+                            .iter()
+                            .any(|k| matches!(k, IdxKey::Col(x) if *x == c))
+                        {
+                            cols.push((Ord::Col(c), false));
+                        }
+                    }
+                }
                 cols.push((Ord::End, false));
             } else {
                 cols.push((Ord::Rowid, false));
@@ -1670,7 +1687,7 @@ pub(crate) fn order_sat(
                 continue;
             }
             let hit = |e: &RExpr, o: &SortOrder| match c {
-                Ord::End => false,
+                Ord::End | Ord::Col(_) => false,
                 Ord::Rowid => s.is_rowid(e),
                 Ord::Key(k, ko) => {
                     ko.coll == o.coll
@@ -1705,8 +1722,10 @@ pub(crate) fn order_sat(
     let mut sat = 0usize;
     let mut bignull = None;
     // A UNIQUE index whose key columns past the equality ones are
-    // NOT NULL (and no `IS` equality): its whole key makes the rows
-    // distinct.
+    // NOT NULL (and no `IS` equality; an IN one counts as `=`, v0.17
+    // review fix): its whole key makes the rows distinct. The pin also
+    // requires each later column it walks NOT NULL (`lost`).
+    let mut lost = false;
     let uniq = ix.is_some_and(|m| {
         m.unique
             && skip_of(l) == 0
@@ -1718,8 +1737,9 @@ pub(crate) fn order_sat(
                 _ => true,
             })
             && l.eq.iter().all(|t| {
-                ts.get(*t)
-                    .is_some_and(|t| matches!(t.op, TOp::Eq) && !t.isnull)
+                ts.get(*t).is_some_and(|t| {
+                    matches!(t.op, TOp::Eq | TOp::In(_) | TOp::InSub(_)) && !t.isnull
+                })
             })
     });
     for (i, (e, o)) in q.order.iter().enumerate() {
@@ -1748,9 +1768,23 @@ pub(crate) fn order_sat(
             sat = tail(i);
             break;
         }
+        // A WITHOUT ROWID index's column past its key: the pin checks
+        // it NOT NULL before it matches a term, and once the terms stop
+        // matching there the rows are distinct (where.c: `if( j==0 ||
+        // j<nKeyCol ) isOrderDistinct=0` only before the key's end;
+        // v0.17 review fix).
+        let past = ix.is_some_and(|m| tab.wr && next >= m.keys.len());
+        if past {
+            let x = match c {
+                Ord::Col(x) | Ord::Key(IdxKey::Col(x), _) => Some(*x),
+                _ => None,
+            };
+            if x.is_some_and(|x| !tab.notnull.get(x).copied().unwrap_or(false)) {
+                lost = true;
+            }
+        }
         if matches!(c, Ord::End) {
-            let nn = ix.is_none_or(|m| !m.covers_all) || tab.notnull.iter().all(|x| *x);
-            if uniq && nn {
+            if uniq && !lost {
                 sat = tail(i);
             } else if q
                 .order
@@ -1765,6 +1799,8 @@ pub(crate) fn order_sat(
         let (hit, kdesc) = match c {
             Ord::End => (false, false),
             Ord::Rowid => (s.is_rowid(e0), false),
+            // (A term under its column's own collation: no COLLATE.)
+            Ord::Col(x) => (s.is_col(e, *x), false),
             Ord::Key(k, ko) => (
                 ko.coll == o.coll
                     && match k {
@@ -1776,6 +1812,9 @@ pub(crate) fn order_sat(
             ),
         };
         if !hit {
+            if past && uniq && !lost {
+                sat = tail(i);
+            }
             break;
         }
         let r = if q.group { false } else { o.desc != kdesc };

@@ -2139,7 +2139,10 @@ impl<S: Storage> Statement<'_, S> {
             self.rec_rows.push((rec.id, row));
             let mut r = Ok(());
             for step in steps.iter() {
-                match self.exec_subplan_core(step, outer, None, None, 0).await {
+                match self
+                    .exec_subplan_core(step, outer, None, None, (0, usize::MAX))
+                    .await
+                {
                     Ok(produced) => {
                         for p in produced.iter() {
                             if admit(&p.out, &mut seen) {

@@ -260,6 +260,53 @@ All ungated fixes on claimed paths (ADR 0001); no new leaf.
    (`... UNION ALL SELECT 'a', 1 ORDER BY 1`). Only operators other
    than UNION ALL merge now; the final stable sort is the ORDER BY.
 
+**Review fixes** (all ungated, each reproduced on the live pin first):
+6. **A delivered ORDER BY skips and stops on every path.** `pre_skip`
+   asked `stream::rowid_order`, which took one bare rowid term at slot
+   0 only, so `ORDER BY rowid, b`, `rowid COLLATE NOCASE`, an INTEGER
+   PRIMARY KEY `a, b` / `a COLLATE NOCASE` computed the OFFSET rows (and,
+   with a LIMIT, every later row) — and inside a correlated subquery an
+   enclosing query's `x.rowid` / `x.a` read as the subquery's own order,
+   skipping rows the pin computes. `order_delivered` now takes the
+   source's own slot base and rowid source (`(outer.vals.len(),
+   outer.rowids.len())` for a subquery, `(0, 0)` at the top), strips the
+   leading COLLATE, and serves the planner's trim, `pre_skip`, the
+   stream's no-sorter mode (DISTINCT included) and the subquery LIMIT
+   cap; `stream::rowid_order` is gone.
+7. **isOrderDistinct over IN and WITHOUT ROWID columns**
+   (`xplan::order_sat`): an IN equality counts as `=` for the UNIQUE
+   key (where.c skips the NOT NULL test for `j < nEq`), and a WITHOUT
+   ROWID index walks the columns past its key — a secondary index's
+   PRIMARY KEY suffix, the clustered index's other columns in table
+   order (`Ord::Col`) — testing each NOT NULL before it matches a term;
+   once the terms stop matching past the key (`if( j==0 ||
+   j<nKeyCol ) isOrderDistinct=0` only before it) the rows are
+   distinct. `WHERE a IN (1,3) ORDER BY a, b, X`, `pw WHERE a > 0 ORDER
+   BY a, X` and `pv WHERE b > 0 ORDER BY b, c, X` answer with no
+   sorter; `pw ... ORDER BY a, b, X` is `LAST TERM OF ORDER BY` (was
+   `LAST 2 TERMS`: the clustered index's `b` is walked).
+8. **A single-row aggregate's DISTINCT and ORDER BY are no-ops**:
+   `pre_skip` treats an aggregate without GROUP BY (and no window) as
+   one delivered row, so `SELECT DISTINCT X+count(*) FROM t LIMIT 1
+   OFFSET 1` and its `ORDER BY 1` form are no row, in FROM / scalar
+   subqueries and compound arms too.
+9. **Windows, DISTINCT cores and DISTINCT groups stop at their
+   LIMIT.** `pre_skip` also returns the bound past which no row is
+   computed; `win_project_async` stops there (with no sorter; a
+   DISTINCT one drops duplicates as they come), so `SELECT G,
+   row_number() OVER (PARTITION BY b) FROM t LIMIT 1` answers. A UNION
+   ALL chain's DISTINCT core and a DISTINCT grouping (`group_cap`)
+   count distinct rows under the cap (`dup_row`), as the pin's loop
+   stops at the LIMIT (`SELECT DISTINCT G FROM t UNION ALL SELECT 5
+   LIMIT 1`, `SELECT DISTINCT b, G FROM t GROUP BY a LIMIT 1`).
+10. **The DISTINCT subquery cap's dedup runs once** (review finding:
+    `sub_project`'s inline dedup recomputed the collations per row and
+    `exec_subplan_core_n` deduplicated again, about 2x base). The
+    collations are hoisted and the second pass is skipped when the
+    first ran: `SELECT count(*) FROM (SELECT DISTINCT a FROM t LIMIT
+    20000)` over 20,000 rows is back to base (13.9 s debug, 14.3 s at
+    base, 29.0 s before).
+
 **Oracle-probing notes** (live pin, rows and EQP): `SELECT
 abs(-9223372036854775808) LIMIT 1 OFFSET 1`, its FROM / scalar / IN /
 CTE / view forms, `X UNION ALL SELECT 2 LIMIT 1 OFFSET 1` (2), `SELECT
@@ -289,8 +336,32 @@ BY x, n` is `LAST TERM OF ORDER BY`; `ORDER BY 1 COLLATE BINARY` in
 the subquery is column 1 (`resolveOrderGroupBy` strips the COLLATE of
 an integer), `x COLLATE BINARY` is none. UNION ALL ties: `t2 UNION
 ALL t ORDER BY n DESC` is `B|5` before `|5` (left core first).
+Review probes (X = an overflow on one row): `ORDER BY rowid, b` /
+`rowid, a, b` / `rowid COLLATE NOCASE` / ipk `a, b` / `a COLLATE
+NOCASE` `LIMIT 2 OFFSET 1` answer `2 3`, and with the overflow on the
+third row `LIMIT 2` answers `1 2`; a correlated `(SELECT .. FROM t
+ORDER BY rowid LIMIT 1 OFFSET 1)` answers, `ORDER BY x.rowid` / `x.a`
+/ `rowid, x.b` fail (where.c: `mTerm==0 && !sqlite3ExprIsConstant`
+leaves the term unsatisfied, a sorter). `ti WHERE a IN (1,3) ORDER BY
+a, b, X` is `1 1 3` with `SEARCH ti USING COVERING INDEX ... (a=?)` and
+no sorter (also DESC, with `b > 0`, with `b IN`); `a = 1 ORDER BY b, X`
+answers, `a IS 1` fails. WITHOUT ROWID `pw(a PK, b NOT NULL, c)`:
+`WHERE a > 0 ORDER BY a, X` and `a IN (..)` answer with no sorter,
+`a, b, X` / `a, b, c, X` are `LAST TERM OF ORDER BY`; `pv` secondary
+UNIQUE `(b, c)`: `b, c, X` no sorter; `pu PRIMARY KEY(b, a)`: `b, a,
+X` no sorter, `b, a, c, X` one term; nullable `pn`: `a, X` fails.
+`SELECT DISTINCT X+count(*) FROM t LIMIT 1 OFFSET 1`, `ORDER BY 1`,
+`HAVING`, FROM / scalar forms answer (no row); with `sum(count(*))
+OVER ()` they fail. Window LIMITs: `row_number() OVER ()`, `OVER
+(PARTITION BY b)`, `sum(a) OVER (PARTITION BY b)` `LIMIT 1` answer
+(`1|1`, `1|1`, `1|4`); `DISTINCT G, row_number() OVER () > 0 LIMIT 1`
+answers; with an outer ORDER BY the pin answers too — its top-N sorter
+(select.c `pushOntoSorter`: `OP_IfNotZero` / `OP_IdxLE` before
+`pDeferredRowLoad`) skips a row whose key sorts past the LIMIT before
+its columns (see the gaps). `SELECT DISTINCT G FROM t UNION ALL SELECT
+5 LIMIT 1` and `SELECT DISTINCT b, G FROM t GROUP BY a LIMIT 1` answer.
 
-**Tests.** `tests/order_offset_v17.rs` (9 tests, rows in order and,
+**Tests.** `tests/order_offset_v17.rs` (13 tests, rows in order and,
 where shapes allow, EQP trees against the live pin): 60 OFFSET shapes
 over every executor path; 37 distinct-tail shapes (rowid, UNIQUE,
 WITHOUT ROWID, joins, subqueries, DISTINCT, GROUP BY, windows); 31
@@ -298,22 +369,39 @@ omitted-ORDER-BY shapes (8 with plans); 24 co-routine-order shapes
 with plans; 11 UNION ALL tie shapes; generated corpora (xorshift): 160
 OFFSET queries, 140 ORDER BY tails with plans, 160 FROM subqueries
 with and without ORDER BY / LIMIT under ordering, joining, aggregating
-and compound readers. `hipp-cli/tests/cli_v17_order_offset.rs` (4
-tests): the same fixes on stdin scripts (rows, error presence, exit
-status, EQP text) and one-shot arguments, byte for byte.
+and compound readers. Review fixes: 28 delivered-order shapes (top
+level, FROM / scalar / correlated subqueries, an enclosing rowid),
+29 IN / WITHOUT ROWID shapes with plans, 14 single-row aggregate
+shapes, 30 window / DISTINCT LIMIT shapes, and a generated corpus of
+300 (220 rows-only, 80 with plans; each corpus must mostly answer on
+the pin, so error-vs-error agreement cannot carry it).
+`hipp-cli/tests/cli_v17_order_offset.rs` (5 tests; the review one
+without the delivered-order and one-row aggregate shapes, see the VM
+gap): the same fixes on
+stdin scripts (rows, error presence, exit status, EQP text) and
+one-shot arguments, byte for byte.
 
 **Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
 passed (its `--features vm` workspace suite included: the frozen VM's
 suites stay green, the new shapes fall back); `tests/depth_v16.rs` and
 `tests/triggers_v16.rs` with debug info: pass (no recursion added; no
-`STACK_*` change).
+`STACK_*` change). Review fixes: `cargo fmt --all`; full
+`ci/local-gates.sh` through every test and no_std stage (the
+`--features vm` suites green), its size stages re-run after the
+ratchet update: all pass; `tests/depth_v16.rs` and
+`tests/triggers_v16.rs` with debug info pass (no `STACK_*` change).
 
 **Size Δ.** tiny 0 (76,928); full +2,720 (481,064 → 483,784); max
 +3,504 (968,472 → 971,976); xl +3,456 (1,066,716 → 1,070,172).
 Ratchets raised to the measured figures with a justification
 (`ci/size-ratchet.toml`); offsets taken first: one `arm_bounds` for
 both compound executors and the skipped group's aggregates in the
-existing finalize loop (-440 B on full).
+existing finalize loop (-440 B on full). Review fixes: tiny 0
+(76,928); full +520 (486,884 → 487,404); max +968 (975,540 →
+976,508); xl +936 (1,073,688 → 1,074,624), measured over the
+values_chain unit that landed between; offsets: one `dup_row` for
+every DISTINCT check, `dedup_compound_rows` and `stream::rowid_order`
+removed.
 
 **Honest gaps.**
 - A GROUP BY over a co-routine's order: the pin's `wherePathMatchSubqueryOB`
@@ -332,10 +420,32 @@ existing finalize loop (-440 B on full).
   `iOrderByCol`); hipp's resolved term is a COLLATE expression, so a
   reader's `ORDER BY x` is sorted again (rows in the reader's
   collation).
-- A WITHOUT ROWID table read in its own order (no access path) whose
-  columns are all NOT NULL: `ORDER BY k, abs(..)` answers on the pin,
-  fails in hipp (the natural scan's delivered order is not kept; the
-  DESC form, an access path, matches).
+- A WITHOUT ROWID table read in its own order (no access path, `SCAN
+  w`): `ORDER BY k, abs(..)` answers on the pin when the columns the
+  pin walks past the key are NOT NULL, and fails in hipp — the plan
+  (EXPLAIN QUERY PLAN) now matches, but the executor keeps no
+  delivered order for a natural scan (it has no access path to carry
+  it). Through an access path (`WHERE k > 0`, `k IN (..)`, DESC) it
+  matches (review fix 7).
+- A sorter under a LIMIT computes every row's result columns in hipp;
+  the pin's top-N sorter (select.c `pushOntoSorter` with
+  `pDeferredRowLoad`, for SRT_Output / co-routine / scalar
+  destinations, not a materialized one, no DISTINCT) computes the
+  ORDER BY key first and skips a row whose key sorts at or past the
+  largest of the LIMIT + OFFSET rows it holds before computing its
+  columns: `SELECT CASE WHEN a IS NULL THEN abs(..) ELSE a END, b FROM
+  t ORDER BY a DESC LIMIT 2` answers on the pin, fails in hipp, as do
+  a window query's outer ORDER BY ... LIMIT and a grouped one (review
+  finding 5; pre-existing, a separate mechanism from the OFFSET and
+  delivered orders this unit fixes, recorded rather than built).
+- A subquery's ORDER BY alias under a COLLATE (`(SELECT c AS x, n FROM
+  t ORDER BY x COLLATE NOCASE LIMIT 10) ORDER BY x`) is the same as
+  `ORDER BY 1 COLLATE BINARY` above: the pin's term is result column
+  1, so the reader keeps the subquery's NOCASE order (`NULL, 1, A, a,
+  b, B`); hipp sorts again (`NULL, 1, A, B, a, b`).
+- A GROUP BY over a WITHOUT ROWID clustered index walks only its key
+  (the non-key columns' NOT NULL test the pin applies to a GROUP BY's
+  distinct rows is not modelled; pre-existing).
 - The omission is not applied under a window function's reader (the
   pin's rewrite moves the FROM clause into a subquery that keeps or
   drops the ORDER BY by its own rules), nor for UPDATE ... FROM.
@@ -345,6 +455,11 @@ existing finalize loop (-440 B on full).
   own OFFSET handling (it computes a skipped row's columns and skips a
   skipped group's finalize); its strict suites stay green and
   `tests/order_offset_v17.rs` runs on today's executor under `vm`.
+  The review's delivered-order and single-row aggregate OFFSET shapes
+  (`ORDER BY rowid, b LIMIT 2 OFFSET 1`, a correlated `ORDER BY
+  x.rowid`, `SELECT DISTINCT X+count(*) FROM t LIMIT 1 OFFSET 1`)
+  differ on the VM, so the hipp-cli suite, which runs on it under the
+  workspace's `--features vm` pass, leaves them to the library suite.
 
 ### Parity: gaps_plan_cli — planner and CLI divergences (2026-11-15)
 

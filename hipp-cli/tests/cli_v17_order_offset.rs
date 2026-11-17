@@ -165,3 +165,28 @@ fn one_shot_arguments_like_the_pin() {
         ],
     );
 }
+
+/// The review fixes as the shell shows them: IN and WITHOUT ROWID
+/// loops make the rows distinct (rows and plans); windows and DISTINCT
+/// cores stop at their LIMIT. (The delivered-order and single-row
+/// aggregate OFFSET shapes are in `tests/order_offset_v17.rs` only:
+/// under the workspace's `--features vm` run this shell executes them
+/// on the frozen VM, which keeps its own OFFSET handling, a recorded
+/// gap.)
+#[test]
+fn review_fixes_render_like_the_pin() {
+    same(
+        "review",
+        "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,1),(2,1),(3,2);
+CREATE TABLE x(a INTEGER PRIMARY KEY, b); INSERT INTO x VALUES (1,1),(2,1),(3,2);
+CREATE TABLE ti(a, b NOT NULL, UNIQUE(a, b)); INSERT INTO ti VALUES (1,1),(1,2),(3,2);
+CREATE TABLE pw(a PRIMARY KEY, b NOT NULL, c) WITHOUT ROWID; INSERT INTO pw VALUES (1,1,0),(2,2,0),(3,2,0);",
+        "SELECT a FROM ti WHERE a IN (1,3) ORDER BY a, b, abs(-9223372036854775808);
+EXPLAIN QUERY PLAN SELECT a FROM ti WHERE a IN (1,3) ORDER BY a, b, abs(-9223372036854775808);
+SELECT c FROM pw WHERE a > 0 ORDER BY a, abs(-9223372036854775808);
+EXPLAIN QUERY PLAN SELECT c FROM pw WHERE a > 0 ORDER BY a, b, abs(-9223372036854775808);
+SELECT CASE WHEN b=2 THEN abs(-9223372036854775808) ELSE a END, row_number() OVER (PARTITION BY b) FROM t LIMIT 1;
+SELECT DISTINCT CASE WHEN b=2 THEN abs(-9223372036854775808) ELSE a END FROM t UNION ALL SELECT 5 LIMIT 1;
+SELECT DISTINCT b, CASE WHEN b=2 THEN abs(-9223372036854775808) ELSE a END FROM t GROUP BY a LIMIT 1;",
+    );
+}

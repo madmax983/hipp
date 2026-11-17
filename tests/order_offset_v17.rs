@@ -683,3 +683,360 @@ fn generated_subquery_orders_match_the_pin() {
     let bad = diffs_on(&path, &qs, false);
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
 }
+
+// ---------------------------------------------------- review fixes
+
+/// The review-fix schema: an INTEGER PRIMARY KEY table, a UNIQUE
+/// index with a nullable leading column, WITHOUT ROWID tables with
+/// NOT NULL, nullable and secondary-UNIQUE shapes.
+const R: &str = "CREATE TABLE t(a, b); INSERT INTO t VALUES (1,1),(2,1),(3,2); \
+    CREATE TABLE x(a INTEGER PRIMARY KEY, b); INSERT INTO x VALUES (1,1),(2,1),(3,2); \
+    CREATE TABLE ti(a, b NOT NULL, UNIQUE(a, b)); INSERT INTO ti VALUES (1,1),(1,2),(3,2),(NULL,4); \
+    CREATE TABLE pw(a PRIMARY KEY, b NOT NULL, c) WITHOUT ROWID; \
+    INSERT INTO pw VALUES (1,1,0),(2,2,NULL),(3,2,0); \
+    CREATE TABLE pv(a PRIMARY KEY, b NOT NULL, c NOT NULL) WITHOUT ROWID; \
+    INSERT INTO pv VALUES (1,1,0),(2,2,0),(3,2,1); CREATE UNIQUE INDEX pvb ON pv(b, c); \
+    CREATE TABLE pu(a, b, c NOT NULL, d, PRIMARY KEY(b, a)) WITHOUT ROWID; \
+    INSERT INTO pu VALUES (1,1,0,0),(2,2,0,1),(3,2,1,1); CREATE INDEX pud ON pu(d); \
+    CREATE TABLE pn(a PRIMARY KEY, b, c) WITHOUT ROWID; INSERT INTO pn VALUES (1,1,1),(2,NULL,2); \
+    CREATE TABLE pp(a INTEGER PRIMARY KEY, b NOT NULL, c); CREATE UNIQUE INDEX ppb ON pp(b); \
+    INSERT INTO pp VALUES (1,3,1),(2,2,2),(3,1,3); \
+    CREATE TABLE tw(a INTEGER PRIMARY KEY, b); INSERT INTO tw VALUES (1,1),(2,2),(3,1),(4,1);";
+
+/// A corpus line's `$F` (a result column that overflows on the row
+/// whose `a` is 1) and `$G` (on the row whose `b` is 2).
+fn review(tag: &str, qs: &[&str], plans: bool) {
+    let qs: Vec<String> = qs.iter().map(|q| fill(q)).collect();
+    let path = fresh(tag, R);
+    answers_mostly(&path, &qs);
+    let bad = diffs_on(&path, &qs, plans);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// Most of a corpus must answer on the pin (an error on both sides
+/// agrees, so a corpus of errors would test nothing).
+fn answers_mostly(path: &Path, qs: &[String]) {
+    let ok = qs.iter().filter(|q| pin(path, q).is_ok()).count();
+    assert!(
+        ok * 2 >= qs.len(),
+        "only {ok} of {} answer on the pin",
+        qs.len()
+    );
+}
+
+fn fill(q: &str) -> String {
+    q.replace("$F", "CASE WHEN a=1 THEN BAD ELSE a END")
+        .replace("$G", "CASE WHEN b=2 THEN BAD ELSE a END")
+        .replace("BAD", BAD)
+}
+
+/// An ORDER BY its lone table's loop delivers — the rowid or INTEGER
+/// PRIMARY KEY under a COLLATE, or followed by plain columns — has no
+/// sorter: the OFFSET skips rows before their columns and the LIMIT
+/// stops the loop, at the top level and in subqueries, correlated
+/// ones too; an enclosing query's rowid or column is no such order
+/// (review fix: hipp computed the skipped rows, and a correlated
+/// subquery read the enclosing rowid as its own).
+#[test]
+fn review_delivered_orders_skip_and_stop() {
+    review(
+        "rdel",
+        &[
+            "SELECT $F FROM t ORDER BY rowid, b LIMIT 2 OFFSET 1",
+            "SELECT $F FROM t ORDER BY rowid, a, b LIMIT 2 OFFSET 1",
+            "SELECT $F FROM t ORDER BY rowid COLLATE NOCASE LIMIT 2 OFFSET 1",
+            "SELECT $F FROM t ORDER BY rowid, b COLLATE NOCASE DESC LIMIT 2 OFFSET 1",
+            "SELECT $F FROM t ORDER BY rowid DESC LIMIT 2 OFFSET 1",
+            "SELECT (SELECT $F FROM t ORDER BY rowid COLLATE NOCASE LIMIT 1 OFFSET 1)",
+            "SELECT $F FROM x ORDER BY a, b LIMIT 2 OFFSET 1",
+            "SELECT $F FROM x ORDER BY a COLLATE NOCASE LIMIT 2 OFFSET 1",
+            "SELECT * FROM (SELECT $F FROM x ORDER BY a COLLATE NOCASE, b LIMIT 2 OFFSET 1)",
+            "SELECT CASE WHEN a=3 THEN BAD ELSE a END FROM t ORDER BY rowid, b LIMIT 2",
+            "SELECT CASE WHEN a=3 THEN BAD ELSE a END FROM t ORDER BY rowid COLLATE NOCASE LIMIT 2",
+            "SELECT (SELECT CASE WHEN a=3 THEN BAD ELSE a END FROM t ORDER BY rowid, b LIMIT 1)",
+            "SELECT * FROM (SELECT CASE WHEN a=3 THEN BAD ELSE a END FROM t ORDER BY rowid, b LIMIT 1)",
+            "SELECT CASE WHEN a=3 THEN BAD ELSE a END FROM x ORDER BY a, b LIMIT 2",
+            "SELECT b, (SELECT CASE WHEN a=3 THEN BAD ELSE a END FROM t ORDER BY rowid LIMIT 1) FROM x",
+            "SELECT b, (SELECT $F FROM x ORDER BY a LIMIT 1 OFFSET 1) FROM t",
+            "SELECT b, (SELECT $F FROM t ORDER BY rowid LIMIT 1 OFFSET 1) FROM x",
+            "SELECT x.b, (SELECT CASE WHEN t.a=3 THEN BAD ELSE t.a END FROM t ORDER BY t.rowid, t.b LIMIT 1) FROM x",
+            "SELECT x.b, (SELECT CASE WHEN t.a=3 THEN BAD ELSE t.a END FROM t ORDER BY t.rowid DESC LIMIT 1 OFFSET 2) FROM x",
+            "SELECT b, (SELECT $F FROM t ORDER BY rowid, x.b LIMIT 1 OFFSET 1) FROM x",
+            "SELECT b, (SELECT CASE WHEN t.a=1 THEN BAD ELSE t.a END FROM t ORDER BY x.rowid LIMIT 1 OFFSET 1) FROM x",
+            "SELECT b, (SELECT CASE WHEN t.a=1 THEN BAD ELSE t.a END FROM t ORDER BY x.a LIMIT 1 OFFSET 1) FROM x",
+            "SELECT b, (SELECT CASE WHEN t.a=1 THEN BAD ELSE t.a END FROM t ORDER BY x.rowid LIMIT 1) FROM x",
+            "SELECT x.b, (SELECT CASE WHEN t.a=1 THEN BAD ELSE t.a END FROM t ORDER BY t.rowid, x.a LIMIT 1 OFFSET 1) FROM x",
+            "SELECT DISTINCT b FROM t ORDER BY rowid, b LIMIT 1 OFFSET 1",
+            "SELECT * FROM (SELECT DISTINCT CASE WHEN a=3 THEN BAD ELSE b END FROM t ORDER BY rowid, b LIMIT 1)",
+            "SELECT $F FROM t ORDER BY rowid, abs(b) LIMIT 2 OFFSET 1",
+            "SELECT $F FROM t ORDER BY rowid, random() LIMIT 2 OFFSET 1",
+        ],
+        true,
+    );
+}
+
+/// The pin's `isOrderDistinct` over IN equalities (an IN column is
+/// walked, its NULLs never reached) and WITHOUT ROWID indexes (the
+/// columns past the key are walked until the ORDER BY stops
+/// matching, each NOT NULL first): later terms are never computed
+/// (review fix: hipp sorted the last terms and computed them).
+#[test]
+fn review_in_and_without_rowid_distinct_rows() {
+    review(
+        "rinwr",
+        &[
+            "SELECT a FROM ti WHERE a IN (1,3) ORDER BY a, b, BAD",
+            "SELECT a FROM ti WHERE a IN (1,3) ORDER BY a DESC, b DESC, BAD",
+            "SELECT a FROM ti WHERE a IN (1,3) AND b > 0 ORDER BY a, b, BAD",
+            "SELECT a FROM ti WHERE a IN (1,3) AND b IN (1,2) ORDER BY a, b, BAD",
+            "SELECT a FROM ti WHERE a IN (SELECT b FROM t) ORDER BY a, b, BAD",
+            "SELECT a FROM ti WHERE a = 1 ORDER BY b, BAD",
+            "SELECT a FROM ti WHERE a IS 1 ORDER BY b, BAD",
+            "SELECT a FROM ti WHERE a IN (1,3) ORDER BY a, BAD",
+            "SELECT c FROM pw WHERE a > 0 ORDER BY a, BAD",
+            "SELECT c FROM pw WHERE a > 0 ORDER BY a, b, BAD",
+            "SELECT c FROM pw WHERE a > 0 ORDER BY a, b, c, BAD",
+            "SELECT c FROM pw WHERE a > 0 ORDER BY a DESC, BAD",
+            "SELECT c FROM pw WHERE a IN (1,2,3) ORDER BY a, BAD",
+            "SELECT c FROM pw WHERE a > 0 ORDER BY a, b, random()",
+            "SELECT a FROM pv WHERE b > 0 ORDER BY b, c, BAD",
+            "SELECT a FROM pv WHERE b > 0 ORDER BY b, c, a, BAD",
+            "SELECT a FROM pv WHERE b > 0 ORDER BY b, BAD",
+            "SELECT a FROM pv WHERE a > 0 ORDER BY a, b, c, BAD",
+            "SELECT a FROM pu WHERE b > 0 ORDER BY b, a, BAD",
+            "SELECT a FROM pu WHERE b > 0 ORDER BY b, a, c, BAD",
+            "SELECT a FROM pu WHERE b > 0 ORDER BY b, a, c, d, BAD",
+            "SELECT a FROM pu WHERE d >= 0 ORDER BY d, b, a, BAD",
+            "SELECT a FROM pu WHERE d >= 0 ORDER BY d, BAD",
+            "SELECT a FROM pn WHERE a > 0 ORDER BY a, BAD",
+            "SELECT a FROM pn WHERE a > 0 ORDER BY a, c",
+            "SELECT a FROM pn ORDER BY a, BAD",
+            "SELECT a FROM pp WHERE b > 0 ORDER BY b, BAD",
+            "SELECT a FROM pp WHERE b IN (1,2) ORDER BY b, BAD",
+            "SELECT a FROM pp WHERE b IN (1,2) ORDER BY b DESC, BAD LIMIT 1 OFFSET 1",
+        ],
+        true,
+    );
+}
+
+/// An aggregate without GROUP BY is one row: its DISTINCT and ORDER
+/// BY are no-ops, so its OFFSET skips the row before its columns; a
+/// window query keeps both (review fix: hipp computed the row).
+#[test]
+fn review_single_row_aggregates_skip() {
+    review(
+        "ragg",
+        &[
+            "SELECT DISTINCT BAD+count(*) FROM t LIMIT 1 OFFSET 1",
+            "SELECT BAD+count(*) FROM t ORDER BY 1 LIMIT 1 OFFSET 1",
+            "SELECT BAD+count(*) FROM t ORDER BY 1 DESC NULLS FIRST LIMIT 1 OFFSET 1",
+            "SELECT * FROM (SELECT DISTINCT BAD+count(*) FROM t LIMIT 1 OFFSET 1)",
+            "SELECT (SELECT DISTINCT BAD+count(*) FROM t LIMIT 1 OFFSET 1)",
+            "SELECT DISTINCT BAD+count(*) FROM t HAVING count(*)>0 LIMIT 1 OFFSET 1",
+            "SELECT DISTINCT BAD+count(*), sum(count(*)) OVER () FROM t LIMIT 1 OFFSET 1",
+            "SELECT BAD+count(*), sum(count(*)) OVER () FROM t ORDER BY 1 LIMIT 1 OFFSET 1",
+            "SELECT BAD+count(*) FROM t ORDER BY 1 LIMIT 1",
+            "SELECT DISTINCT BAD+count(*) FROM t UNION ALL SELECT 1 LIMIT 1 OFFSET 1",
+            "SELECT b, (SELECT DISTINCT BAD+count(*) FROM t AS u WHERE u.b=t.b ORDER BY 1 LIMIT 1 OFFSET 1) FROM t",
+            "SELECT DISTINCT count(*), max(a) FROM t ORDER BY 2 DESC LIMIT 5 OFFSET 0",
+            "SELECT DISTINCT BAD+count(*) FROM t WHERE a>5 LIMIT 1 OFFSET 1",
+            "SELECT BAD+count(*), sum(count(*)) OVER () FROM t LIMIT 1 OFFSET 1",
+        ],
+        false,
+    );
+}
+
+/// With no sorter, a window query, a DISTINCT compound core and a
+/// DISTINCT grouping stop at their LIMIT (DISTINCT counting distinct
+/// rows): later rows' result columns are never computed (review fix).
+#[test]
+fn review_window_and_distinct_limits_stop() {
+    review(
+        "rwin",
+        &[
+            "SELECT $G, row_number() OVER () FROM tw LIMIT 1",
+            "SELECT $G, row_number() OVER (PARTITION BY b) FROM tw LIMIT 1",
+            "SELECT $G, sum(a) OVER (PARTITION BY b) FROM tw LIMIT 1",
+            "SELECT * FROM (SELECT $G, row_number() OVER (PARTITION BY b) FROM tw LIMIT 1)",
+            "SELECT $G, row_number() OVER () FROM tw LIMIT 1 OFFSET 1",
+            "SELECT $G, row_number() OVER () FROM tw LIMIT 2 OFFSET 0",
+            "SELECT $G, row_number() OVER (ORDER BY a DESC) FROM tw LIMIT 2 OFFSET 1",
+            "SELECT $G, row_number() OVER (PARTITION BY b ORDER BY a) FROM tw LIMIT 3",
+            "SELECT b, sum(a) OVER (), CASE WHEN b=2 THEN BAD ELSE b END FROM tw GROUP BY b LIMIT 1",
+            "SELECT $G, row_number() OVER () FROM tw UNION ALL SELECT 1, 2 LIMIT 1",
+            "SELECT DISTINCT $G, row_number() OVER () > 0 FROM tw LIMIT 1",
+            "SELECT * FROM (SELECT DISTINCT $G, row_number() OVER () > 0 FROM tw LIMIT 1)",
+            "SELECT DISTINCT b%2, row_number() OVER () > 0, CASE WHEN a=4 THEN BAD ELSE 0 END FROM tw LIMIT 2",
+            "SELECT DISTINCT b%2, row_number() OVER () > 0, CASE WHEN a=4 THEN BAD ELSE 0 END FROM tw LIMIT 1 OFFSET 1",
+            "SELECT DISTINCT b, sum(a) OVER (PARTITION BY b), CASE WHEN a=2 THEN BAD ELSE 0 END FROM tw LIMIT 1",
+            "SELECT DISTINCT b, count(*) OVER (PARTITION BY b) FROM tw LIMIT 5",
+            "SELECT DISTINCT $G FROM tw UNION ALL SELECT 5 LIMIT 1",
+            "SELECT DISTINCT b%1 FROM tw UNION ALL SELECT DISTINCT $G FROM tw LIMIT 2",
+            "SELECT DISTINCT b%1 FROM tw UNION ALL SELECT DISTINCT $G FROM tw LIMIT 2 OFFSET 1",
+            "SELECT * FROM (SELECT DISTINCT b%1 FROM tw UNION ALL SELECT DISTINCT $G FROM tw LIMIT 2)",
+            "SELECT (SELECT DISTINCT b%1 FROM tw UNION ALL SELECT DISTINCT $G FROM tw LIMIT 1 OFFSET 1)",
+            "SELECT DISTINCT b FROM tw UNION ALL SELECT DISTINCT b FROM tw LIMIT 3",
+            "SELECT DISTINCT b, $G FROM tw GROUP BY a LIMIT 1",
+            "SELECT DISTINCT b%2, CASE WHEN a=4 THEN BAD ELSE 0 END FROM tw GROUP BY a LIMIT 2",
+            "SELECT DISTINCT b%2, CASE WHEN a=4 THEN BAD ELSE 0 END FROM tw GROUP BY a LIMIT 1 OFFSET 1",
+            "SELECT * FROM (SELECT DISTINCT b%2, CASE WHEN a=4 THEN BAD ELSE 0 END FROM tw GROUP BY a LIMIT 2)",
+            "SELECT (SELECT DISTINCT b%2 + CASE WHEN a=4 THEN BAD ELSE 0 END FROM tw GROUP BY a LIMIT 1 OFFSET 1)",
+            "SELECT DISTINCT sum(b) FROM tw GROUP BY b%2 LIMIT 1",
+            "SELECT DISTINCT b FROM tw GROUP BY a ORDER BY a DESC LIMIT 2",
+            "SELECT DISTINCT b FROM tw GROUP BY a ORDER BY b LIMIT 2",
+        ],
+        false,
+    );
+}
+
+/// Generated review-fix shapes: delivered orders (rowid / INTEGER
+/// PRIMARY KEY leads under COLLATE, DESC, NULLS placement, later plain
+/// or overflowing terms) under LIMIT / OFFSET at the top level and in
+/// FROM, scalar and correlated subqueries; IN and WITHOUT ROWID loops
+/// with their plans; windows, DISTINCT cores and single-row aggregates
+/// under LIMIT / OFFSET.
+#[test]
+fn generated_review_shapes_match_the_pin() {
+    let mut r = Rng(0x7e71_e3f1_c0de_5eed);
+    let mut rows: Vec<String> = Vec::new();
+    let mut plans: Vec<String> = Vec::new();
+    for _ in 0..120 {
+        let tab = r.pick(&["t", "x"]);
+        let lead = if tab == "t" {
+            r.pick(&[
+                "rowid",
+                "rowid COLLATE NOCASE",
+                "rowid DESC",
+                "rowid NULLS LAST",
+            ])
+        } else {
+            r.pick(&["a", "a COLLATE NOCASE", "a DESC", "rowid", "a NULLS LAST"])
+        };
+        let mut ob = vec![lead.to_string()];
+        for _ in 0..r.n(3) {
+            ob.push(
+                r.pick(&["b", "a", "b DESC", "BAD", "abs(b)", "b COLLATE NOCASE"])
+                    .to_string(),
+            );
+        }
+        let col = r.pick(&["$F", "CASE WHEN a=3 THEN BAD ELSE a END", "a", "$G"]);
+        let core = format!(
+            "SELECT {col} FROM {tab} ORDER BY {} LIMIT {} OFFSET {}",
+            ob.join(", "),
+            r.pick(&["1", "2", "-1"]),
+            r.pick(&["0", "1", "2"])
+        );
+        rows.push(match r.n(4) {
+            0 => core,
+            1 => format!("SELECT * FROM ({core})"),
+            2 => format!("SELECT ({core})"),
+            _ => format!(
+                "SELECT y.b, ({}) FROM x AS y",
+                core.replace("FROM t ", "FROM t AS q ")
+            ),
+        });
+    }
+    for _ in 0..80 {
+        let (tab, lead) = match r.n(5) {
+            0 => (
+                "ti",
+                r.pick(&[
+                    "WHERE a IN (1,3) ORDER BY a, b",
+                    "WHERE a IN (1,3) ORDER BY a DESC, b DESC",
+                    "WHERE a IN (1,3) AND b > 0 ORDER BY a, b",
+                    "WHERE a = 1 ORDER BY b",
+                ]),
+            ),
+            1 => (
+                "pw",
+                r.pick(&[
+                    "WHERE a > 0 ORDER BY a",
+                    "WHERE a > 0 ORDER BY a, b",
+                    "WHERE a IN (1,2,3) ORDER BY a",
+                    "WHERE a > 0 ORDER BY a DESC, b DESC",
+                ]),
+            ),
+            2 => (
+                "pv",
+                r.pick(&[
+                    "WHERE b > 0 ORDER BY b, c",
+                    "WHERE b > 0 ORDER BY b",
+                    "WHERE a > 0 ORDER BY a, b",
+                ]),
+            ),
+            3 => (
+                "pu",
+                r.pick(&[
+                    "WHERE b > 0 ORDER BY b, a",
+                    "WHERE b > 0 ORDER BY b, a, c",
+                    "WHERE d >= 0 ORDER BY d, b, a",
+                ]),
+            ),
+            _ => (
+                "pp",
+                r.pick(&[
+                    "WHERE b > 0 ORDER BY b",
+                    "WHERE b IN (1,2) ORDER BY b",
+                    "WHERE b IN (3,1) ORDER BY b DESC",
+                ]),
+            ),
+        };
+        // (No `random()`: its ties would come in random order.)
+        let tail = r.pick(&[", BAD", ", c", ", BAD, c", ", -c", ", (SELECT BAD)", ""]);
+        let lim = r.pick(&["", " LIMIT 2", " LIMIT 1 OFFSET 1"]);
+        plans.push(format!("SELECT a FROM {tab} {lead}{tail}{lim}"));
+    }
+    for _ in 0..100 {
+        let lim = format!(
+            " LIMIT {} OFFSET {}",
+            r.pick(&["1", "2", "3"]),
+            r.pick(&["0", "1", "2"])
+        );
+        let q = match r.n(5) {
+            0 => format!(
+                "SELECT {}$G, {} FROM tw{lim}",
+                r.pick(&["", "DISTINCT "]),
+                r.pick(&[
+                    "row_number() OVER ()",
+                    "row_number() OVER (PARTITION BY b) > 0",
+                    "sum(a) OVER (PARTITION BY b)",
+                    "count(*) OVER (ORDER BY a DESC)"
+                ])
+            ),
+            1 => format!(
+                "SELECT DISTINCT {} FROM tw UNION ALL SELECT {}{lim}",
+                r.pick(&["b%2", "$G", "b"]),
+                r.pick(&["5", "DISTINCT $G FROM tw", "DISTINCT b FROM tw"])
+            ),
+            2 => format!(
+                "SELECT DISTINCT {} FROM tw GROUP BY a{}{lim}",
+                r.pick(&["b%2, CASE WHEN a=4 THEN BAD ELSE 0 END", "b, $G", "b"]),
+                r.pick(&["", " ORDER BY a", " ORDER BY a DESC"])
+            ),
+            3 => format!(
+                "SELECT {}BAD+count(*){} FROM tw{}{lim}",
+                r.pick(&["", "DISTINCT "]),
+                r.pick(&["", ", max(a)"]),
+                r.pick(&["", " ORDER BY 1", " HAVING count(*) > 0", " WHERE a > 9"])
+            ),
+            _ => format!(
+                "SELECT {}b, $G FROM tw ORDER BY {}{lim}",
+                r.pick(&["", "DISTINCT "]),
+                r.pick(&["rowid", "a", "a, b", "a COLLATE NOCASE"])
+            ),
+        };
+        rows.push(match r.n(3) {
+            0 => q,
+            1 => format!("SELECT * FROM ({q})"),
+            _ => format!("SELECT count(*) FROM ({q})"),
+        });
+    }
+    let path = fresh("grev", R);
+    let rows: Vec<String> = rows.iter().map(|q| fill(q)).collect();
+    let plans: Vec<String> = plans.iter().map(|q| fill(q)).collect();
+    answers_mostly(&path, &rows);
+    answers_mostly(&path, &plans);
+    let mut bad = diffs_on(&path, &rows, false);
+    bad.extend(diffs_on(&path, &plans, true));
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}

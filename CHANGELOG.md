@@ -55,10 +55,22 @@ All notable changes to hipp. Versions follow the milestones in
   delivers the reader's ORDER BY by column number
   (`SQLITE_OrderBySubq`); a DISTINCT subquery under a LIMIT stops at
   it; a UNION ALL compound's ORDER BY keeps ties in core order.
+- Review fixes (ungated): an ORDER BY the loop delivers under a
+  COLLATE or with later plain columns (`ORDER BY rowid, b`, an INTEGER
+  PRIMARY KEY `a COLLATE NOCASE`) skips its OFFSET and stops at its
+  LIMIT, in correlated subqueries too, where an enclosing query's
+  rowid no longer reads as the subquery's own order; isOrderDistinct
+  counts an IN equality as `=` and walks a WITHOUT ROWID index's
+  columns past its key (NOT NULL each) — rows and EXPLAIN QUERY PLAN
+  as the pin's; a single-row aggregate's DISTINCT / ORDER BY no longer
+  makes its OFFSET row computed; window queries, DISTINCT UNION ALL
+  cores and DISTINCT groupings stop at their LIMIT; a DISTINCT
+  subquery under a LIMIT deduplicates once (back to base speed).
 - Tests: `tests/order_offset_v17.rs` (rows and EQP against the live
   pin, generated corpora), `hipp-cli/tests/cli_v17_order_offset.rs`.
 - Size: tiny 0, full +2,720 B, max +3,504 B, xl +3,456 B (ratchets
-  raised to the measured figures).
+  raised to the measured figures); review fixes: tiny 0, full +520 B,
+  max +968 B, xl +936 B.
 
 ### Planner and CLI parity (wave 17, unit `gaps_plan_cli`)
 
