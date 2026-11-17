@@ -299,6 +299,27 @@ impl<S: Storage> Connection<S> {
 
     /// `view_columns` with the planner's error kept (PRAGMA
     /// table_info reports it, as the pin does).
+    /// `plan_subquery` of a SELECT the pin resolves but never codes
+    /// (v0.17 review fix): a view read for its column names, a view or
+    /// trigger ALTER TABLE edits. Its code-generation errors (an
+    /// unknown collation in a comparison or sort key, a row value
+    /// misused, ...) wait in an enclosing scope that is never coded
+    /// (`query::late`); under `deep` (ALTER TABLE's), so do its FROM
+    /// subqueries' column collations (`Connection::uncoded`).
+    pub(super) fn plan_uncoded(
+        &self,
+        s: &SelectStmt,
+        arena: &Arena,
+        deep: bool,
+    ) -> Result<crate::query::SubPlan, S::Error> {
+        let g = crate::query::ScopeGroup::new(AVec::new(), AVec::new(), 0);
+        g.late.set(Some(None));
+        let was = self.uncoded.replace(deep || self.uncoded.get());
+        let r = self.plan_subquery(s, arena, core::slice::from_ref(&g));
+        self.uncoded.set(was);
+        r
+    }
+
     pub(super) fn view_names(
         &self,
         arena: &Arena,
@@ -307,7 +328,11 @@ impl<S: Storage> Connection<S> {
         let ckpt = arena.checkpoint();
         let r = (|| -> Result<AVec<AVec<u8>>, S::Error> {
             let (select, cols) = self.expand_view(arena, v)?;
-            let plan = self.plan_subquery(&select, arena, &[])?;
+            // The pin's `sqlite3ViewGetColumnNames`: the SELECT is
+            // resolved, not coded, and its columns take their types
+            // (v0.17 review fix: only those collations are looked up).
+            let plan = self.plan_uncoded(&select, arena, false)?;
+            crate::query::lead_colls::<S::Error>(&plan)?;
             // A column list names the columns whatever the SELECT's
             // width (the pin checks that only when the view is read).
             let mut names = if cols.is_empty() {
@@ -1623,8 +1648,13 @@ fn count_selects(s: &SelectStmt) -> usize {
 
 fn count_into(s: &SelectStmt, n: &mut usize) {
     count_core(s, n);
+    // (The rows of a VALUES chain are one SELECT here, as before the
+    // chain was read row by row: v0.17 review fix, the pin reads a CTE
+    // of 3,000 chained rows.)
     for (_, c) in s.compound.iter() {
-        count_core(c, n);
+        if c.values.is_empty() {
+            count_core(c, n);
+        }
     }
     for (e, _) in s.order_by.iter() {
         count_expr(e, n);

@@ -1150,7 +1150,7 @@ impl<S: Storage> Connection<S> {
         let ckpt = arena.checkpoint();
         let r = (|| -> Result<AVec<AVec<u8>>, S::Error> {
             let (select, _) = self.expand_view(arena, v)?;
-            let plan = self.plan_subquery(&select, arena, &[])?;
+            let plan = self.plan_uncoded(&select, arena, false)?;
             let mut types = AVec::new();
             let w = plan.width();
             for i in 0..w {
@@ -2489,6 +2489,10 @@ impl<S: Storage> Statement<'_, S> {
             cols.push(m);
         }
         let rules = self.conn.table_rules(&self.arena, t)?;
+        // (The check codes every CHECK: v0.17 review fix.)
+        if let Some(r) = rules.as_deref() {
+            r.coded::<S::Error>(None)?;
+        }
         // Plans and names both in the pin's `pIndex` order (newest
         // first: `write_index_plans` and `table_indexes` each reverse
         // the catalog's), zipped position by position below (v0.17

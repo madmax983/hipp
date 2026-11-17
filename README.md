@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 487,404 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 976,508 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,074,624 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 490,396 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 976,692 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,077,632 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -88,6 +88,15 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   a nested window ORDER BY inside a dropped term raises nothing; a
   view column read through a compound subquery takes the pin's type
   name; a result alias in a WHERE term is pushed down as its item.
+  Review fixes: a WHERE term reaches a compound through a merged
+  subquery or view and through a `SELECT * FROM (...)` arm; a
+  correlated chain arm keeps its column names; long VALUES lists and
+  `count(*)` over 1,000+ arms behave as on the pin; a CHECK under an
+  unknown collation fails only the statements that code it (ADD
+  COLUMN's verification, an UPDATE of a column it reads, FK actions,
+  `integrity_check`), and PRAGMA table_info / ALTER TABLE resolve
+  views without coding them; CREATE TABLE ... AS keeps a REAL in a
+  FLEXNUM column.
 - **ORDER BY / OFFSET parity** (unit `order_offset`, ungated fixes).
   With no sorter or DISTINCT in the way, the OFFSET skips a row before
   its result columns are computed (FROM-less cores, subqueries,

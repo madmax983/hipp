@@ -629,6 +629,32 @@ impl<S: Storage> Connection<S> {
                 if matches!(ev, Event::Insert) && !f.deferred && !self.fk.defer && top && !multi {
                     continue;
                 }
+                let child = self.fk_shape(
+                    c,
+                    arena,
+                    f.on_delete == SET_DEFAULT || f.on_update == SET_DEFAULT,
+                )?;
+                // The action's UPDATE of the child codes the child's
+                // CHECKs that read its key (v0.17 review fix: one under
+                // an unknown collation is refused at prepare).
+                #[cfg(feature = "sql")]
+                if let Some(r) = child.rules.as_deref() {
+                    let act = match ev {
+                        Event::Delete => f.on_delete,
+                        Event::Update(..) => f.on_update,
+                        Event::Insert => 0,
+                    };
+                    if act == SET_NULL
+                        || act == SET_DEFAULT
+                        || (act == CASCADE && matches!(ev, Event::Update(..)))
+                    {
+                        let mut m = AVec::new();
+                        for i in 0..c.columns.len() {
+                            m.push(ccols.iter().any(|k| *k == i));
+                        }
+                        r.coded::<S::Error>(Some((m.as_slice(), false)))?;
+                    }
+                }
                 out.parent.push(Fk {
                     id: (c.root, fi),
                     deferred: f.deferred,
@@ -638,11 +664,7 @@ impl<S: Storage> Connection<S> {
                     ccols,
                     pcols,
                     selfref: eq_ci(handle_bytes(ca, c.name), table),
-                    child: self.fk_shape(
-                        c,
-                        arena,
-                        f.on_delete == SET_DEFAULT || f.on_update == SET_DEFAULT,
-                    )?,
+                    child,
                 });
             }
         }

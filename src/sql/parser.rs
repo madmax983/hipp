@@ -149,6 +149,12 @@ struct Parser<'a> {
     /// read as a chain of selects (`SelectStmt::vchain`).
     #[cfg(feature = "sql")]
     with_seen: bool,
+    /// The VALUES list just parsed ended in a co-routine that began
+    /// after chained rows (v0.17 review fix, `sql`): the pin's reader
+    /// then has `SF_Values`, which exempts the compound from the
+    /// 500-SELECT limit.
+    #[cfg(feature = "sql")]
+    vtail: bool,
     /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
     /// a view's tree in its reduced form, whose leaves lose their
     /// height, so a leaf the pin resolves on its own (`SELECT a`,
@@ -816,6 +822,8 @@ impl<'a> Parser<'a> {
             r_false: false,
             #[cfg(feature = "sql")]
             with_seen: false,
+            #[cfg(feature = "sql")]
+            vtail: false,
             #[cfg(feature = "query")]
             reduced: false,
             #[cfg(feature = "query")]
@@ -4626,10 +4634,12 @@ impl<'a> Parser<'a> {
         #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut last = base;
         #[cfg(feature = "sql")]
+        let mut last_values;
+        #[cfg(feature = "sql")]
         {
             // (A VALUES chain at the head brings its rows as cores.)
             let mut compound: AVec<(CompoundOp, SelectStmt)> = core::mem::take(&mut head.compound);
-            let mut last_values = !head.values.is_empty();
+            last_values = !head.values.is_empty();
             loop {
                 let op = if self.eat_kw(b"UNION") {
                     if self.eat_kw(b"ALL") {
@@ -4656,7 +4666,7 @@ impl<'a> Parser<'a> {
                 // A later VALUES chain is the pin's `SELECT * FROM
                 // (chain)` (`parserDoubleLinkSelect`, v0.17).
                 if !core.compound.is_empty() {
-                    core = self.chain_wrap::<E>(core)?;
+                    core = self.chain_wrap(core);
                 }
                 if op == CompoundOp::UnionAll {
                     pending = pending.max(self.core_h);
@@ -4696,9 +4706,11 @@ impl<'a> Parser<'a> {
         // one), unless the last member is a one-row VALUES (its
         // `SF_Values` exemption; v0.16 review fix — probed: 600
         // SELECTs then `VALUES(1)` read, then `VALUES(1),(2)` do
-        // not).
+        // not) or a VALUES co-routine begun after chained rows
+        // (v0.17 review fix).
         #[cfg(feature = "sql")]
         if head.compound.len() >= MAX_COMPOUND_SELECT
+            && !(last_values && self.vtail)
             && head
                 .compound
                 .as_slice()
@@ -4830,6 +4842,7 @@ impl<'a> Parser<'a> {
         }
         // (One-row selects throughout: `SF_MultiValue`.)
         let multi = segs.len() > 1 && segs.iter().all(|g| g.len() == 1);
+        self.vtail = segs.len() > 1 && segs.as_slice().last().is_some_and(|g| g.len() > 1);
         // The pin's select numbers: a one-row select takes one after
         // its subqueries; a co-routine its first row's and, at its
         // second row, its reader's.
@@ -4906,31 +4919,15 @@ impl<'a> Parser<'a> {
     }
 
     /// A VALUES chain that is a later compound member: the pin's
-    /// `SELECT * FROM (chain)` (`parserDoubleLinkSelect`, v0.17),
-    /// its items the chain's columns by name (`column1`, ...), so a
-    /// reader's WHERE term can be pushed into it and its column's
-    /// affinity is the chain's own (a REAL one reads the chain's
-    /// integers as reals: `SubPlan::real_cols`).
+    /// `SELECT * FROM (chain)` (`parserDoubleLinkSelect`, v0.17), so
+    /// its columns keep the chain's names (a first-row column
+    /// reference's included), a reader's WHERE term can be pushed into
+    /// it, and its column's affinity is the chain's own (a REAL one
+    /// reads the chain's integers as reals: `SubPlan::real_cols`).
     #[cfg(feature = "sql")]
-    fn chain_wrap<E>(&self, chain: SelectStmt) -> Result<SelectStmt, E> {
-        let w = chain.values.as_slice().first().map_or(0, |r| r.len());
+    fn chain_wrap(&self, chain: SelectStmt) -> SelectStmt {
         let mut s = self.values_select(AVec::new());
-        for i in 0..w {
-            let mut name = AVec::new();
-            name.extend_from_slice(b"column");
-            crate::record::render_int((i as i64).saturating_add(1), &mut name);
-            let h = self.arena.alloc_copy_handle(name.as_slice())?;
-            s.items.push(SelectItem::Expr(
-                Expr::Column {
-                    table: None,
-                    name: h,
-                    #[cfg(feature = "sql")]
-                    schema: None,
-                },
-                Some(h),
-                h,
-            ));
-        }
+        s.items.push(SelectItem::Star);
         s.from.push(FromSource {
             table: ABytes::EMPTY,
             alias: None,
@@ -4949,7 +4946,7 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "planner")]
             flat: false,
         });
-        Ok(s)
+        s
     }
 
     fn select_core_select<E>(&mut self, base: usize) -> Result<SelectStmt, E> {

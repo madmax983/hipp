@@ -1401,7 +1401,11 @@ pub fn sub_col_affinity(plan: &SubPlan, j: usize) -> Option<Affinity> {
 /// VALUES core's items carry none.
 pub fn item_result_affinity(r: &RExpr) -> Option<Affinity> {
     match r {
-        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) => Some(*aff),
+        // (A trigger's `new.rowid` keeps its INTEGER affinity: v0.17
+        // review fix.)
+        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, Some(aff), _) => {
+            Some(*aff)
+        }
         RExpr::Collate(x, _) => item_result_affinity(x),
         RExpr::Rowid(_) => Some(Affinity::Integer),
         // A scalar subquery carries its own result's affinity
@@ -2155,6 +2159,19 @@ pub fn resolve_scoped<E>(
         late::<E>(SchemaKind::UnknownCollation, cur, enclosing)?;
     }
     Ok(r)
+}
+
+/// `resolve_scoped` with no collation looked up and no enclosing
+/// scope (v0.17 review fix, `sql`): a CHECK, whose collations are
+/// looked up only by the writes that code it (`TableRules::coded`).
+#[cfg(feature = "sql")]
+pub(crate) fn resolve_lazy<E>(
+    expr: &Expr,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    planner: SubPlanner<'_, E>,
+) -> Result<RExpr, E> {
+    resolve_node::<E>(expr, arena, cur, &[], planner)
 }
 
 /// `resolve_scoped`'s recursion.

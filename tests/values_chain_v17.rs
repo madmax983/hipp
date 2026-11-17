@@ -121,15 +121,20 @@ async fn eqp_of(_db: &mut Connection<FileStorage>, _sql: &str) -> Result<String,
 /// One query's answer: its rows (or the error) and its plan.
 type Answer = (Result<Vec<u8>, String>, Result<String, String>);
 
-fn hipp_answers(path: &Path, qs: &[String]) -> Vec<Answer> {
+/// Each query's answer from hipp, on the frozen VM when `vm` is set
+/// and the hidden `vm` feature is on (else on today's executor).
+fn hipp_answers_on(path: &Path, qs: &[String], vm: bool) -> Vec<Answer> {
     block_on(async {
         let fs = FileStorage::open(path).expect("fs open");
         // (The frozen VM, `vm`, keeps its own OFFSET / ORDER BY
         // handling: these shapes run on today's executor.)
         #[cfg(feature = "vm")]
-        let cfg = Config::default().vm_off(true);
+        let cfg = Config::default().vm_off(!vm);
         #[cfg(not(feature = "vm"))]
-        let cfg = Config::default();
+        let cfg = {
+            let _ = vm;
+            Config::default()
+        };
         let mut db = Connection::open(fs, cfg).await.expect("open");
         let mut out = Vec::new();
         for q in qs {
@@ -175,7 +180,12 @@ fn compound_flattened(pin_plan: &str, hipp_plan: &str) -> bool {
 /// Every difference of `qs` on the file at `path`: rows in order and
 /// (with `plans`) plans.
 fn diffs_on(path: &Path, qs: &[String], plans: bool) -> Vec<String> {
-    let got = hipp_answers(path, qs);
+    diffs_vm(path, qs, plans, false)
+}
+
+/// `diffs_on`, on the frozen VM when `vm` is set (`hipp_answers_on`).
+fn diffs_vm(path: &Path, qs: &[String], plans: bool, vm: bool) -> Vec<String> {
+    let got = hipp_answers_on(path, qs, vm);
     let mut bad = Vec::new();
     for (q, (rows, plan)) in qs.iter().zip(got) {
         let p_rows = pin(path, q);
@@ -876,5 +886,506 @@ fn view_types_through_compound_subqueries() {
         "CREATE TABLE t(a INTEGER, b TEXT, c); CREATE TABLE u(a INT, d varchar(9)); \
          CREATE TABLE w(p DATETIME, q BOOLEAN, r DOUBLE PRECISION, s CLOB, z FLOATING);",
         &refs,
+    );
+}
+
+// ------------------------------------------------ review fixes (v0.17)
+
+/// A later VALUES arm is the pin's `SELECT * FROM (chain)`: its
+/// columns keep the chain's names, a first-row column reference's
+/// included (review fix: the wrapper named `column1` and failed when
+/// `(VALUES (t.i), ...)` named its column `i`). Generated correlated
+/// chains under plain, aliased and WITH heads.
+#[test]
+fn correlated_chain_arms_keep_their_names() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let vals = [
+        "t.i",
+        "t.r",
+        "t.s",
+        "t.rowid",
+        "t.n",
+        "1",
+        "'3'",
+        "2.5",
+        "NULL",
+        "CAST(4 AS REAL)",
+        "t.i+0",
+        "t.b",
+    ];
+    let heads = ["SELECT 0 AS x", "SELECT 0", "SELECT t.i AS x", "SELECT t.s"];
+    let aggs = ["group_concat(1)", "count(*)", "sum(typeof(1) = 'integer')"];
+    let mut qs: Vec<String> = vec![
+        "SELECT (SELECT group_concat(x) FROM (SELECT 0 AS x UNION ALL VALUES (t.i),(t.r))) FROM t"
+            .into(),
+        "SELECT t.rowid, (SELECT count(*) FROM (SELECT 1 UNION ALL VALUES (t.i),(t.r))) FROM t"
+            .into(),
+        "SELECT (WITH w AS (SELECT 1) SELECT group_concat(x) FROM (SELECT 0 AS x UNION ALL VALUES (t.s),(1))) FROM t"
+            .into(),
+        "SELECT (SELECT group_concat(x) FROM (SELECT 0 AS x UNION ALL VALUES (t.rowid),(t.r))) FROM t"
+            .into(),
+    ];
+    for _ in 0..200 {
+        let n = 2 + rng.n(3) as usize;
+        let mut v = String::new();
+        for k in 0..n {
+            if k > 0 {
+                v.push(',');
+            }
+            v.push_str(&format!("({})", rng.pick(&vals)));
+        }
+        qs.push(match rng.n(3) {
+            0 => format!(
+                "SELECT (WITH w AS (SELECT 1) SELECT group_concat(x || typeof(x)) FROM (SELECT 0 AS x UNION ALL VALUES {v})) FROM t"
+            ),
+            1 => format!(
+                "SELECT (SELECT group_concat(x || typeof(x)) FROM (SELECT 0 AS x UNION ALL VALUES {v}) WHERE x > '2') FROM t"
+            ),
+            _ => format!(
+                "SELECT t.rowid, (SELECT {} FROM ({} UNION ALL VALUES {v})) FROM t",
+                rng.pick(&aggs),
+                rng.pick(&heads)
+            ),
+        });
+    }
+    let path = fresh("corr", S);
+    let bad = diffs_on(&path, &qs, false);
+    assert!(
+        bad.is_empty(),
+        "{} of {} differ:\n{}",
+        bad.len(),
+        qs.len(),
+        bad.join("\n")
+    );
+}
+
+/// The pin merges a plain `SELECT ... FROM (compound)` (a subquery or
+/// a view, a view's VALUES chain included) into its reader before it
+/// pushes a WHERE term into the compound's arms, each with its own
+/// affinity (review fix: the term stayed in the reader with the
+/// compound's affinity). Fixed shapes, then a generated corpus.
+#[test]
+fn push_down_through_merged_subqueries() {
+    let schema = format!(
+        "{S} CREATE TABLE ra(a REAL); INSERT INTO ra VALUES (3.0); \
+         CREATE VIEW vc AS SELECT * FROM (VALUES (3),(4) UNION ALL SELECT r FROM t); \
+         CREATE VIEW vs AS SELECT 3 AS x UNION ALL SELECT r FROM t; \
+         CREATE VIEW vw AS SELECT x FROM (SELECT 3 AS x UNION ALL SELECT s FROM t); \
+         CREATE VIEW vv AS SELECT * FROM vs;"
+    );
+    let mut qs: Vec<String> = [
+        "SELECT x, typeof(x) FROM (SELECT x FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra)) WHERE x = '3'",
+        "SELECT x, typeof(x) FROM (SELECT * FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra)) WHERE x = '3'",
+        "SELECT column1, typeof(column1) FROM vc WHERE column1 = '3'",
+        "SELECT x FROM vs WHERE x = '3'",
+        "SELECT x FROM vw WHERE x = '3'",
+        "SELECT x FROM vv WHERE x = '3'",
+        "SELECT x FROM (SELECT * FROM vw) WHERE x = '3'",
+        "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 3 UNION ALL SELECT CAST(4 AS REAL))) WHERE x = '3'",
+        "SELECT x FROM (SELECT * FROM (SELECT * FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra))) WHERE x = '3'",
+        "SELECT x FROM (SELECT x FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra) WHERE x > 0) WHERE x = '3'",
+        "SELECT * FROM u, (SELECT x FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra)) WHERE x = '3' AND u.a = 3",
+        "SELECT x FROM (SELECT x FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra) LIMIT 5) WHERE x = '3'",
+        "SELECT count(*) FROM (SELECT x FROM (SELECT 3 AS x UNION ALL SELECT a FROM ra)) WHERE x = '3'",
+    ]
+    .iter()
+    .map(|q| q.to_string())
+    .collect();
+    let mut rng = Rng(0x6a09_e667_f3bc_c909);
+    let arms = [
+        ("SELECT r AS x FROM t", "SELECT r FROM t"),
+        ("SELECT s AS x FROM t", "SELECT s FROM t"),
+        ("SELECT i AS x FROM t", "SELECT i FROM t"),
+        ("SELECT n AS x FROM t", "SELECT n FROM t"),
+        ("SELECT 3 AS x", "SELECT 3"),
+        ("SELECT '3' AS x", "SELECT '3'"),
+        ("SELECT CAST(3 AS REAL) AS x", "SELECT CAST(3 AS REAL)"),
+        ("SELECT CAST(3 AS TEXT) AS x", "VALUES (3),(4)"),
+        ("SELECT 4 AS x", "VALUES ('3'),(random()*0+3)"),
+    ];
+    let lits = ["'3'", "3", "'3.0'", "'4'", "4.0", "'x'"];
+    let ops = ["=", "<>", ">", "<="];
+    for _ in 0..240 {
+        let n = 2 + rng.n(2) as usize;
+        let mut body = String::from(arms[rng.n(arms.len() as u64) as usize].0);
+        for _ in 1..n {
+            body.push_str(" UNION ALL ");
+            body.push_str(arms[rng.n(arms.len() as u64) as usize].1);
+        }
+        let mid = match rng.n(4) {
+            0 => format!("SELECT * FROM ({body})"),
+            1 => format!("SELECT x FROM ({body})"),
+            2 => format!("SELECT * FROM (SELECT * FROM ({body}))"),
+            _ => body.clone(),
+        };
+        let lit = rng.pick(&lits);
+        let term = if rng.n(5) == 0 {
+            format!("x IN ({lit}, 9)")
+        } else {
+            format!("x {} {lit}", rng.pick(&ops))
+        };
+        qs.push(match rng.n(3) {
+            0 => format!("SELECT x, typeof(x) FROM ({mid}) WHERE {term}"),
+            1 => format!(
+                "SELECT x, typeof(x) FROM {} WHERE {term}",
+                rng.pick(&["vs", "vw", "vv"])
+            ),
+            _ => format!("SELECT x FROM (SELECT x, typeof(x) FROM ({mid}) WHERE {term}) WHERE 1"),
+        });
+    }
+    let path = fresh("pdm", &schema);
+    let bad = diffs_on(&path, &qs, false);
+    assert!(
+        bad.is_empty(),
+        "{} of {} differ:\n{}",
+        bad.len(),
+        qs.len(),
+        bad.join("\n")
+    );
+    // (Plans: not through `vw`, whose co-routine number differs, nor
+    // beside `u`, whose automatic index hipp does not build: both
+    // EQP-only and older than these fixes.)
+    let plans: Vec<String> = qs
+        .iter()
+        .step_by(5)
+        .filter(|q| !q.contains("vw") && !q.contains("u,"))
+        .cloned()
+        .collect();
+    let bad = diffs_on(&path, &plans, true);
+    assert!(
+        bad.is_empty(),
+        "{} of {} plans differ:\n{}",
+        bad.len(),
+        plans.len(),
+        bad.join("\n")
+    );
+}
+
+/// A trigger's `new.rowid` keeps its INTEGER affinity as a VALUES
+/// chain's row and as a subquery's item (review fix: it had none, so
+/// `column1 = '3'` matched nothing); `new.i` has none on the pin.
+#[test]
+fn trigger_rowid_keeps_its_affinity() {
+    let bodies = [
+        "(SELECT group_concat(column1 || typeof(column1)) FROM (VALUES (3),(new.rowid),(4)) WHERE column1 = '3')",
+        "(SELECT group_concat(column1 || typeof(column1)) FROM (VALUES (3),(new.i),(4)) WHERE column1 = '3')",
+        "(SELECT group_concat(column1 || typeof(column1)) FROM (VALUES (3),(new.rowid)) WHERE column1 = '1')",
+        "(SELECT group_concat(x || typeof(x)) FROM (SELECT 3 AS x UNION ALL SELECT new.rowid) WHERE x = '1')",
+        "(SELECT group_concat(column1 || typeof(column1)) FROM (VALUES (3),(new.r),(4)) WHERE column1 = '3')",
+        "(SELECT group_concat(column1 || typeof(column1)) FROM (VALUES (3),(new.s),(4)) WHERE column1 = '3.0')",
+        "(SELECT group_concat(x || typeof(x)) FROM (SELECT new.rowid AS x) WHERE x = '1')",
+        "(SELECT group_concat(x || typeof(x)) FROM (SELECT new.i AS x) WHERE x = '3')",
+        "((SELECT new.rowid) = '1') || ((SELECT new.i) = '3') || (new.i = '3') || (new.rowid = '1')",
+        "'1' IN (SELECT new.rowid)",
+        "(SELECT group_concat(x || typeof(x)) FROM (SELECT new.r AS x UNION ALL SELECT 3) WHERE x = '7')",
+        "(SELECT group_concat(column1) FROM (VALUES (new.rowid * 1),(3)) WHERE column1 = '1')",
+    ];
+    let mut scripts = Vec::new();
+    for b in bodies.iter() {
+        scripts.push(format!(
+            "CREATE TABLE tt(r REAL, i INT, s TEXT);; CREATE TABLE lg(a, b);; \
+             CREATE TRIGGER tr AFTER INSERT ON tt BEGIN INSERT INTO lg SELECT 1, {b}; END;; \
+             INSERT INTO tt VALUES (7, 3, '3.0');; INSERT INTO tt VALUES (8, 4, 'x');; SELECT * FROM lg"
+        ));
+    }
+    let refs: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    script_same("trid", S, &refs);
+}
+
+/// Long VALUES lists: a co-routine begun after chained rows exempts
+/// the compound from the 500-SELECT limit (the pin's `SF_Values` on
+/// its reader; review fix: 600 `(random())` rows then `(1),(2)` were
+/// refused), and `SELECT count(*) FROM (chain)` is the pin's
+/// `countOfViewOptimization`, a sum of one term per arm that is "too
+/// large" at 1000 arms (review fix: hipp answered any length). A CTE
+/// of a long chain reads (review fix: its rows counted as copies).
+#[test]
+fn long_value_lists_match_pin() {
+    fn rows(n: usize, e: &str) -> String {
+        vec![e; n].join(",")
+    }
+    let v = |n: usize| format!("VALUES {}", rows(n, "(random())"));
+    let qs: Vec<String> = vec![
+        format!(
+            "SELECT count(*) FROM (VALUES {},(1),(2))",
+            rows(600, "(random())")
+        ),
+        format!("SELECT count(*) FROM ({})", v(600)),
+        format!(
+            "SELECT count(*) FROM (VALUES {},(1),(2),(random()))",
+            rows(600, "(random())")
+        ),
+        format!(
+            "SELECT count(*) FROM (SELECT 1 UNION ALL VALUES {},(1),(2))",
+            rows(600, "(random())")
+        ),
+        format!(
+            "SELECT count(*) FROM (VALUES {},(1),(2),{})",
+            rows(300, "(random())"),
+            rows(300, "(random())")
+        ),
+        format!("VALUES {},(1),(2)", rows(600, "(random()*0)")),
+        format!(
+            "SELECT count(*) FROM (VALUES {},{})",
+            rows(500, "(random())"),
+            rows(500, "(1),(2)")
+        ),
+        format!(
+            "SELECT count(*) FROM ({} UNION ALL VALUES (1),(2))",
+            vec!["SELECT 1"; 600].join(" UNION ALL ")
+        ),
+        format!(
+            "SELECT count(*) FROM (VALUES {},(1),(2) UNION ALL SELECT 5)",
+            rows(600, "(random())")
+        ),
+        format!(
+            "SELECT count(*) FROM (VALUES {},(1),(2))",
+            rows(498, "(random())")
+        ),
+        format!(
+            "SELECT count(*) FROM (VALUES {},(1),(2))",
+            rows(499, "(random())")
+        ),
+        format!("SELECT count(*) FROM ({})", v(999)),
+        format!("SELECT count(*) FROM ({})", v(1000)),
+        format!("SELECT (SELECT count(*) FROM ({}))", v(1000)),
+        format!("SELECT count(*) FROM (SELECT 1 UNION ALL {})", v(999)),
+        format!("SELECT count(*) FROM (SELECT 1 UNION ALL {})", v(1000)),
+        format!("SELECT 1 IN ({})", v(1000)),
+        format!("SELECT EXISTS ({})", v(1000)),
+        format!("WITH c AS ({}) SELECT count(*) FROM c", v(1200)),
+        format!(
+            "WITH c AS (SELECT * FROM ({})) SELECT count(*) FROM c",
+            v(1000)
+        ),
+        format!(
+            "WITH c AS (SELECT 1) SELECT count(*) FROM (VALUES {})",
+            rows(1000, "(1)")
+        ),
+        format!("SELECT count(*) FROM (SELECT * FROM ({}))", v(1000)),
+        format!(
+            "SELECT count(*) FROM (SELECT column1 AS x FROM ({}))",
+            v(1000)
+        ),
+        format!(
+            "SELECT count(*) FROM (SELECT * FROM ({}) WHERE column1 IS NOT NULL)",
+            v(1000)
+        ),
+        format!("SELECT count(*) FROM ({}) WHERE column1 > 0 OR 1", v(1000)),
+        format!("SELECT count(*) FROM (SELECT 1), ({})", v(1000)),
+        format!("SELECT count(1) FROM ({})", v(1000)),
+        format!("SELECT count(*) FILTER (WHERE 1) FROM ({})", v(1000)),
+        format!("SELECT count(*) FROM ({}) ORDER BY 1", v(1000)),
+        format!(
+            "SELECT count(*) FROM (SELECT DISTINCT 1 UNION ALL {})",
+            v(1000)
+        ),
+        format!("SELECT count(*) AS c FROM ({}) AS s", v(1000)),
+        format!(
+            "WITH a AS (VALUES {}) SELECT (SELECT count(*) FROM a) + (SELECT count(*) FROM a) + (SELECT count(*) FROM a)",
+            rows(900, "(random())")
+        ),
+    ];
+    let path = fresh("long", S);
+    let bad = diffs_on(&path, &qs, false);
+    assert!(
+        bad.is_empty(),
+        "{} of {} differ:\n{}",
+        bad.len(),
+        qs.len(),
+        bad.join("\n")
+    );
+    let scripts = [
+        format!("CREATE VIEW v AS {};; SELECT count(*) FROM v", v(1000)),
+        format!("CREATE VIEW v AS {};; SELECT count(*) FROM v", v(999)),
+        format!(
+            "CREATE TABLE tt(a);; INSERT INTO tt SELECT * FROM (VALUES {},(1),(2));; SELECT count(*) FROM tt",
+            rows(600, "(random()*0)")
+        ),
+        format!(
+            "CREATE TABLE tt(a);; INSERT INTO tt SELECT * FROM ({});; SELECT count(*) FROM tt",
+            v(1200)
+        ),
+    ];
+    let refs: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    script_same("longs", S, &refs);
+}
+
+/// Schema paths that resolve a statement without coding it look no
+/// collation up but the ones the pin does (review fixes): an ADD
+/// COLUMN that verifies its rows codes every CHECK; an UPDATE codes
+/// the CHECKs that read a changed column, a foreign key's SET NULL /
+/// SET DEFAULT / ON UPDATE CASCADE those that read its key;
+/// `integrity_check` every CHECK; `PRAGMA table_info` of a view only
+/// its columns' collations (and its FROM subqueries'); ALTER TABLE's
+/// rename none.
+#[test]
+fn unknown_collation_in_schema_paths() {
+    let scripts = [
+        // ADD COLUMN.
+        "CREATE TABLE a1(a);; ALTER TABLE a1 ADD COLUMN c CHECK (c COLLATE bogus = 'q');; SELECT sql FROM sqlite_schema",
+        "CREATE TABLE a1(a);; INSERT INTO a1 VALUES (1);; ALTER TABLE a1 ADD COLUMN c CHECK (c COLLATE bogus = 'q')",
+        "CREATE TABLE a1(a CHECK (a COLLATE bogus = 'x'));; ALTER TABLE a1 ADD COLUMN c CHECK (c > 0)",
+        "CREATE TABLE a1(a CHECK (a COLLATE bogus = 'x'));; ALTER TABLE a1 ADD COLUMN c;; SELECT sql FROM sqlite_schema",
+        "CREATE TABLE a1(a, CHECK (a COLLATE bogus = 'x'));; ALTER TABLE a1 ADD COLUMN c AS (a);; SELECT sql FROM sqlite_schema",
+        "CREATE TABLE a1(a CHECK (a COLLATE bogus = 'x'));; ALTER TABLE a1 ADD COLUMN c AS (1) NOT NULL",
+        "CREATE TABLE a1(a ANY) STRICT;; ALTER TABLE a1 ADD COLUMN c INT CHECK (c COLLATE bogus = 'q')",
+        "CREATE TABLE a1(a ANY CHECK (a COLLATE bogus = 'x')) STRICT;; ALTER TABLE a1 ADD COLUMN c INT",
+        "CREATE TABLE a1(a);; ALTER TABLE a1 ADD COLUMN c CHECK (c COLLATE nocase = 'q');; SELECT sql FROM sqlite_schema",
+        "CREATE TABLE a1(a CHECK (raise(abort, 'x') IS NULL));; ALTER TABLE a1 ADD COLUMN c CHECK (c > 0)",
+        "CREATE TABLE a1(a);; ALTER TABLE a1 ADD COLUMN c CHECK (raise(abort, 'x') IS NULL)",
+        // UPDATE / INSERT / FK actions / integrity_check.
+        "CREATE TABLE b1(a, b, CHECK (a COLLATE bogus = 'x'));; UPDATE b1 SET b = 1;; SELECT 'ok'",
+        "CREATE TABLE b1(a CHECK (a COLLATE bogus = 'x'), b);; UPDATE b1 SET b = 1;; SELECT 'ok'",
+        "CREATE TABLE b1(a CHECK (a COLLATE bogus = 'x'), b);; UPDATE b1 SET a = 1",
+        "CREATE TABLE b1(a CHECK (a COLLATE bogus = 'x'), b);; INSERT INTO b1(b) VALUES (5)",
+        "CREATE TABLE b1(a, g AS (a + 1), CHECK (g COLLATE bogus = 'x'), b);; UPDATE b1 SET a = 1",
+        "CREATE TABLE b1(a, g AS (a + 1), CHECK (g COLLATE bogus = 'x'), b);; UPDATE b1 SET b = 1;; SELECT 'ok'",
+        "CREATE TABLE b1(a INTEGER PRIMARY KEY, b, CHECK (a COLLATE bogus = 'q'));; UPDATE b1 SET rowid = 1",
+        "CREATE TABLE b1(a INTEGER PRIMARY KEY, b, CHECK (a COLLATE bogus = 'q'));; UPDATE b1 SET b = 1;; SELECT 'ok'",
+        "CREATE TABLE b1(a PRIMARY KEY, b, CHECK (b COLLATE bogus = 'q')) WITHOUT ROWID;; UPDATE b1 SET a = 1;; SELECT 'ok'",
+        "CREATE TABLE b1(a, g AS (a + 1), CHECK (a COLLATE bogus = 'x'));; SELECT * FROM b1;; DELETE FROM b1;; CREATE INDEX bi ON b1(a);; SELECT 'ok'",
+        "CREATE TABLE b1(a, CHECK (a COLLATE bogus = 'x'));; PRAGMA integrity_check",
+        "CREATE TABLE b1(a, CHECK (a COLLATE bogus = 'x'));; PRAGMA quick_check",
+        "PRAGMA foreign_keys = 1;; CREATE TABLE p(id INTEGER PRIMARY KEY);; \
+         CREATE TABLE c(x REFERENCES p ON DELETE SET NULL, y, CHECK (y COLLATE bogus = 'q'));; \
+         INSERT INTO p VALUES (1);; DELETE FROM p;; SELECT 'ok'",
+        "PRAGMA foreign_keys = 1;; CREATE TABLE p(id INTEGER PRIMARY KEY);; \
+         CREATE TABLE c(x REFERENCES p ON DELETE CASCADE, y, CHECK (x COLLATE bogus = 'q'));; \
+         INSERT INTO p VALUES (1);; DELETE FROM p;; SELECT 'ok'",
+        "PRAGMA foreign_keys = 1;; CREATE TABLE p(id INTEGER PRIMARY KEY);; \
+         CREATE TABLE c(x REFERENCES p ON DELETE SET NULL, y, CHECK (x COLLATE bogus = 'q'));; \
+         INSERT INTO p VALUES (1);; DELETE FROM p",
+        "PRAGMA foreign_keys = 1;; CREATE TABLE p(id INTEGER PRIMARY KEY);; \
+         CREATE TABLE c(x REFERENCES p ON UPDATE CASCADE, y, CHECK (x COLLATE bogus = 'q'));; \
+         INSERT INTO p VALUES (1);; UPDATE p SET id = 2",
+        "PRAGMA foreign_keys = 1;; CREATE TABLE p(id INTEGER PRIMARY KEY);; \
+         CREATE TABLE c(x REFERENCES p ON UPDATE CASCADE, y, CHECK (x COLLATE bogus = 'q'));; \
+         INSERT INTO p VALUES (1);; DELETE FROM p;; SELECT 'ok'",
+        // PRAGMA table_info of a view.
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a FROM v0 ORDER BY b COLLATE bogus;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a FROM v0 WHERE b = 1 COLLATE bogus;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a FROM v0 WHERE b = 1 COLLATE bogus;; SELECT * FROM pragma_table_info('v')",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a FROM v0 GROUP BY b COLLATE bogus;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a COLLATE bogus FROM v0;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a FROM (SELECT b COLLATE bogus AS a FROM v0);; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT 1 AS k FROM (SELECT b COLLATE bogus AS a FROM v0);; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a FROM v0 WHERE a IN (SELECT b COLLATE bogus FROM v0);; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT (SELECT b FROM v0 ORDER BY b COLLATE bogus) AS z FROM v0;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS WITH c AS (SELECT b COLLATE bogus AS q FROM v0) SELECT 1 AS k;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS WITH c AS (SELECT b COLLATE bogus AS q FROM v0) SELECT q FROM c;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT (1, 2) AS x;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT raise(ignore) AS r FROM v0;; PRAGMA table_info(v)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a COLLATE bogus AS x FROM v0;; \
+         CREATE TRIGGER tv INSTEAD OF INSERT ON v BEGIN SELECT 1; END;; INSERT INTO v VALUES (1)",
+        "CREATE TABLE v0(a, b);; CREATE VIEW v AS SELECT a AS x FROM v0 WHERE b = 1 COLLATE bogus;; \
+         CREATE TRIGGER tv INSTEAD OF INSERT ON v BEGIN SELECT 1; END;; SELECT 'ok'",
+        // ALTER TABLE.
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a FROM r0 WHERE b = 1 COLLATE bogus;; \
+         ALTER TABLE r0 RENAME COLUMN b TO c;; SELECT sql FROM sqlite_schema WHERE name = 'v'",
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a FROM r0 WHERE b = 1 COLLATE bogus;; \
+         ALTER TABLE r0 RENAME TO r1;; SELECT sql FROM sqlite_schema WHERE name = 'v'",
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a COLLATE bogus FROM r0;; \
+         ALTER TABLE r0 RENAME TO r1;; SELECT sql FROM sqlite_schema WHERE name = 'v'",
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a FROM (SELECT b COLLATE bogus AS a FROM r0);; \
+         ALTER TABLE r0 RENAME TO r1;; SELECT sql FROM sqlite_schema WHERE name = 'v'",
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a FROM r0 ORDER BY b COLLATE bogus;; \
+         ALTER TABLE r0 RENAME COLUMN b TO c;; SELECT sql FROM sqlite_schema WHERE name = 'v'",
+        "CREATE TABLE r0(a, b);; CREATE TRIGGER tr AFTER INSERT ON r0 BEGIN SELECT 1 WHERE new.b = 1 COLLATE bogus; END;; \
+         ALTER TABLE r0 RENAME COLUMN b TO c;; SELECT sql FROM sqlite_schema WHERE name = 'tr'",
+        "CREATE TABLE r0(a, b);; CREATE TRIGGER tr AFTER INSERT ON r0 BEGIN INSERT INTO r0 SELECT a, b FROM r0 ORDER BY b COLLATE bogus; END;; \
+         ALTER TABLE r0 RENAME TO r1;; SELECT 'ok'",
+        "CREATE TABLE r0(a, b, c);; CREATE VIEW v AS SELECT a FROM r0 WHERE b = 1 COLLATE bogus;; \
+         ALTER TABLE r0 DROP COLUMN c;; SELECT 'ok'",
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a FROM r0 WHERE b = 1 COLLATE bogus;; \
+         ALTER TABLE r0 DROP COLUMN a",
+        "CREATE TABLE r0(a, b);; CREATE VIEW v AS SELECT a FROM r0 WHERE (a, b) = (1, 2, 3);; ALTER TABLE r0 RENAME TO r1",
+    ];
+    script_same("ucs", S, &scripts);
+}
+
+/// CREATE TABLE ... AS stores a FLEXNUM column (a numeric CAST in a
+/// compound's leftmost core, or a FROM subquery's such column) as the
+/// pin does: NUMERIC that leaves a REAL alone (review fix: `2.0` was
+/// stored as the integer 2).
+#[test]
+fn create_as_flexnum_columns() {
+    let sels = [
+        "SELECT 1 AS x UNION ALL VALUES (CAST(2 AS REAL)),(3)",
+        "SELECT 1 AS x UNION ALL SELECT * FROM (SELECT CAST(2 AS REAL) UNION ALL SELECT 3)",
+        "SELECT 1 AS x UNION ALL SELECT CAST(2 AS REAL)",
+        "SELECT CAST(2 AS REAL) AS x",
+        "SELECT CAST(2.0 AS NUMERIC) AS x, CAST('2.0' AS NUMERIC) AS y, CAST(2.5 AS INT) AS z",
+        "SELECT x FROM (SELECT CAST(2 AS REAL) AS x UNION ALL SELECT 3)",
+        "SELECT CAST(2 AS INT) AS x UNION ALL SELECT 3.0",
+        "SELECT a AS x FROM nn UNION ALL SELECT 3.0",
+        "SELECT * FROM (SELECT CAST(2 AS REAL) AS x UNION ALL SELECT 3) WHERE x > 0",
+        "SELECT x + 0 AS x FROM (SELECT CAST(2 AS REAL) AS x UNION ALL SELECT 3)",
+        "SELECT CAST(x AS REAL) AS x FROM (SELECT 2 AS x UNION ALL SELECT 3)",
+        "SELECT 1 AS x UNION ALL SELECT x FROM (SELECT CAST(2 AS REAL) AS x UNION ALL SELECT 3.0)",
+        "SELECT CAST(2 AS INT) AS x UNION ALL SELECT '3.0' UNION ALL SELECT 4.0",
+        "SELECT CAST(2 AS NUMERIC) AS x UNION ALL SELECT 3.0 UNION ALL SELECT '4.0'",
+        "SELECT x FROM (SELECT a AS x FROM nn UNION ALL SELECT 3.0)",
+        "SELECT CAST(2 AS REAL) AS x UNION ALL SELECT a FROM nn",
+        "SELECT 'a' AS x UNION ALL VALUES (CAST(2 AS REAL)),(3)",
+    ];
+    let mut scripts = Vec::new();
+    for s in sels.iter() {
+        scripts.push(format!(
+            "CREATE TABLE nn(a NUMERIC);; INSERT INTO nn VALUES (5), (6.0);; \
+             CREATE TABLE q AS {s};; SELECT sql FROM sqlite_schema WHERE name = 'q';; \
+             SELECT *, typeof(x) FROM q;; INSERT INTO q(x) VALUES (7.0);; SELECT x, typeof(x) FROM q"
+        ));
+    }
+    let refs: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    script_same("flex", S, &refs);
+}
+
+/// The frozen VM (hidden `vm` feature) computes an enclosing query's
+/// aggregate in a dropped ORDER BY or an EXISTS result list in its
+/// owner too (review fix: these suites ran with the VM off, so its
+/// change had no coverage). Without `vm`, today's executor.
+#[test]
+fn inert_aggregates_on_the_vm() {
+    let mut qs: Vec<String> = [
+        "SELECT (SELECT 1 ORDER BY sum(abs(u.a - 9223372036854775807 - 3))) FROM u",
+        "SELECT (SELECT 1 ORDER BY sum(u.a)) FROM u",
+        "SELECT EXISTS (SELECT sum(abs(u.a - 9223372036854775807 - 3))) FROM u",
+        "SELECT EXISTS (SELECT sum(u.a)) FROM u",
+        "SELECT EXISTS (SELECT sum(u.a)), count(*) FROM u",
+        "SELECT (SELECT 1 ORDER BY sum(abs(u.a - 9223372036854775807 - 3))), count(*) FROM u",
+        "SELECT EXISTS (SELECT sum(abs(u.a - 9223372036854775807 - 3))) FROM u GROUP BY b",
+        "SELECT b, EXISTS (SELECT max(u.a)) FROM u GROUP BY b HAVING EXISTS (SELECT sum(u.c))",
+        "SELECT x FROM (SELECT 1 AS x UNION ALL VALUES (3),(random()*0+3)) WHERE x = '3'",
+        "SELECT 1 COLLATE bogus",
+        "SELECT a FROM u WHERE b = 'x' COLLATE bogus",
+    ]
+    .iter()
+    .map(|q| q.to_string())
+    .collect();
+    let mut rng = Rng(0xbb67_ae85_84ca_a73b);
+    let aggs = [
+        "sum(abs(u.a - 9223372036854775807 - 3))",
+        "sum(u.c)",
+        "count(u.b)",
+        "total(u.a)",
+    ];
+    let shapes = [
+        "SELECT (SELECT 1 ORDER BY {a}) FROM u",
+        "SELECT EXISTS (SELECT {a}) FROM u",
+        "SELECT EXISTS (SELECT {a} FROM t) FROM u",
+        "SELECT a FROM u WHERE EXISTS (SELECT {a})",
+    ];
+    for _ in 0..40 {
+        qs.push(rng.pick(&shapes).replace("{a}", rng.pick(&aggs)));
+    }
+    let path = fresh("vm", S);
+    let bad = diffs_vm(&path, &qs, false, true);
+    assert!(
+        bad.is_empty(),
+        "{} of {} differ:\n{}",
+        bad.len(),
+        qs.len(),
+        bad.join("\n")
     );
 }

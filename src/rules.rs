@@ -167,12 +167,38 @@ pub struct TableRules {
     /// STRICT column types, one per column; empty when the table
     /// is not STRICT.
     pub strict: AVec<StrictType>,
+    /// The CHECKs (indexes into `checks`) that compare under an
+    /// unknown collation (v0.17 review fix, `sql`): a statement that
+    /// codes one is refused at prepare (`TableRules::coded`).
+    #[cfg(feature = "sql")]
+    pub unknown: AVec<usize>,
 }
 
 impl TableRules {
     /// No generated column, CHECK or STRICT typing.
     pub fn is_empty(&self) -> bool {
         self.gcols.is_none() && self.checks.is_empty() && self.strict.is_empty()
+    }
+
+    /// The pin's "no such collation sequence" for a write that codes
+    /// a CHECK of `unknown` (v0.17 review fix): an INSERT (`changed`
+    /// `None`) codes every CHECK, an UPDATE those that read a changed
+    /// column (`sqlite3ExprReferencesUpdatedColumn`).
+    #[cfg(feature = "sql")]
+    pub fn coded<E>(&self, changed: Option<(&[bool], bool)>) -> Result<(), E> {
+        let eff = changed.map(|(m, r)| (self.changed_cols(m, r), r));
+        for i in self.unknown.iter() {
+            let hit = match (&eff, self.checks.as_slice().get(*i)) {
+                (Some((m, r)), Some(c)) => reads_any(c, m.as_slice(), *r),
+                _ => true,
+            };
+            if hit {
+                return Err(Error::Schema {
+                    kind: SchemaKind::UnknownCollation,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The VIRTUAL-column mask for record encode / decode.
@@ -596,6 +622,15 @@ pub fn plan_rules<E>(
         for text in checks.iter() {
             let e = parse_rule::<E>(text, arena, lim)?;
             let mut planner = subquery_refused::<E>(SchemaKind::SubqueryInConstraint);
+            #[cfg(feature = "sql")]
+            let r = {
+                let r = crate::query::resolve_lazy::<E>(&e, arena, &cur, &mut planner)?;
+                if crate::query::coll_misses(&r) {
+                    rules.unknown.push(rules.checks.len());
+                }
+                r
+            };
+            #[cfg(not(feature = "sql"))]
             let r = resolve_scoped::<E>(&e, arena, &cur, &[], &mut planner)?;
             if has_agg(&r) {
                 return Err(Error::Schema {
@@ -624,8 +659,10 @@ pub fn validate_def<E>(
     checks: &[crate::arena::ABytes],
     strict: bool,
     has_rowid: bool,
+    lazy: bool,
 ) -> Result<TableRules, E> {
     use crate::sql::handle_bytes;
+    let _ = lazy;
     let mut specs: AVec<ColSpec<'_>> = AVec::new();
     let mut alias = None;
     for (i, c) in columns.iter().enumerate() {
@@ -667,25 +704,18 @@ pub fn validate_def<E>(
         // A CHECK holding RAISE() is accepted when the table is
         // created (v0.16, `triggers`): the pin refuses it only where
         // it is resolved, when a row is written.
+        // (Not `lazy`: an ADD COLUMN that verifies the rows codes every
+        // CHECK at once, v0.17 review fix.)
         #[cfg(feature = "triggers")]
-        if parse_rule::<E>(handle_bytes(arena, *h), arena, lim)
-            .is_ok_and(|e| expr_any(&e, &mut |x| matches!(x, Expr::Raise(..))))
+        if lazy
+            && parse_rule::<E>(handle_bytes(arena, *h), arena, lim)
+                .is_ok_and(|e| expr_any(&e, &mut |x| matches!(x, Expr::Raise(..))))
         {
-            continue;
-        }
-        // So is one naming an unknown collation (v0.17): the pin looks
-        // it up only when a write codes the check.
-        #[cfg(feature = "sql")]
-        if parse_rule::<E>(handle_bytes(arena, *h), arena, lim).is_ok_and(|e| {
-            expr_any(&e, &mut |x| {
-                matches!(x, Expr::Collate(_, crate::record::Coll::Unknown))
-            })
-        }) {
             continue;
         }
         texts.push(handle_bytes(arena, *h));
     }
-    plan_rules::<E>(
+    let rules = plan_rules::<E>(
         arena,
         lim,
         tname,
@@ -694,7 +724,14 @@ pub fn validate_def<E>(
         texts.as_slice(),
         strict,
         has_rowid,
-    )
+    )?;
+    // So is one comparing under an unknown collation (v0.17): the pin
+    // looks it up only when a write codes the check.
+    #[cfg(feature = "sql")]
+    if !lazy {
+        rules.coded::<E>(None)?;
+    }
+    Ok(rules)
 }
 
 /// Whether a generated column of `columns` calls LIKE — the
@@ -1296,6 +1333,60 @@ pub fn compound_affinity(
         return Some(aff);
     }
     Some(demote(aff, m, head_item))
+}
+
+/// Whether column `i` of `plan` has the pin's FLEXNUM affinity
+/// (v0.17 review fix, CREATE TABLE ... AS): NUMERIC from a numeric
+/// CAST in a compound's leftmost core (`demote`), or a FROM
+/// subquery's such column read through the core that gives the
+/// affinity. It leaves a REAL alone where NUMERIC makes `2.0` an
+/// integer.
+#[cfg(feature = "sql")]
+pub fn flex_col(plan: &crate::query::SubPlan, i: usize) -> bool {
+    use crate::query::item_result_affinity;
+    fn item(p: &crate::query::SubPlan, i: usize) -> Option<&RExpr> {
+        match p.values.as_slice() {
+            [] => p.items.as_slice().get(i),
+            [r] => r.as_slice().get(i),
+            _ => None,
+        }
+    }
+    let head = item(plan, i);
+    if compound_affinity(
+        head.and_then(item_result_affinity),
+        plan,
+        plan.compound.as_slice(),
+        i,
+    ) != Some(Affinity::Numeric)
+    {
+        return false;
+    }
+    if !plan.compound.is_empty() && matches!(head, Some(RExpr::Cast(..))) {
+        return true;
+    }
+    // The core whose item gives the affinity.
+    let mut cores = core::iter::once(plan).chain(plan.compound.iter().map(|(_, t)| &**t));
+    let Some((c, mut e)) = cores.find_map(|c| {
+        item(c, i)
+            .filter(|e| item_result_affinity(e).is_some())
+            .map(|e| (c, e))
+    }) else {
+        return false;
+    };
+    while let RExpr::Collate(x, _) = e {
+        e = x;
+    }
+    let RExpr::Column(slot, ..) = e else {
+        return false;
+    };
+    let mut o = 0usize;
+    for s in c.sources.iter() {
+        if let Some(j) = slot.checked_sub(o).filter(|j| *j < s.ncols) {
+            return s.derived.as_deref().is_some_and(|d| flex_col(d, j));
+        }
+        o = o.saturating_add(s.ncols);
+    }
+    false
 }
 
 /// `compound_affinity`'s demotion of a compound column's affinity

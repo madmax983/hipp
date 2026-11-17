@@ -163,34 +163,167 @@ removed (the structure carries them), `window::each_child` shared with
 a shared `late` helper measured +104 B and was not kept.
 
 **Honest gaps.**
-- A compound arm written `SELECT * FROM (...)` takes no pushed WHERE
-  term (the push-down substitutes only explicit items): `SELECT x FROM
+- (closed in v0.17: values_chain review fixes) A compound arm written
+  `SELECT * FROM (...)` took no pushed WHERE term: `SELECT x FROM
   (SELECT 1 AS x UNION ALL SELECT * FROM (SELECT 3 UNION ALL SELECT
-  CAST(4 AS REAL))) WHERE x = '3'` is `3.0` in hipp, no row on the pin
-  (pre-existing; the chain wrapper hipp builds names its items).
+  CAST(4 AS REAL))) WHERE x = '3'` was `3.0` in hipp, no row on the pin.
 - A trigger's `new.k` in a VALUES first row names the column
   `column1` in hipp, `k` on the pin (the trigger value reaches the
   planner as a literal).
 - Two unaliased FROM items over pure chains make the pin's `*`
   expansion "ambiguous column name: *.0-ROW VALUES CLAUSE.column1";
-  hipp expands them. The pin refuses a view whose text is a VALUES
-  chain of 20,000 rows when it is read ("Expression tree is too
-  large"); hipp reads it.
+  hipp expands them. (closed in v0.17: values_chain review fixes) The
+  pin refuses a view whose text is a VALUES chain of 20,000 rows when
+  it is read with `count(*)` ("Expression tree is too large",
+  `countOfViewOptimization`); hipp read it.
 - `rowid = 1 COLLATE bogus` in a WHERE is refused in hipp; the pin's
   rowid lookup codes no comparison and answers.
 - A grouped query that fails on a later group prints nothing in
   hipp-cli; the pin prints the groups before it (pre-existing).
 - The pin's flattening of a compound CTE into its reader, and of a
-  `(VALUES ...)` co-routine in FROM, stay EQP-only gaps (pre-existing).
+  `(VALUES ...)` co-routine in FROM, stay gaps (pre-existing): EQP, and
+  with no ORDER BY the row order of a join that the pin drives from
+  the VALUES rows (`SELECT * FROM u JOIN (VALUES (1),(3)) v ON
+  v.column1 = u.a` is `1|a|1`, `3|c|3` on the pin, the other way round
+  in hipp, which scans `u` first).
 - The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) folds inert
   aggregates like today's executor; `tests/values_chain_v17.rs` runs on
-  today's executor under `vm`.
+  today's executor under `vm` (closed in v0.17: values_chain review
+  fixes — `inert_aggregates_on_the_vm` runs on the VM).
 - Item 7's scan of the older honest gaps found the alias push-down
   (fixed, item 7); left as recorded: a GROUP BY over a co-routine's
   order and its partial ORDER BY match, a subquery's `ORDER BY 1
   COLLATE BINARY` as column 1, a WITHOUT ROWID natural scan's ORDER BY
   (`order_offset`'s gaps, planner work), and the push-down without
   `planner` (by design, ADR 0004).
+
+**Review fixes (2026-11-17).** Eleven findings, each reproduced on the
+live pin first; all ungated fixes on claimed paths (`sql`, the
+push-down under `planner`), no new leaf.
+1. **A later VALUES arm is `SELECT * FROM (chain)`** (regression:
+   `chain_wrap` named its items `column1, ...`, and a chain whose first
+   row is `t.i` names its column `i`, so `SELECT 0 AS x UNION ALL
+   VALUES (t.i),(t.r)` was "no such column"). The wrapper is the pin's
+   `SELECT *` now, and the push-down substitutes a `SELECT * FROM (one
+   item)` arm's columns by name (`star_arm`; names must be distinct).
+   That also closes the recorded `SELECT * FROM (...)` arm gap.
+2. **ALTER TABLE ADD COLUMN codes every CHECK when it verifies the
+   rows** (the pin's post-ADD `quick_check`, run when the new column
+   has a CHECK, is a NOT NULL generated column or the table is
+   STRICT): a CHECK under an unknown collation, or holding RAISE(),
+   anywhere in the table fails it then (regression for the collation;
+   the RAISE form was older). `validate_def(lazy)`. Without such a
+   verification (`ADD COLUMN c` alone) it is accepted, as on the pin.
+3. **A WHERE term reaches a compound through a merged subquery or
+   view** (`passes_on`): the pin merges `SELECT * FROM (compound)` /
+   `SELECT x FROM (compound)` (a view's text included, a view's VALUES
+   chain too) before `pushDownWhereTerms`, so each arm compares with its
+   own affinity. hipp now pushes the term into the merged body (planned
+   raw again, its own WHERE kept, so the reader holds the term once),
+   and that body pushes it on. `SELECT x FROM (SELECT x FROM (SELECT 3
+   AS x UNION ALL SELECT a FROM ra)) WHERE x = '3'` is one row.
+4. **A trigger's `new.rowid` keeps its INTEGER affinity** as a result
+   item (`item_result_affinity` of a trigger value with an affinity),
+   so a VALUES chain or a subquery over it compares as on the pin;
+   `new.i` has none there (probed).
+5. **A VALUES co-routine begun after chained rows exempts the compound
+   from the 500-SELECT limit** (the pin's `SF_Values` on the reader
+   `sqlite3MultiValues` builds when `pLeft->pPrior` is set; parser
+   `vtail`): `(VALUES (random()) x600, (1), (2))` reads (regression).
+   A CTE's chained rows count as one SELECT of the expansion's copy
+   limit again (regression: a 1,200-row chain CTE was "nested too
+   deep").
+6. **Unknown collations in schema paths** (`TableRules::unknown` /
+   `coded`, `Connection::plan_uncoded`): a CHECK is resolved without the
+   lookup and refused by the statements that code it — an INSERT, an
+   UPDATE whose changed columns (generated ones and the rowid included)
+   it reads (`sqlite3ExprReferencesUpdatedColumn`), a foreign key's SET
+   NULL / SET DEFAULT / ON UPDATE CASCADE action whose child key it
+   reads, `integrity_check` / `quick_check`; a SELECT, DELETE or CREATE
+   INDEX on the table answers. A view read for its column names (PRAGMA
+   table_info, an INSTEAD OF trigger's NEW row, ALTER's checks) is
+   resolved but not coded: only its columns' (and FROM subqueries')
+   collations are looked up; ALTER TABLE's rename / drop-column
+   re-plans look none up. Its code-generation errors (row value misused
+   in a result column, RAISE) wait there too.
+7. **PRAGMA table_info of a view whose result column names an unknown
+   collation fails** (`lead_colls` on the view's own plan), as the
+   pin's `sqlite3ViewGetColumnNames` does; an INSERT through an INSTEAD
+   OF trigger on it too.
+8. **CREATE TABLE ... AS keeps a REAL in a FLEXNUM column**
+   (`rules::flex_col`, `Plan::CreateTableAs::flex`): a numeric CAST in
+   a compound's leftmost core, or a FROM subquery's such column read
+   through the core that gives the affinity, is the pin's
+   `SQLITE_AFF_FLEXNUM` (declared `NUM`), which `applyAffinity` does not
+   turn from REAL to INTEGER: `CREATE TABLE q AS SELECT 1 AS x UNION
+   ALL VALUES (CAST(2 AS REAL)),(3)` stores `2.0|real`.
+9. **`SELECT count(*) FROM (compound)` at the depth limit** (the pin's
+   `countOfViewOptimization`, select.c, rewrites it to a sum of one
+   `(SELECT count(*) FROM arm)` per arm, each optimized in turn, and
+   `sqlite3ExprCheckHeight` refuses that sum at 1,000 arms):
+   `count_of_view` refuses it as "Expression tree is too large" under
+   the same conditions — one FROM subquery, not a CTE's own body, read
+   through plain merged bodies, no WHERE / GROUP BY / HAVING / ORDER BY,
+   `count(*)` without FILTER, arms with no WHERE, LIMIT, aggregate or
+   DISTINCT.
+10. Docs: the co-routine flattening gap names its row-order effect.
+11. Test coverage: `inert_aggregates_on_the_vm` runs on the frozen VM
+    under `vm`.
+
+Probing notes (live pin): `count(*)` over a 999-arm chain answers, a
+1,000-arm one fails, also in a scalar subquery, through `SELECT * FROM
+(...)` / `SELECT column1 AS x FROM (...)`, a view, a CTE whose body is
+`SELECT * FROM (chain)`, and through a later arm's wrapper; it answers
+with a WHERE (outer or merged body), `count(1)`, FILTER, ORDER BY, a
+join, a DISTINCT arm, a CTE that is the chain itself, an IN / EXISTS,
+INSERT ... SELECT and a top-level VALUES. 600 SELECTs then `VALUES
+(1),(2)` is "too many terms"; 600 chained rows then `(1),(2)` is not.
+ADD COLUMN: `t(a CHECK (a COLLATE bogus = 'x'))` + `ADD COLUMN c CHECK
+(c > 0)` fails, + `ADD COLUMN c` reads, + `ADD COLUMN c AS (1) NOT NULL`
+fails, on a STRICT table any ADD fails. UPDATE: `SET b = 1` past a
+CHECK on `a` reads; `SET rowid = 1` past a CHECK on the INTEGER PRIMARY
+KEY fails. table_info: `ORDER BY` / `WHERE` / `GROUP BY` / an IN
+subquery's / a scalar subquery's ORDER BY under an unknown collation
+answer, a result column's (directly or through a FROM subquery or a
+used CTE) fails, `SELECT 1 AS k FROM (SELECT b COLLATE bogus ...)`
+fails; ALTER RENAME answers for every such view, the FROM-subquery one
+included. CTAS: `SELECT CAST(2 AS REAL) AS x` alone is `x REAL`; `a`
+of a NUMERIC column `UNION ALL SELECT 3.0` is NUMERIC (`3`).
+
+Tests: `tests/values_chain_v17.rs` 7 more tests (18): 204 correlated
+chain arms (200 generated), 253 push-down shapes through merged
+subqueries and views (240 generated; 50 with plans), 12 trigger
+bodies, 32 long-list queries + 4 scripts, 55 schema-path scripts, 17
+CTAS scripts, 51 VM shapes (40 generated). `hipp-cli/tests/cli_v17_values_chain.rs`
+one more test (6): the same on stdin and as one-shot arguments.
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` suite included, `inert_aggregates_on_the_vm` on
+the VM); `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info: pass, no `STACK_*` change.
+
+Size Δ of the review fixes: tiny 0 (76,928); full +2,992 (487,404 → 490,396); max +184 (976,508 → 976,692); xl +3,008 (1,074,624 → 1,077,632). Ratchets raised to the measured figures with a reason each; no offsetting saving found (`#[inline(never)]` on the new helpers measured +8 B on full and was dropped). max grows less than full: layout.
+
+Honest gaps the review fixes leave (new or found on the way):
+- A VALUES chain of a few thousand non-constant rows exhausts the
+  default statement arena (`Config::stmt_max`; each row is a compound
+  core now) where the pin reads it; the CLI's larger arena reads them.
+- A CTE whose body is a SELECT compound is copied per reference into
+  the expansion's 1,000-SELECT limit (`MAX_COPIES`), so three uses of a
+  450-arm CTE are "nested too deep" in hipp and read on the pin
+  (pre-existing).
+- A TEMP CREATE TABLE ... AS inserts through the temp connection, so a
+  FLEXNUM column's REAL is stored as NUMERIC there (`2` for `2.0`).
+- A push-down through a merged body that the splice then gives up
+  (hipp's own restrictions) loses the term in the arms, as before.
+- EQP only, pre-existing: a view over a compound numbers its
+  co-routine one past the pin's (`subquery-4` / `subquery-3`); the pin
+  builds an automatic index on a compound co-routine beside a table
+  where hipp scans it; `SELECT count(*) FROM (compound)`'s
+  `SCALAR SUBQUERY` per arm (hipp shows the co-routine); chain plans
+  under a scalar / EXISTS LIMIT 1 (`SCAN 1 CONSTANT ROW`), an IN
+  list's bloom filters, a UNION's sorter on its left arm (review
+  finding 10, not taken: EQP only).
 
 ### Parity: order_offset — ORDER BY / OFFSET result divergences (2026-11-17)
 

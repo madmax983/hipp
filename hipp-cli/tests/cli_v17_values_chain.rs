@@ -203,3 +203,45 @@ PRAGMA table_info(v2);
 SELECT name, type FROM pragma_table_info('v3');",
     );
 }
+
+/// Review fixes as the shell shows them: a correlated VALUES arm's
+/// names, a WHERE term pushed through a merged subquery or view, a
+/// trigger's `new.rowid` affinity, long VALUES lists, unknown
+/// collations in schema paths, CREATE TABLE ... AS FLEXNUM columns.
+#[test]
+fn review_fixes_render_like_the_pin() {
+    same(
+        "rf",
+        SETUP,
+        "SELECT (SELECT group_concat(x) FROM (SELECT 0 AS x UNION ALL VALUES (t.i),(t.r))) FROM t;
+SELECT t.rowid, (SELECT count(*) FROM (SELECT 1 UNION ALL VALUES (t.i),(t.r))) FROM t;
+SELECT x, typeof(x) FROM (SELECT x FROM (SELECT 3 AS x UNION ALL SELECT r FROM t)) WHERE x = '3';
+CREATE VIEW vc AS SELECT * FROM (VALUES (3),(4) UNION ALL SELECT r FROM t);
+SELECT column1, typeof(column1) FROM vc WHERE column1 = '3';
+CREATE TABLE tt(r REAL, i INT, s TEXT); CREATE TABLE lg(a, b);
+CREATE TRIGGER tr AFTER INSERT ON tt BEGIN INSERT INTO lg SELECT 1, (SELECT group_concat(column1 || typeof(column1)) FROM (VALUES (3),(new.rowid),(4)) WHERE column1 = '3'); END;
+INSERT INTO tt VALUES (7, 3, '3.0'); SELECT * FROM lg;
+CREATE TABLE q AS SELECT 1 AS x UNION ALL VALUES (CAST(2 AS REAL)),(3);
+SELECT x, typeof(x) FROM q;
+CREATE TABLE a1(a);
+ALTER TABLE a1 ADD COLUMN c CHECK (c COLLATE bogus = 'q');
+CREATE TABLE b1(a, b, CHECK (a COLLATE bogus = 'x'));
+UPDATE b1 SET b = 1;
+UPDATE b1 SET a = 1;
+CREATE VIEW vb AS SELECT a FROM b1 WHERE b = 1 COLLATE bogus;
+PRAGMA table_info(vb);
+CREATE VIEW vd AS SELECT a COLLATE bogus FROM b1;
+PRAGMA table_info(vd);
+ALTER TABLE b1 RENAME COLUMN b TO c;
+SELECT sql FROM sqlite_schema WHERE name IN ('a1', 'vb');
+SELECT 'done';",
+    );
+    let rows = |n: usize, e: &str| vec![e; n].join(",");
+    let a = format!(
+        "SELECT count(*) FROM (VALUES {},(1),(2))",
+        rows(600, "(random())")
+    );
+    let b = format!("SELECT count(*) FROM (VALUES {})", rows(1000, "(random())"));
+    let c = format!("SELECT count(*) FROM (VALUES {})", rows(999, "(random())"));
+    same_args("rfa", &[a.as_str(), b.as_str(), c.as_str()]);
+}

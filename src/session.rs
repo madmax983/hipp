@@ -746,6 +746,9 @@ enum Plan {
         select: Option<Box<crate::query::SubPlan>>,
         sql: AVec<u8>,
         affs: AVec<crate::record::Affinity>,
+        /// The columns of the pin's FLEXNUM affinity (v0.17 review
+        /// fix, `rules::flex_col`): NUMERIC that leaves a REAL alone.
+        flex: AVec<bool>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3): everything population needs
     /// is resolved at plan time.
@@ -1533,6 +1536,11 @@ pub struct Connection<S: Storage> {
     /// plans for flattening.
     #[cfg(feature = "planner")]
     flat_from: core::cell::Cell<bool>,
+    /// Planning a SELECT that ALTER TABLE edits and never codes
+    /// (v0.17 review fix, `sql`; `Connection::plan_uncoded`): its FROM
+    /// subqueries' column collations are not looked up either.
+    #[cfg(feature = "sql")]
+    uncoded: core::cell::Cell<bool>,
     /// The recursive CTEs whose recursive SELECTs are being
     /// planned (v0.16, `sql`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
@@ -1641,6 +1649,8 @@ impl<S: Storage> Connection<S> {
             flat_raw: core::cell::Cell::new(false),
             #[cfg(feature = "planner")]
             flat_from: core::cell::Cell::new(false),
+            #[cfg(feature = "sql")]
+            uncoded: core::cell::Cell::new(false),
             #[cfg(feature = "sql")]
             rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "query")]
@@ -2306,6 +2316,7 @@ impl<S: Storage> Connection<S> {
                                 select: None,
                                 sql: AVec::new(),
                                 affs: AVec::new(),
+                                flex: AVec::new(),
                             });
                         }
                         return Err(Error::Schema {
@@ -2351,6 +2362,7 @@ impl<S: Storage> Connection<S> {
                     kept.as_slice(),
                     strict,
                     !wr_def,
+                    true,
                 )?;
                 #[cfg(feature = "sql")]
                 if self.prag.like_redefined
@@ -2807,7 +2819,14 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "indexes")]
                     indexes,
                     #[cfg(feature = "query")]
-                    rules: self.table_rules(arena, t)?,
+                    rules: {
+                        let r = self.table_rules(arena, t)?;
+                        #[cfg(feature = "sql")]
+                        if let Some(r) = r.as_deref() {
+                            r.coded::<S::Error>(None)?;
+                        }
+                        r
+                    },
                     #[cfg(feature = "sql")]
                     autoinc: if t.autoinc {
                         Some(copy_vec(handle_bytes(&self.catalog_arena, t.name)))
@@ -2837,7 +2856,7 @@ impl<S: Storage> Connection<S> {
                 table,
                 column,
                 text,
-                ..
+                checks: new_checks,
             } => {
                 let tname = handle_bytes(arena, *table);
                 let t = match self.catalog.find(&self.catalog_arena, tname) {
@@ -2971,6 +2990,10 @@ impl<S: Storage> Connection<S> {
                     checks.as_slice(),
                     strict_def,
                     t.has_rowid(),
+                    // (The pin's quick_check after ADD COLUMN codes every
+                    // CHECK when the new column has one, is a NOT NULL
+                    // generated column or the table is STRICT.)
+                    new_checks.is_empty() && !(column.generated && column.not_null) && !strict_def,
                 )?;
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "sql")]
@@ -3225,7 +3248,9 @@ impl<S: Storage> Connection<S> {
         let w = plan.width();
         let mut names = self.result_col_names(&plan, (0, 0))?;
         let mut affs: AVec<Affinity> = AVec::new();
+        let mut flex = AVec::new();
         for i in 0..w {
+            flex.push(crate::rules::flex_col(&plan, i));
             let item = plan.items.as_slice().get(i);
             // Demoted across compound cores; a numeric CAST is the
             // pin's FLEXNUM, declared ` NUM`.
@@ -3247,6 +3272,7 @@ impl<S: Storage> Connection<S> {
             select: Some(Box::new(plan)),
             sql: crate::rules::ctas_sql(tname, cols.as_slice()),
             affs,
+            flex,
         })
     }
 
@@ -4566,6 +4592,12 @@ impl<S: Storage> Connection<S> {
         )?;
         #[cfg(all(feature = "sql", not(feature = "expr_index")))]
         let _ = hint;
+        let rules = self.table_rules(arena, t)?;
+        #[cfg(feature = "sql")]
+        if let Some(r) = rules.as_deref() {
+            let (m, rowid) = assigned_columns(sets.as_slice(), t.columns.len(), t.rowid_alias);
+            r.coded::<S::Error>(Some((m.as_slice(), rowid)))?;
+        }
         Ok(Plan::Update {
             #[cfg(feature = "expr_index")]
             access,
@@ -4590,7 +4622,7 @@ impl<S: Storage> Connection<S> {
             returning: returning_r,
             #[cfg(feature = "indexes")]
             indexes,
-            rules: self.table_rules(arena, t)?,
+            rules,
         })
     }
 
@@ -5165,6 +5197,13 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<CorePlan, S::Error> {
         use crate::query::{ScopeGroup, has_agg, item_result_affinity, resolve_scoped};
+        #[cfg(feature = "sql")]
+        if count_of_view(stmt, arena, self.cfg.max_expr_depth) {
+            return Err(Error::Parse {
+                offset: 0,
+                kind: crate::error::ParseKind::ExprTooDeep,
+            });
+        }
         #[cfg(feature = "expr_index")]
         let merge = self.merge_core.take();
         let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
@@ -5971,7 +6010,9 @@ impl<S: Storage> Connection<S> {
         // are taken (the pin's `sqlite3SubqueryColumnTypes`, at
         // prepare: an unknown one fails, v0.17), its leftmost core's.
         #[cfg(feature = "sql")]
-        crate::query::lead_colls::<S::Error>(&dplan)?;
+        if !self.uncoded.get() {
+            crate::query::lead_colls::<S::Error>(&dplan)?;
+        }
         let mut real_cols = AVec::new();
         for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
             // A compound's column affinity is demoted across
@@ -8520,12 +8561,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             // as the pin re-prepares on a schema change.
             self.plan = self.conn.plan(&self.arena, &self.ast)?;
         }
-        let (select, sql, affs) = match &self.plan {
+        let (select, sql, affs, flex) = match &self.plan {
             Plan::CreateTableAs {
                 select: Some(select),
                 sql,
                 affs,
-            } => (select.clone(), sql.clone(), affs.clone()),
+                flex,
+            } => (select.clone(), sql.clone(), affs.clone(), flex.clone()),
             _ => return Err(Error::Unsupported),
         };
         let rows = self.exec_subplan(&select, &RowData::empty()).await?;
@@ -8539,8 +8581,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                 kind: SchemaKind::DatatypeMismatch,
             })?;
             let mut rec = AVec::new();
-            for (v, a) in row.iter().zip(affs.iter()) {
-                rec.push(apply_affinity(v.clone(), *a));
+            for (i, (v, a)) in row.iter().zip(affs.iter()).enumerate() {
+                rec.push(match v {
+                    OwnedValue::Real(_) if flex.as_slice().get(i) == Some(&true) => v.clone(),
+                    _ => apply_affinity(v.clone(), *a),
+                });
             }
             let bytes = crate::rules::encode_rec(rec.as_slice(), None, None);
             btree::btree_insert(&mut self.conn.pager, root, rowid, bytes.as_slice()).await?;
@@ -15030,6 +15075,79 @@ fn values_col_name(i: usize) -> AVec<u8> {
     v.extend_from_slice(b"column");
     crate::record::render_int((i + 1) as i64, &mut v);
     v
+}
+
+/// The pin's `countOfViewOptimization` (v0.17 review fix): `SELECT
+/// count(*) FROM (a UNION ALL b ...)` — one FROM subquery that is not a
+/// CTE's own body, read through any plain `SELECT ... FROM (...)` the
+/// flattener merges first, no WHERE / GROUP BY / HAVING / ORDER BY, arms
+/// with no WHERE, LIMIT, aggregate or DISTINCT — becomes the sum of
+/// each arm's `(SELECT count(*) FROM arm)` (each optimized in turn),
+/// which the pin refuses as "Expression tree is too large" once the
+/// arms reach the depth limit (1000: a VALUES chain).
+#[cfg(feature = "sql")]
+fn count_of_view(stmt: &SelectStmt, arena: &Arena, depth: usize) -> bool {
+    // A core the flattener merges whole: no clause but its FROM.
+    fn plain(c: &SelectStmt) -> bool {
+        c.filter.is_none()
+            && c.limit.is_none()
+            && !c.distinct
+            && c.group_by.is_empty()
+            && c.having.is_none()
+            && !c.items.iter().any(|it| match it {
+                SelectItem::Expr(e, ..) => {
+                    crate::rules::expr_any(e, &mut |x| matches!(x, Expr::Func { .. }))
+                }
+                _ => false,
+            })
+    }
+    // `SELECT count(*) FROM f` (`f` read through merged cores).
+    fn deep(mut f: &crate::sql::FromSource, depth: usize) -> bool {
+        loop {
+            let Some(d) = f.derived.as_deref() else {
+                return false;
+            };
+            if !d.compound.is_empty() {
+                let arms = core::iter::once(d).chain(d.compound.iter().map(|(_, c)| c));
+                return f.cte.as_ref().is_none_or(|c| c.view)
+                    && plain(d)
+                    && d.compound
+                        .iter()
+                        .all(|(op, c)| *op == crate::sql::CompoundOp::UnionAll && plain(c))
+                    && (d.compound.len().saturating_add(1) >= depth
+                        || arms.into_iter().any(|c| match c.from.as_slice() {
+                            [g] => c.order_by.is_empty() && deep(g, depth),
+                            _ => false,
+                        }));
+            }
+            match d.from.as_slice() {
+                [g] if plain(d) && d.values.is_empty() && d.order_by.is_empty() => f = g,
+                _ => return false,
+            }
+        }
+    }
+    let call = match stmt.items.as_slice() {
+        [
+            SelectItem::Expr(
+                Expr::Func {
+                    name, star, clause, ..
+                },
+                ..,
+            ),
+        ] => *star && clause.is_none() && handle_bytes(arena, *name).eq_ignore_ascii_case(b"count"),
+        _ => false,
+    };
+    match stmt.from.as_slice() {
+        [f] if call
+            && stmt.filter.is_none()
+            && stmt.having.is_none()
+            && stmt.group_by.is_empty()
+            && stmt.order_by.is_empty() =>
+        {
+            deep(f, depth)
+        }
+        _ => false,
+    }
 }
 
 /// Resolve a compound SELECT's ORDER BY terms (v0.9) to

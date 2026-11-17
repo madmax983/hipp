@@ -33,10 +33,28 @@ All notable changes to hipp. Versions follow the milestones in
   subquery takes its type from the rightmost core (`INT`, `REAL`,
   `NUM`); a result alias in a WHERE term is pushed down as the item it
   names (`planner`).
+- Review fixes (ungated): a later VALUES arm is the pin's `SELECT *
+  FROM (chain)` again, so a correlated chain's named column (`(t.i)`)
+  no longer fails as "no such column", and a pushed WHERE term reaches
+  a `SELECT * FROM (...)` arm by column name; a WHERE term reaches a
+  compound through a merged `SELECT ... FROM (compound)` subquery or
+  view (a view's VALUES chain included), each arm comparing with its
+  own affinity; a trigger's `new.rowid` keeps its INTEGER affinity as a
+  result item; a VALUES co-routine begun after 500+ chained rows is
+  exempt from the compound limit and a CTE's chained rows count as one
+  SELECT; `SELECT count(*) FROM (compound)` of 1,000+ arms fails as
+  "Expression tree is too large" (the pin's `countOfViewOptimization`);
+  a CHECK under an unknown collation fails ADD COLUMN when it verifies
+  the rows, an UPDATE only when it reads a changed column, a foreign
+  key action only when it reads the child key, and `integrity_check`;
+  PRAGMA table_info and ALTER TABLE resolve views without coding them
+  (only a view's column collations are looked up, by table_info);
+  CREATE TABLE ... AS keeps a REAL in a FLEXNUM (`NUM`) column.
 - Tests: `tests/values_chain_v17.rs` (rows and plans against the live
-  pin, generated corpora), `hipp-cli/tests/cli_v17_values_chain.rs`.
+  pin, generated corpora; one suite on the frozen VM under `vm`),
+  `hipp-cli/tests/cli_v17_values_chain.rs`.
 - Size: tiny 0, full +3,100 B, max +3,564 B, xl +3,516 B (ratchets
-  raised to the measured figures).
+  raised to the measured figures); review fixes: full +2,992 B, max +184 B, xl +3,008 B.
 
 ### ORDER BY / OFFSET parity (wave 18, unit `order_offset`)
 
