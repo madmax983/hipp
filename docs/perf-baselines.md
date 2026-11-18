@@ -470,3 +470,30 @@ reservation brings n=1000 to 428,109,167 Ir (a further -1.68%;
 
 Size gates: tiny +24 B, full +16 B, max +16 B, xl +16 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## write_index_leaf_inserted copies the leaf one cell at a time (baseline at 05691e0)
+
+`bolt_workload` (callgrind, release + debuginfo). Every index entry
+that lands in a leaf that still fits (CREATE INDEX, INSERT index
+maintenance) rebuilds the whole leaf image in
+`write_index_leaf_inserted`: per old cell a span lookup,
+`padded_cell_len`, a small `copy_from_slice` and an out-of-line
+`put_be_u16`, although the leaf it reads is the one this same
+function wrote (cells end-to-end from the page end, in pointer
+order), so all but the pointer array moves as two blocks.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 183,682,572   |
+| 1000 | 436,250,948   |
+| 2000 | 1,100,951,650 |
+
+n=1000 profile: `index_insert_core` inclusive 150,372,651 (34.47%);
+`write_index_leaf_inserted` is inlined into it: ~20.9M Ir on its own
+lines and calls (`put_be_u16` 561,228 calls 4.49M + 3.37M at the
+call site, `padded_cell_len` 2.24M, span reads 3.36M, per-cell copies
+2.24M) plus ~9.9M of inlined `ptr::copy_nonoverlapping`: ~31M,
+~7% of the total, over 559,242 cells copied by 1,986 calls (~280
+cells per leaf, ~55 Ir per cell).
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`
