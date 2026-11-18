@@ -497,3 +497,36 @@ call site, `padded_cell_len` 2.24M, span reads 3.36M, per-cell copies
 cells per leaf, ~55 Ir per cell).
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`
+
+### After: move a packed leaf's cells as two blocks
+
+`write_index_leaf_inserted` first checks, from the spans
+`index_search_raw` already validated, that the old leaf is packed:
+each cell starts where the one before it in pointer order ends,
+counting down from the page end (the layout this function itself
+writes). Then the rebuild's output is the cells before `pos` where
+they already are, the new cell, and the cells from `pos` on moved
+down by its length: two block copies, the pointer array rewritten from
+the spans (those from `pos` on lowered by the new cell's length) and
+the same header. Any other leaf takes the per-cell loop as before.
+A temporary self-check build ran both and asserted the images equal:
+every leaf write in the workload (998 / 1,986 / 3,942 at
+n=500/1000/2000) took the fast path, and the whole test suite (1056
+tests) ran with zero mismatches. Workload checksums identical
+(176089 / 657610 / 4083309); test pass/fail set identical before and
+after (the 923 failures are the absent `sqlite3` oracle, same on the
+baseline commit).
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 183,682,572   | 169,647,945   | -7.64%  |
+| 1000 | 436,250,948   | 401,550,603   | -7.95%  |
+| 2000 | 1,100,951,650 | 1,021,208,315 | -7.24%  |
+
+n=1000: `index_insert_core` inclusive 150,372,651 -> 115,671,563
+(-23.1%). dhat (n=1000) unchanged: 106,525,541 bytes in 427,777
+blocks (no allocation was removed; the gate cleared is instructions).
+
+Size gates: tiny unchanged (no `indexes`); full +632 B, max +672 B,
+xl +688 B; ratchets raised by those amounts (each well under
+`justify_over`).

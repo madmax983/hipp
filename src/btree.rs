@@ -3917,6 +3917,50 @@ async fn write_index_leaf_inserted<S: Storage>(
     }
     let idx = pager.dirty_page(page).await?;
     let out = pager.frame_data_mut(idx);
+    // A leaf this function wrote has its cells end-to-end from the
+    // page end, in pointer order. Then the rebuild below copies the
+    // cells before `pos` to where they already are and those from
+    // `pos` on to `new`'s length lower: two block moves and a
+    // pointer-array shift build the same image.
+    let mut low = old.len();
+    let mut packed = old.len() == out.len();
+    for &(at, total) in spans {
+        match low.checked_sub(padded_cell_len(usize::from(total))) {
+            Some(c) if usize::from(at) == c => low = c,
+            _ => {
+                packed = false;
+                break;
+            }
+        }
+    }
+    let nlen = new.bytes.len();
+    if packed && low >= 8 + 2 * (n + 1) + nlen {
+        let end = old.len();
+        let split = if pos == 0 {
+            end
+        } else {
+            usize::from(spans[pos - 1].0)
+        };
+        out.fill(0);
+        out[split..end].copy_from_slice(&old[split..end]);
+        out[split - nlen..split].copy_from_slice(new.bytes.as_slice());
+        out[low - nlen..split - nlen].copy_from_slice(&old[low..split]);
+        let head_ptrs = &mut out[8..8 + 2 * pos];
+        for (dst, &(at, _)) in head_ptrs.chunks_exact_mut(2).zip(&spans[..pos]) {
+            dst.copy_from_slice(&at.to_be_bytes());
+        }
+        put_be_u16(out, 8 + 2 * pos, (split - nlen) as u16);
+        let tail = &mut out[8 + 2 * (pos + 1)..8 + 2 * (n + 1)];
+        for (dst, &(at, _)) in tail.chunks_exact_mut(2).zip(&spans[pos..]) {
+            dst.copy_from_slice(&((usize::from(at) - nlen) as u16).to_be_bytes());
+        }
+        out[0] = KIND_LEAF_INDEX;
+        put_be_u16(out, 1, 0);
+        put_be_u16(out, 3, (n + 1) as u16);
+        put_be_u16(out, 5, content_code(low - nlen));
+        out[7] = 0;
+        return Ok(());
+    }
     out.fill(0);
     let mut content = out.len();
     for j in 0..=n {

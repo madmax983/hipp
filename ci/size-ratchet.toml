@@ -88,7 +88,9 @@ justify_over = 4096
 # `compound_affinity` made non-generic and out of line (-2,237 B).
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 481064
+# +632 B (Bolt): write_index_leaf_inserted moves a packed leaf's cells
+# as two blocks (-7.95% instructions on bolt_workload at n=1000).
+ratchet = 481696
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -161,7 +163,9 @@ justify_over = 16384
 # +24 B (Bolt, measured after merging main into v0.17 wave 17; +16 B on
 # main): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 968472
+# +672 B (Bolt): write_index_leaf_inserted moves a packed leaf's cells
+# as two blocks (-7.95% instructions on bolt_workload at n=1000).
+ratchet = 969144
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -229,7 +233,9 @@ justify_over = 32768
 # JOIN's constant ON term. Same offset.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-ratchet = 1066716
+# +688 B (Bolt): write_index_leaf_inserted moves a packed leaf's cells
+# as two blocks (-7.95% instructions on bolt_workload at n=1000).
+ratchet = 1067404
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
