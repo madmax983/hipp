@@ -33,8 +33,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 494,292 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 986,160 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,088,300 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 985,472 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,088,732 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -91,13 +91,17 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   skips OFFSET rows before their columns.
 - **ATTACH parity** (unit `attach`, leaf `attach`). A string literal
   names a schema, table or column where the pin's grammar takes a name
-  (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `FROM 't'`); an unqualified
+  (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `FROM 't'`, `WITH 'c'`, `SET
+  'a' = 1`, `CREATE TRIGGER 'tr'`, `UNIQUE('b')`); an unqualified
   `PRAGMA integrity_check` / `quick_check` checks main, temp and every
   attached database in turn under one error limit (a B-tree message
-  names its own database); an attached database's view is read beside
+  names its own database; a routed check's report comes before its
+  error); a WITH-prefixed write writes its target's database, not its
+  CTE's (review fix: it wrote a same-named table elsewhere); an attached database's view is read beside
   other databases' tables with its names bound to its own database (and
   `aux.v` no longer reads main's `v`); a TEMP UPDATE / DELETE / INSERT
-  VALUES reads main and attached tables; a write of an attached table
+  VALUES, and a WITH-prefixed, upsert or RETURNING TEMP INSERT ...
+  SELECT, reads main and attached tables; a write of an attached table
   reads another database's same-named table by an unqualified name and
   other databases' tables by three-part names. Still open (STATUS.md):
   TEMP triggers on main or attached tables or writing another

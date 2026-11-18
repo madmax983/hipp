@@ -176,3 +176,63 @@ fn integrity_check_every_database() {
         run_stdin(&oracle(), &b, &input)
     );
 }
+
+/// Review fixes: WITH-prefixed writes write their target's database
+/// (not the CTE's), TEMP writes fed by WITH / RETURNING reading main,
+/// string names in CTE / trigger / SET positions, and the temp
+/// database the unqualified integrity check opens.
+#[test]
+fn with_prefixed_writes_and_string_names() {
+    byte_identical(
+        "with",
+        "ATTACH 'a.db' AS aux; CREATE TABLE m(x); INSERT INTO m VALUES (1), (2), (3); \
+         CREATE TABLE aux.m(x); INSERT INTO aux.m VALUES (10), (2); \
+         CREATE TEMP TABLE t(y); INSERT INTO t VALUES (2); \
+         CREATE TEMP TABLE m(x); INSERT INTO temp.m VALUES (2), (7); \
+         WITH c AS (SELECT y FROM temp.t) DELETE FROM main.m WHERE x IN (SELECT y FROM c); \
+         WITH c AS (SELECT y FROM temp.t) UPDATE aux.m SET x = x + 100; \
+         WITH c AS (SELECT x FROM main.m) UPDATE t SET y = (SELECT max(x) FROM c); \
+         WITH c AS (SELECT x FROM m) INSERT INTO t SELECT x + 500 FROM c; \
+         INSERT INTO t SELECT x + 600 FROM main.m RETURNING y; \
+         SELECT 'main', * FROM main.m; SELECT 'aux', * FROM aux.m; \
+         SELECT 'temp', * FROM temp.m; SELECT 'temp', * FROM temp.t; \
+         WITH 'c'('z') AS (SELECT 1) SELECT z FROM c; \
+         CREATE TRIGGER 'aux'.'tr' AFTER UPDATE OF 'x' ON m BEGIN SELECT 1; END; \
+         UPDATE 'aux'.'m' SET 'x' = 4 WHERE x > 100; SELECT * FROM aux.m; \
+         PRAGMA integrity_check; PRAGMA database_list;",
+    );
+}
+
+/// Review fix: `PRAGMA aux.integrity_check` over a B-tree-corrupt
+/// attached file prints its report before the error.
+#[test]
+fn corrupt_attached_btree_report() {
+    let corrupt = |d: &Path| {
+        let p = d.join("a.db");
+        let out = Command::new(oracle())
+            .arg(&p)
+            .arg(
+                "CREATE TABLE t(a, b); CREATE INDEX i ON t(a); \
+                 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 300) \
+                 INSERT INTO t SELECT n, printf('%.200c', 'x') FROM r;",
+            )
+            .output()
+            .expect("oracle");
+        assert!(out.status.success());
+        let mut b = std::fs::read(&p).expect("read");
+        b[9 * 4096] = 0;
+        b[6 * 4096 + 3] = 0x7f;
+        b[6 * 4096 + 4] = 0xff;
+        std::fs::write(&p, b).expect("write");
+    };
+    let input = "ATTACH 'a.db' AS aux;\nPRAGMA aux.integrity_check;\nPRAGMA aux.quick_check(2);\n\
+                 PRAGMA integrity_check;\nSELECT 'after';\n";
+    let a = temp_dir("btree-hipp");
+    let b = temp_dir("btree-ora");
+    corrupt(&a);
+    corrupt(&b);
+    assert_eq!(
+        run_stdin(&hipp_bin(), &a, input),
+        run_stdin(&oracle(), &b, input)
+    );
+}

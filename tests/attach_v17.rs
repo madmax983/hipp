@@ -382,6 +382,12 @@ fn same_rows(tag: &str, prep: &dyn Fn(&Path), stmts: &[String]) {
     prep(&o);
     let (hl, he) = hipp_run(&h, stmts);
     let (ol, oe) = oracle_run(&o, stmts);
+    // A value with newlines is several of the shell's lines.
+    let hl: Vec<String> = hl
+        .iter()
+        .flat_map(|l| l.split('\n'))
+        .map(str::to_string)
+        .collect();
     let script = stmts.join(";\n");
     assert_eq!(hl, ol, "{tag}: rows differ:\n{script}");
     assert_eq!(he, oe, "{tag}: failing statements differ:\n{script}");
@@ -510,6 +516,241 @@ fn regressions() {
              SELECT * FROM aux.m ORDER BY x
              UPDATE aux.m SET y = 'u' FROM main.m WHERE main.m.x = aux.m.x AND aux.m.x = 1
              SELECT * FROM aux.m ORDER BY x",
+        ],
+    );
+}
+
+/// Review fixes: a WITH clause lists its CTEs' names before the
+/// write's target, which the router took as the target (the wrong
+/// database's same-named table was written, or main's target looked
+/// up in temp); a WITH-prefixed, upsert or RETURNING TEMP INSERT ...
+/// SELECT reading main; CTE / trigger / SET / constraint column names
+/// as strings.
+#[test]
+fn with_prefixed_writes() {
+    each(
+        "wf",
+        &[
+            // No ATTACH: main's write whose CTE reads temp.
+            "CREATE TABLE m(x)
+             INSERT INTO m VALUES (1), (2), (3)
+             CREATE TEMP TABLE t(y)
+             INSERT INTO t VALUES (2)
+             CREATE TEMP TABLE m(x)
+             INSERT INTO temp.m VALUES (2), (7)
+             WITH c AS (SELECT y FROM temp.t) DELETE FROM main.m WHERE x IN (SELECT y FROM c)
+             SELECT 'main', * FROM main.m
+             SELECT 'temp', * FROM temp.m
+             WITH c AS (SELECT y FROM temp.t) UPDATE main.m SET x = x + 100
+             SELECT 'main', * FROM main.m
+             SELECT 'temp', * FROM temp.m",
+            "CREATE TABLE m(x PRIMARY KEY, y)
+             INSERT INTO m VALUES (1, 'a'), (2, 'b'), (3, 'c')
+             CREATE TEMP TABLE t(y)
+             INSERT INTO t VALUES (2)
+             WITH c AS (SELECT y FROM temp.t) UPDATE m SET y = 'w' WHERE x IN (SELECT y FROM c)
+             SELECT * FROM m
+             WITH c AS (SELECT y FROM temp.t) DELETE FROM m WHERE x IN (SELECT y FROM c)
+             SELECT * FROM m
+             WITH c AS (SELECT y FROM temp.t) INSERT INTO m VALUES ((SELECT y + 50 FROM c), 'v')
+             SELECT * FROM m
+             WITH c AS (SELECT x FROM m) UPDATE t SET y = (SELECT max(x) FROM c)
+             SELECT * FROM t
+             WITH c AS (SELECT x FROM m WHERE x = 52) DELETE FROM t WHERE y IN (SELECT x - 49 FROM c)
+             SELECT count(*) FROM t
+             WITH c AS (SELECT x FROM m) INSERT INTO t SELECT x + 500 FROM c
+             INSERT INTO t SELECT x + 600 FROM m RETURNING y
+             SELECT * FROM t ORDER BY y",
+            // A same-named CTE never names the target.
+            "CREATE TABLE m(x)
+             INSERT INTO m VALUES (1), (2)
+             CREATE TEMP TABLE t(y)
+             WITH m AS (SELECT 1 AS x) DELETE FROM m WHERE x IN (SELECT x FROM m)
+             SELECT * FROM m",
+            // ATTACH: an attached table's write whose CTE reads temp.
+            "ATTACH '{d}/a.db' AS aux
+             CREATE TABLE aux.m(x)
+             INSERT INTO aux.m VALUES (1), (2), (3)
+             CREATE TEMP TABLE t(y)
+             INSERT INTO t VALUES (2)
+             CREATE TEMP TABLE m(x)
+             INSERT INTO temp.m VALUES (2), (7)
+             WITH c AS (SELECT y FROM temp.t) DELETE FROM aux.m WHERE x IN (SELECT y FROM c)
+             SELECT 'aux', * FROM aux.m
+             SELECT 'temp', * FROM temp.m
+             WITH c AS (SELECT y FROM temp.t) UPDATE aux.m SET x = x + 100
+             SELECT 'aux', * FROM aux.m
+             SELECT 'temp', * FROM temp.m",
+            // A CTE reading another database (pre-existing).
+            "ATTACH '{d}/a.db' AS aux
+             CREATE TABLE m(x)
+             INSERT INTO m VALUES (1), (2), (3)
+             CREATE TABLE aux.m(x)
+             INSERT INTO aux.m VALUES (10), (2)
+             CREATE TABLE aux.n(v)
+             INSERT INTO aux.n VALUES (2)
+             WITH c AS (SELECT v FROM aux.n) DELETE FROM main.m WHERE x IN (SELECT v FROM c)
+             SELECT 'aux', * FROM aux.m
+             SELECT 'main', * FROM main.m
+             WITH c AS (SELECT v FROM aux.n) UPDATE m SET x = x + 100
+             SELECT 'aux', * FROM aux.m
+             SELECT 'main', * FROM main.m
+             WITH c AS (SELECT x FROM main.m) DELETE FROM aux.m WHERE x IN (SELECT x - 99 FROM c)
+             SELECT 'aux', * FROM aux.m
+             WITH c AS (SELECT x FROM m) UPDATE aux.m SET x = x + (SELECT max(x) FROM c)
+             SELECT 'aux', * FROM aux.m
+             SELECT 'main', * FROM main.m",
+            // String names in the remaining `nm` positions.
+            "CREATE TABLE t(a PRIMARY KEY, b, UNIQUE('b'))
+             INSERT INTO t VALUES (1, 2)
+             INSERT INTO t VALUES (5, 2)
+             UPDATE 't' SET 'b' = 5
+             INSERT INTO t VALUES (1, 0) ON CONFLICT(a) DO UPDATE SET 'b' = 7
+             CREATE TABLE p(id PRIMARY KEY)
+             CREATE TABLE ch(x REFERENCES 'p'('id'), FOREIGN KEY('x') REFERENCES p('id'))
+             CREATE TRIGGER 'tr' AFTER UPDATE OF 'b' ON 't' BEGIN INSERT INTO p VALUES (new.b); END
+             UPDATE t SET b = 9
+             SELECT * FROM p
+             WITH 'c'('y') AS (SELECT 1) SELECT y FROM c
+             WITH RECURSIVE 'r'('n') AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT * FROM r
+             DROP TRIGGER 'tr'
+             SELECT * FROM t",
+        ],
+    );
+}
+
+/// One random script of WITH-prefixed (and plain) writes over main,
+/// temp and an attached database whose tables share names.
+fn random_with_script(rng: &mut Rng) -> Vec<String> {
+    let att = rng.int(10) < 7;
+    let mut s = Vec::new();
+    if att {
+        s.push("ATTACH '{d}/a.db' AS aux".to_string());
+    }
+    let mut dbs = vec!["main", "temp"];
+    for (sql, aux) in [
+        (
+            "CREATE TABLE m(x)|INSERT INTO m VALUES (1), (2), (3)",
+            false,
+        ),
+        (
+            "CREATE TABLE aux.m(x)|INSERT INTO aux.m VALUES (10), (2)",
+            true,
+        ),
+        (
+            "CREATE TEMP TABLE m(x)|INSERT INTO temp.m VALUES (2), (7)",
+            false,
+        ),
+        (
+            "CREATE TEMP TABLE t(y)|INSERT INTO t VALUES (2), (3)",
+            false,
+        ),
+        (
+            "CREATE TABLE aux.n(v)|INSERT INTO aux.n VALUES (2), (10)",
+            true,
+        ),
+        ("CREATE TABLE k(v)|INSERT INTO k VALUES (3)", false),
+    ] {
+        if (aux && !att) || rng.int(100) >= 85 {
+            continue;
+        }
+        s.extend(sql.split('|').map(str::to_string));
+    }
+    if att {
+        dbs.push("aux");
+    }
+    let col = |n: &str| match n.rsplit('.').next() {
+        Some("t") => "y",
+        Some("n") | Some("k") => "v",
+        _ => "x",
+    };
+    let srcs = [
+        "temp.t", "t", "aux.n", "n", "main.m", "m", "temp.m", "aux.m", "k", "main.k",
+    ];
+    let tgts = [
+        "main.m", "m", "temp.m", "aux.m", "temp.t", "t", "aux.n", "k",
+    ];
+    for _ in 0..4 {
+        let src = rng.pick(&srcs);
+        let tg = rng.pick(&tgts);
+        let (tc, sc) = (col(tg), col(src));
+        let body = match rng.int(7) {
+            0 => format!("DELETE FROM {tg} WHERE {tc} IN (SELECT z FROM c)"),
+            1 => format!("UPDATE {tg} SET {tc} = {tc} + 100 WHERE {tc} IN (SELECT z FROM c)"),
+            2 => format!("UPDATE {tg} SET {tc} = (SELECT max(z) FROM c)"),
+            3 => format!("INSERT INTO {tg} VALUES ((SELECT min(z) + 50 FROM c))"),
+            4 => format!("DELETE FROM {tg} WHERE {tc} IN (SELECT z FROM c) RETURNING {tc}"),
+            5 => format!("INSERT INTO {tg} SELECT z + 700 FROM c RETURNING {tc}"),
+            _ => format!("INSERT INTO {tg} SELECT z + 500 FROM c"),
+        };
+        s.push(if rng.int(100) < 35 {
+            body.replace("FROM c", &format!("FROM (SELECT {sc} AS z FROM {src})"))
+        } else {
+            format!("WITH c AS (SELECT {sc} AS z FROM {src}) {body}")
+        });
+        for d in dbs.iter() {
+            for t in ["m", "t", "n", "k"] {
+                s.push(format!("SELECT '{d}.{t}', * FROM {d}.{t} ORDER BY 2"));
+            }
+        }
+    }
+    s
+}
+
+#[test]
+fn generated_with_writes() {
+    let n: u64 = std::env::var("HIPP_ATTACH_CORPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let mut rng = Rng(0x0217_c7e5_9a4d_6b13);
+    for i in 0..n {
+        let script = random_with_script(&mut rng);
+        same(&format!("wgen{i}"), &script);
+    }
+}
+
+/// Review fixes: `PRAGMA aux.integrity_check` over a B-tree-corrupt
+/// attached file reports its rows before the error (they were
+/// dropped); an unqualified check opens the temp database, as the
+/// pin's `sqlite3CodeVerifySchema` does (`database_list` lists it).
+#[test]
+fn integrity_check_rows_and_temp() {
+    let prep = |d: &Path| {
+        let p = d.join("a.db");
+        common::cli(
+            &p,
+            "CREATE TABLE t(a, b); CREATE INDEX i ON t(a); \
+             WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 300) \
+             INSERT INTO t SELECT n, printf('%.200c', 'x') FROM r;",
+        );
+        let mut b = std::fs::read(&p).expect("read");
+        b[9 * 4096] = 0;
+        b[6 * 4096 + 3] = 0x7f;
+        b[6 * 4096 + 4] = 0xff;
+        std::fs::write(&p, b).expect("write");
+    };
+    let script = lines(
+        "ATTACH '{d}/a.db' AS aux
+         PRAGMA aux.integrity_check
+         PRAGMA aux.quick_check
+         PRAGMA aux.quick_check(2)
+         PRAGMA integrity_check
+         SELECT name FROM pragma_database_list",
+    );
+    same_rows("icrows", &prep, &script);
+    each(
+        "ictemp",
+        &[
+            "PRAGMA integrity_check
+             SELECT name FROM pragma_database_list
+             ATTACH '{d}/a.db' AS a
+             SELECT name FROM pragma_database_list",
+            "PRAGMA main.quick_check
+             SELECT name FROM pragma_database_list
+             CREATE TABLE x(a)
+             PRAGMA quick_check(x)
+             SELECT name FROM pragma_database_list",
         ],
     );
 }

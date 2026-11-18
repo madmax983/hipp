@@ -413,12 +413,97 @@ smaller and were not kept.
 - A three-part name of another database whose table the statement
   does not read (`UPDATE aux.t SET b = main.m.y`) is refused, where the
   pin reports "no such column".
-- `UPDATE 't' SET 'a' = 5` (a string as a SET column name) does not
-  parse (found along the way; not a qualifier).
+- (closed in v0.17: attach review fixes) `UPDATE 't' SET 'a' = 5` (a
+  string as a SET column name) does not parse (found along the way; not
+  a qualifier).
 - `pragma_integrity_check` / `pragma_quick_check` as table-valued
   functions are refused (the v0.16 PRAGMA unit's gap, unchanged).
 - With a TEMP database every INSERT / UPDATE / DELETE is parsed once
   more by the ATTACH router (to find a TEMP write reading main).
+
+**Review fixes (2026-11-18).** Eight findings, each reproduced on the
+live pin first; seven fixed at the root, one (a CTE-first WITH write)
+had three more instances found and fixed with it.
+1. **A WITH-prefixed write wrote the wrong database** (findings 1-4,
+   high). `route_attach` took the first name `ast_names` lists as the
+   write target, but a WITH clause lists its CTEs' names first. So
+   `WITH c AS (SELECT y FROM temp.t) DELETE FROM main.m ...` was homed
+   on TEMP and deleted `temp.m` (a regression of the unit: without
+   ATTACH too, since every write goes through the router while a TEMP
+   database exists), the same with `UPDATE aux.m` (the new `TEMP_DB`
+   route wrote `temp.m`; it was refused at base), `WITH c AS (... FROM
+   temp.t) UPDATE m ...` failed with "no such table" (worked at base),
+   and `WITH c AS (SELECT v FROM aux.n) DELETE FROM main.m` deleted
+   `aux.m`'s rows (pre-existing). Fix: the target is the ref whose token
+   is the AST's target name (`target_tok`), and a CTE name never hides
+   it (`WITH m AS (...) DELETE FROM m` writes table `m`, as on the
+   pin). The `temp_reads` route asks the same target.
+2. **Item 3's WITH form** (finding 6): `WITH c AS (SELECT x FROM m)
+   UPDATE t ...` / `DELETE FROM t ...` with `t` a TEMP table now runs,
+   by finding 1's fix. Searching the same pattern found the TEMP
+   router's feed taking only a plain INSERT ... SELECT: a WITH-prefixed,
+   upsert or RETURNING TEMP INSERT ... SELECT reading main was
+   `Unsupported` (pin: runs). Those now take the `TEMP_DB` route too.
+3. **`PRAGMA aux.integrity_check` over a B-tree-corrupt attached file
+   printed no rows** (finding 5, pre-existing): `step_att` returned the
+   routed statement's error before keeping the rows it gave. Now the
+   rows are served first and the error follows (`Statement::deferred`),
+   as on the database itself, for every routed statement.
+4. **String names in the remaining `nm` positions** (finding 7):
+   `CREATE TRIGGER 'tr'` (and `aux.'tr'`), `UPDATE OF 'b'`, `WITH
+   'c'('y')`, `SET 'a' = 5` (UPDATE and upsert), and a constraint's
+   column list (`UNIQUE('b')`, `PRIMARY KEY('a')`, `FOREIGN KEY('x')
+   REFERENCES p('id')`) take a string, gated on `attach` as the rest of
+   item 7. Probed beside them and already the pin's: `INDEXED BY 'i'`,
+   `WINDOW 'w'`, `ALTER TABLE t RENAME 'b' TO 'c'`, `SAVEPOINT 'sp'`,
+   `ALTER TABLE ... ADD / DROP COLUMN 'c'`, `CREATE VIEW v('x', 'y')`.
+5. **An unqualified integrity_check opens the TEMP database** (finding
+   8, pre-existing): the pin's loop calls `sqlite3CodeVerifySchema` for
+   `i == 1`, so `PRAGMA database_list` lists `temp` afterwards; with a
+   table argument too (`PRAGMA quick_check(x)`), not after `PRAGMA
+   main.integrity_check`. `integrity_rest` now opens it.
+
+Oracle-probing notes: every repro above on the 3.54.1 pin, plus a
+generated corpus (scratch, 1,100 scripts: WITH-prefixed and plain
+DELETE / UPDATE / INSERT VALUES / INSERT ... SELECT / RETURNING over
+same-named `m` in main, temp and `aux`, CTEs reading each) that hipp
+now matches. `PRAGMA aux.quick_check(2)` over the corrupt file stops
+after two rows with no error on the pin (rc 0), as now in hipp.
+`CREATE TRIGGER 'tr' ... ON aux.m` is the pin's "cannot reference
+objects in database aux" (hipp: `CrossDatabaseReference`).
+
+Tests: `tests/attach_v17.rs` 3 more tests (11): `with_prefixed_writes`
+(the four findings' scripts, item 3's WITH and RETURNING forms, the
+same-named CTE, the string-name positions), `generated_with_writes`
+(xorshift64: WITH-prefixed and plain writes over main / temp / `aux`
+with same-named tables, 24 scripts, `HIPP_ATTACH_CORPUS=200` ran
+clean), `integrity_check_rows_and_temp` (a B-tree-corrupt attached file
+made by the pin; `database_list` after the check). `same_rows` splits
+a value with newlines into the shell's lines.
+`hipp-cli/tests/cli_v17_attach.rs` 2 more tests (5): the WITH writes
+and string names byte-identical one-shot and over stdin, and the
+corrupt file's report over stdin. No new multi-database write path
+(the fixed route writes the database the statement names, through the
+existing attached / TEMP routes), so `tests/crash.rs` is unchanged; it
+passes.
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed.
+`tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info on: pass (the TEMP open in
+`integrity_rest` is a boxed future). Found on the way, not this unit's:
+with debug info *and* `--features vm` (CI's `test_vm` job),
+`depth_tiny_v16`'s `column_counts_match_the_oracle` overflows its
+512 KiB thread here, at the unit's commit c5cd9b4 and at base 1b49982
+alike (the gates' run without debug info passes it).
+
+Size Δ of the review fixes: tiny 0 (76,928); full 0 (494,292); max
+-688 (986,160 → 985,472; ratchet lowered); xl +432 (1,088,300 →
+1,088,732; ratchet raised, layout: the same code shrinks max).
+
+Honest gaps the review fixes leave:
+- `PRAGMA integrity_check(nosuch)` fails at prepare in hipp, before the
+  TEMP database is opened; the pin opens it anyway (its error is a
+  prepare error too), so a later `database_list` lacks `temp`.
 
 ### Parity: values_chain — VALUES chains, lazy collations, inert aggregates (2026-11-17)
 

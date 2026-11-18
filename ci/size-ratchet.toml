@@ -210,7 +210,9 @@ justify_over = 16384
 # 981,700 -> 986,160 (v0.17 result_gaps, ungated correctness; STATUS.md):
 # +4,460 B, the `full` growth plus the WITHOUT ROWID natural order's
 # access path and the co-routine GROUP BY plan line (`explain`).
-ratchet = 986160
+# 986,160 -> 985,472 (v0.17 attach review fixes, `attach` leaf; STATUS.md):
+# -688 B. The router finds the write target by its token (one lookup).
+ratchet = 985472
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -292,7 +294,10 @@ justify_over = 32768
 # `step_att` (+2 KB; boxing its TEMP branch measured larger).
 # 1,084,848 -> 1,088,300 (v0.17 result_gaps, ungated correctness;
 # STATUS.md): +3,452 B, the `max` growth net of layout.
-ratchet = 1088300
+# 1,088,300 -> 1,088,732 (v0.17 attach review fixes, `attach` leaf;
+# STATUS.md): +432 B, layout/inlining (max shrank 688 B): WITH-target
+# routing, routed rows before an error, temp opened by integrity_check.
+ratchet = 1088732
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

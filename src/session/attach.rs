@@ -726,6 +726,23 @@ impl<S: Storage> Connection<S> {
             }
             _ => {}
         }
+        // The statement's target (written database) and its token:
+        // a WITH clause lists its CTEs' names before it (review fix:
+        // the first name was taken as the target).
+        let target = match body {
+            Ast::Insert { table, .. }
+            | Ast::Update { table, .. }
+            | Ast::Delete { table, .. }
+            | Ast::AlterAddColumn { table, .. }
+            | Ast::AlterRename { table, .. }
+            | Ast::AlterRenameColumn { table, .. }
+            | Ast::AlterDropColumn { table, .. } => Some(*table),
+            Ast::DropTable { name, .. }
+            | Ast::DropView { name, .. }
+            | Ast::DropIndex { name, .. } => Some(*name),
+            _ => None,
+        };
+        let target_tok = target.and_then(|h| tok_index(t, h));
         // Every table / view / index name of the statement.
         let mut names = AVec::new();
         let mut ctes = AVec::new();
@@ -751,7 +768,11 @@ impl<S: Storage> Connection<S> {
             }
             let sk = i.and_then(|i| schema_tok(t, i));
             let schema = sk.and_then(|k| ident(t, k, arena));
-            if schema.is_none() && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n)) {
+            // A CTE name never names the target.
+            if schema.is_none()
+                && i != target_tok
+                && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n))
+            {
                 continue;
             }
             // A table-valued pragma function is main's, whatever its
@@ -876,32 +897,23 @@ impl<S: Storage> Connection<S> {
         let any_att = refs.iter().any(|r| matches!(r.loc, Loc::Att(_)))
             || matches!(created_loc, Some(Loc::Att(_)))
             || three.iter().any(|x| matches!(x.1, Loc::Att(_)));
-        // v0.17: a TEMP UPDATE / DELETE / INSERT VALUES reading main
-        // (the TEMP router feeds only INSERT ... SELECT and CTAS).
-        let temp_reads = matches!(
-            body,
-            Ast::Update { .. } | Ast::Delete { .. } | Ast::Insert { select: None, .. }
-        ) && refs.as_slice().first().is_some_and(|r| r.loc == Loc::Temp)
+        let target_ref = target_tok.and_then(|k| refs.iter().find(|r| r.tok == Some(k)));
+        // v0.17: a TEMP write reading main that the TEMP router does
+        // not feed (it feeds a plain INSERT ... SELECT and CTAS):
+        // UPDATE, DELETE, INSERT VALUES, and a WITH-prefixed, upsert
+        // or RETURNING INSERT ... SELECT (review fix).
+        let with = matches!(ast, Ast::With { .. });
+        let temp_reads = match body {
+            Ast::Update { .. } | Ast::Delete { .. } | Ast::Insert { select: None, .. } => true,
+            Ast::Insert {
+                upsert, returning, ..
+            } => with || upsert.is_some() || !returning.is_empty(),
+            _ => false,
+        } && target_ref.is_some_and(|r| r.loc == Loc::Temp)
             && refs.iter().any(|r| r.loc == Loc::Main);
         if !any_att && !temp_reads {
             return Ok(None);
         }
-        // The statement's target (written database) and home.
-        let target: Option<&[u8]> = match body {
-            Ast::Insert { table, .. }
-            | Ast::Update { table, .. }
-            | Ast::Delete { table, .. }
-            | Ast::AlterAddColumn { table, .. }
-            | Ast::AlterRename { table, .. }
-            | Ast::AlterRenameColumn { table, .. }
-            | Ast::AlterDropColumn { table, .. } => Some(handle_bytes(arena, *table)),
-            Ast::DropTable { name, .. }
-            | Ast::DropView { name, .. }
-            | Ast::DropIndex { name, .. } => Some(handle_bytes(arena, *name)),
-            _ => None,
-        };
-        // The target is the first name `ast_names` lists.
-        let target_ref = target.and_then(|_| refs.as_slice().first());
         let home = match (created_loc, target_ref, body) {
             (Some(l), _, _) => l,
             (None, Some(r), _) => r.loc,
@@ -1950,7 +1962,15 @@ impl<S: Storage> Statement<'_, S> {
                 self.conn.mirror_temp(b"ROLLBACK").await;
                 self.conn.mirror_att(b"ROLLBACK").await;
             }
-            r?;
+            // The rows it gave before an error are served first, as
+            // on its own database (review fix: `PRAGMA
+            // aux.integrity_check` over a corrupt page lost its report).
+            if let Err(e) = r {
+                if ran.rows.is_empty() {
+                    return Err(e);
+                }
+                self.deferred = Some(e);
+            }
             self.query_rows = ran.rows;
             self.query_rowids = ran.rowids;
             self.query_loaded = true;
@@ -1959,6 +1979,9 @@ impl<S: Storage> Statement<'_, S> {
         if self.query_pos >= self.query_rows.len() {
             self.phase = Phase::Done;
             self.current_rowid = None;
+            if let Some(e) = self.deferred.take() {
+                return Err(e);
+            }
             return Ok(Step::Done);
         }
         self.current = self.query_rows.as_slice()[self.query_pos].clone();
@@ -2016,6 +2039,13 @@ impl<S: Storage> Statement<'_, S> {
         quick: bool,
         rows: super::pragma::Rows,
     ) -> Result<super::pragma::Rows, S::Error> {
+        // Unqualified, the pin's check opens the temp database, a
+        // table's check too (review fix: `PRAGMA database_list`
+        // lacked it afterwards).
+        if self.conn.alias.is_none() && !self.conn.is_temp {
+            let open: Boxed<'_, Result<_, S::Error>> = Box::pin(self.conn.temp_conn());
+            open.await?;
+        }
         let mut mx: i64 = 100;
         if let Some(a) = &p.arg {
             let s = a.as_slice();
@@ -2024,11 +2054,7 @@ impl<S: Storage> Statement<'_, S> {
                 _ => return Ok(rows),
             }
         }
-        if self.deferred.is_some()
-            || self.conn.alias.is_some()
-            || self.conn.is_temp
-            || (self.conn.attached.is_empty() && self.conn.temp.is_none())
-        {
+        if self.deferred.is_some() || self.conn.alias.is_some() || self.conn.is_temp {
             return Ok(rows);
         }
         let mut out = AVec::new();

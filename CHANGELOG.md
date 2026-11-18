@@ -65,6 +65,15 @@ All notable changes to hipp. Versions follow the milestones in
   another database's view; attached and TEMP tables have no index
   access paths yet.
 - Sizes: tiny and full unchanged; max +5,008 B, xl +7,216 B.
+- Review fixes: a WITH-prefixed INSERT / UPDATE / DELETE is routed by
+  its target, not by the first table its CTEs read (it wrote a
+  same-named table of temp or an attached database, or failed with "no
+  such table"); a WITH-prefixed, upsert or RETURNING TEMP INSERT ...
+  SELECT reads main; `PRAGMA aux.integrity_check` prints its report
+  before the error; an unqualified integrity check opens the TEMP
+  database (`database_list` lists it); string names in CTE, trigger,
+  `UPDATE OF`, SET and constraint column positions. Sizes: tiny and
+  full unchanged; max -688 B, xl +432 B.
 
 ### VALUES chains, lazy collations, inert aggregates (wave 18, unit `values_chain`)
 

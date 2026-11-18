@@ -1022,8 +1022,14 @@ impl<'a> Parser<'a> {
         let rec = usize::from(self.eat_kw(b"RECURSIVE"));
         let mut ctes = AVec::new();
         loop {
+            // v0.17 (`attach`): a string names a CTE or its column.
             let name = match self.cur().tok {
                 Tok::Ident(h, _) => {
+                    self.pos += 1;
+                    h
+                }
+                #[cfg(feature = "attach")]
+                Tok::Text(h) => {
                     self.pos += 1;
                     h
                 }
@@ -1035,6 +1041,11 @@ impl<'a> Parser<'a> {
                 loop {
                     match self.cur().tok {
                         Tok::Ident(h, _) => {
+                            self.pos += 1;
+                            columns.push(h);
+                        }
+                        #[cfg(feature = "attach")]
+                        Tok::Text(h) => {
                             self.pos += 1;
                             columns.push(h);
                         }
@@ -6152,6 +6163,9 @@ UPDATE USING VALUES WHEN WHERE",
         loop {
             let h = match self.ident_at(i) {
                 Some((h, _, _)) if i < to && !self.reserved(i, true) => h,
+                // v0.17 (`attach`): a string names a column too.
+                #[cfg(feature = "attach")]
+                _ if let Some(Tok::Text(h)) = tok(i) => h,
                 _ => return Err(perr(self.item_end_offset(i), ParseKind::UnexpectedToken)),
             };
             i += 1;
@@ -6736,6 +6750,12 @@ impl<'a> Parser<'a> {
                 }
                 Ok(h)
             }
+            // v0.17 (`attach`): a string is a name (`SET 'a' = 1`).
+            #[cfg(feature = "attach")]
+            Tok::Text(h) => {
+                self.pos += 1;
+                Ok(h)
+            }
             _ => Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         }
     }
@@ -7044,9 +7064,11 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        // [schema .] name
+        // [schema .] name (v0.17, `attach`: a string too)
         let (mut name, mut name_at) = match self.cur().tok {
             Tok::Ident(h, _) => (h, self.cur().offset),
+            #[cfg(feature = "attach")]
+            Tok::Text(h) => (h, self.cur().offset),
             _ => return Err(perr(self.cur().offset, ParseKind::UnexpectedToken)),
         };
         self.pos += 1;
@@ -7063,6 +7085,12 @@ impl<'a> Parser<'a> {
             qualified = true;
             match self.cur().tok {
                 Tok::Ident(h, _) => {
+                    name = h;
+                    name_at = self.cur().offset;
+                    self.pos += 1;
+                }
+                #[cfg(feature = "attach")]
+                Tok::Text(h) => {
                     name = h;
                     name_at = self.cur().offset;
                     self.pos += 1;
@@ -7090,6 +7118,11 @@ impl<'a> Parser<'a> {
                 loop {
                     match self.cur().tok {
                         Tok::Ident(h, _) => {
+                            self.pos += 1;
+                            of_cols.push(h);
+                        }
+                        #[cfg(feature = "attach")]
+                        Tok::Text(h) => {
                             self.pos += 1;
                             of_cols.push(h);
                         }
