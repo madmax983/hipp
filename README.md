@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 490,396 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 981,700 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,084,848 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 494,292 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 986,160 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,088,300 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,26 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **Result-level gaps of wave 18** (unit `result_gaps`, ungated
+  fixes). The pin's top-N sorter: under an ORDER BY with a LIMIT and
+  no DISTINCT a row's ORDER BY key is computed first, and a row whose
+  key sorts at or past the largest of the OFFSET + LIMIT rows held is
+  skipped with no result column computed — at the top level, in FROM
+  / IN subqueries, views and CTEs read once, over groups and windows,
+  and in each UNION ALL core of a compound's merge (not in a scalar
+  subquery, an INSERT's SELECT or a materialized CTE); a result
+  column the ORDER BY repeats is computed once. A WITHOUT ROWID
+  table's own order delivers its ORDER BY tail; a FROM subquery's
+  order delivers its reader's GROUP BY (groups in its order, split
+  where the next key differs); a subquery's `ORDER BY 1 COLLATE
+  BINARY` is result column 1 for its reader; an EXISTS computes no
+  result column, ORDER BY or DISTINCT of its UNION cores; a TEMP
+  CREATE TABLE ... AS keeps FLEXNUM reals; a CTE reference counts one
+  toward the "nested too deep" limit (three reads of a 450-arm CTE
+  run); a VALUES list of a few thousand non-constant rows fits the
+  default statement arena (names are copied once, the arena's last
+  chunk takes its whole remaining budget); the `query`-only executor
+  skips OFFSET rows before their columns.
 - **ATTACH parity** (unit `attach`, leaf `attach`). A string literal
   names a schema, table or column where the pin's grammar takes a name
   (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `FROM 't'`); an unqualified
@@ -125,10 +145,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   pin omits (`SQLITE_OmitOrderBy`) is dropped, and a co-routine's own
   order delivers its reader's ORDER BY by column number
   (`SQLITE_OrderBySubq`), whatever the reader's collation; a UNION ALL
-  ORDER BY keeps equal rows in core order. Still open: a sorter under
-  a LIMIT computes every row's columns (the pin's top-N sorter skips
-  rows past it first), and a WITHOUT ROWID natural scan's ORDER BY
-  tail (STATUS.md).
+  ORDER BY keeps equal rows in core order. (Its open items, the pin's
+  top-N sorter and a WITHOUT ROWID natural scan's ORDER BY tail, were
+  closed by `result_gaps`.)
 - **Planner and CLI parity** (unit `gaps_plan_cli`, ungated fixes).
   `INDEXED BY` names an index of the source's own table on every path
   (a plain scan accepted another table's index); WHERE / ON terms are

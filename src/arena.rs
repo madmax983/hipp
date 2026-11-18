@@ -227,16 +227,18 @@ impl Arena {
             new_cap = len + ALIGN;
         }
         if inner.capacity + new_cap > self.max {
-            // A dedicated chunk of exactly the need might still fit
-            // where the geometric one did not.
-            let exact = len + ALIGN;
-            if inner.capacity + exact > self.max {
+            // The rest of the budget as one last chunk might still fit
+            // where the geometric one did not (v0.17: a chunk of exactly
+            // the need left every later allocation a chunk of its own,
+            // each wasting its alignment, and a rewound arena could not
+            // reuse them).
+            new_cap = self.max.saturating_sub(inner.capacity);
+            if new_cap < len + ALIGN {
                 return Err(ArenaError {
                     scope: self.scope,
                     needed: len,
                 });
             }
-            new_cap = exact;
         }
         let raw: *mut [u8] = Box::into_raw(alloc::vec![0u8; new_cap].into_boxed_slice());
         let ptr = raw.cast::<u8>();

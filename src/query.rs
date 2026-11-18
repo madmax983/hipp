@@ -1200,6 +1200,13 @@ pub struct SubPlan {
     /// (`SelectStmt::vchain`; v0.17 review fix, `sql`).
     #[cfg(feature = "sql")]
     pub vchain: bool,
+    /// The result columns an ORDER BY term written as an ordinal or
+    /// an alias under COLLATE names (v0.17, `sql`): the pin's
+    /// `resolveOrderGroupBy` strips the COLLATE before it sets
+    /// `iOrderByCol`, so the term is that column for a reader's
+    /// `wherePathMatchSubqueryOB` (`ORDER BY 1 COLLATE BINARY`).
+    #[cfg(feature = "sql")]
+    pub ob_refs: AVec<usize>,
     /// The pin's select number of this core (v0.16, `explain`;
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]
@@ -3933,6 +3940,19 @@ pub fn mark_exists_inert(p: &mut SubPlan) {
     core(p);
     for (_, t) in p.compound.as_mut_slice() {
         core(t);
+    }
+    // The pin drops an EXISTS's ORDER BY and DISTINCT
+    // (`IgnorableOrderby`, v0.17), and a UNION there is a UNION ALL
+    // (no core's column is computed: `Statement::dest`).
+    fn drop_order(p: &mut SubPlan) {
+        p.order_by.clear();
+        p.distinct = false;
+    }
+    drop_order(p);
+    p.comp_order.clear();
+    for (op, t) in p.compound.as_mut_slice() {
+        *op = crate::sql::CompoundOp::UnionAll;
+        drop_order(t);
     }
 }
 

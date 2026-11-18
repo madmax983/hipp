@@ -1506,7 +1506,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     &empty,
                     core::slice::from_ref(&acc),
                     None,
-                    (0, usize::MAX),
+                    (0, usize::MAX, usize::MAX),
                 )
                 .await
             {

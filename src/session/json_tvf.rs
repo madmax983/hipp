@@ -90,6 +90,7 @@ impl<S: Storage> Connection<S> {
             rec: None,
             mat: 0,
             real_cols: AVec::new(),
+            ob_refs: AVec::new(),
             vchain: false,
             #[cfg(feature = "explain")]
             sel: 0,

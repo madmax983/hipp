@@ -1228,7 +1228,10 @@ impl<'a> Walk<'a> {
             let grouped = acc.is_some_and(|a| a.groups);
             #[cfg(not(feature = "expr_index"))]
             let grouped = false;
-            let grouped = grouped || self.natural(first) >= c.group_by.len();
+            // (Or a lone FROM subquery's order delivers it: v0.17.)
+            let grouped = grouped
+                || self.natural(first) >= c.group_by.len()
+                || first.is_some_and(|s| groups_adjacent(c.sources, c.group_by, s.eqp.base));
             if !grouped {
                 self.add(parent, &[b"USE TEMP B-TREE FOR GROUP BY"]);
             }
@@ -1284,7 +1287,12 @@ impl<'a> Walk<'a> {
             // does not deliver it (v0.17 review fix).
             let single = c.has_agg && c.group_by.is_empty();
             let same_group = !c.group_by.is_empty()
-                && crate::session::groups_sorted(c.group_by, c.order_by, c.sources);
+                && crate::session::groups_sorted_at(
+                    c.group_by,
+                    c.order_by,
+                    c.sources,
+                    first.map_or(usize::MAX, |s| s.eqp.base),
+                );
             let k = c.order_by.len();
             let done = if c.group_by.is_empty() && (!c.distinct || !c.has_agg) {
                 delivered.min(k)

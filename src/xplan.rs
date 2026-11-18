@@ -2198,7 +2198,18 @@ pub(crate) fn best_access(
             sorted = 0;
         }
     }
-    if natural && l.eq.is_empty() && l.lo.is_none() && l.hi.is_none() && !reverse && !groups {
+    // (A WITHOUT ROWID table read in its own order that delivers the
+    // whole ORDER BY keeps the loop as its access path, so the
+    // executor knows the order it delivers: `ORDER BY k,
+    // abs(-9223372036854775808)` never computes the last term; v0.17.)
+    if natural
+        && l.eq.is_empty()
+        && l.lo.is_none()
+        && l.hi.is_none()
+        && !reverse
+        && !groups
+        && !(tab.wr && !q.order.is_empty() && sorted >= q.order.len() && sorted != UNSAT)
+    {
         return None;
     }
     let mut a = lower(s, tab, ts, &l, reverse);

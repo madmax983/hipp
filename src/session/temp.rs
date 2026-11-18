@@ -86,6 +86,9 @@ pub(super) struct FedRoute {
 pub(super) struct TempFeed {
     select: Box<crate::query::SubPlan>,
     create: Option<AVec<u8>>,
+    /// A CREATE TABLE ... AS's FLEXNUM columns (`rules::flex_col`):
+    /// a REAL goes in as it is (v0.17).
+    flex: AVec<bool>,
 }
 
 /// The temp database's errors under the connection's storage type
@@ -1380,13 +1383,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             // A temp write reading main (v0.16): its rows first, read
             // here; a CTAS's table is created before they go in, and
             // it changes no counter (as on the pin).
-            let (fed, create) = match feed {
+            let (fed, create, flex) = match feed {
                 Some(f) => {
-                    let (select, create) = (f.select.clone(), f.create.clone());
+                    let (select, create, flex) =
+                        (f.select.clone(), f.create.clone(), f.flex.clone());
                     let rows = self.exec_subplan(&select, &RowData::empty()).await?;
-                    (Some(rows), create)
+                    (Some(rows), create, flex)
                 }
-                None => (None, None),
+                None => (None, None, AVec::new()),
             };
             #[cfg(feature = "params")]
             let binds = self.binds.values.clone();
@@ -1419,6 +1423,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         rows_v,
                         rows_r,
                         select,
+                        cols,
                         ..
                     },
                 ) = (&fed, &mut st.plan)
@@ -1426,6 +1431,22 @@ impl<'c, S: Storage> Statement<'c, S> {
                     *rows_v = rows.clone();
                     *rows_r = None;
                     *select = None;
+                    // A FLEXNUM column keeps a REAL, and gives anything
+                    // else NUMERIC affinity, here (v0.17: the temp
+                    // INSERT's NUMERIC column made `2.0` the integer 2).
+                    for (i, c) in cols.as_mut_slice().iter_mut().enumerate() {
+                        if flex.as_slice().get(i) == Some(&true) {
+                            for r in rows_v.as_mut_slice().iter_mut() {
+                                if let Some(v) = r.as_mut_slice().get_mut(i)
+                                    && !matches!(v, OwnedValue::Real(_))
+                                {
+                                    let x = core::mem::replace(v, OwnedValue::Null);
+                                    *v = crate::record::apply_affinity(x, c.affinity);
+                                }
+                            }
+                            c.affinity = crate::record::Affinity::Blob;
+                        }
+                    }
                 }
                 #[cfg(feature = "params")]
                 for (i, v) in binds.iter().enumerate() {
@@ -1751,6 +1772,7 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         }
         let mut width = f.width;
+        let mut flex = AVec::new();
         let (select, create, insert) = match &f.ctas {
             Some(name) => {
                 if self.temp_has(name.as_slice(), false) {
@@ -1762,11 +1784,12 @@ impl<S: Storage> Connection<S> {
                     select: Some(select),
                     sql,
                     affs,
-                    ..
+                    flex: fx,
                 } = self.plan_create_as(arena, name.as_slice(), sel)?
                 else {
                     return Err(Error::Unsupported);
                 };
+                flex = fx;
                 let mut insert = copy_vec(b"INSERT INTO \"");
                 for &b in name.iter() {
                     insert.push(b);
@@ -1810,7 +1833,11 @@ impl<S: Storage> Connection<S> {
         Ok(super::Plan::Temp {
             sql: insert,
             width: 0,
-            feed: Some(Box::new(TempFeed { select, create })),
+            feed: Some(Box::new(TempFeed {
+                select,
+                create,
+                flex,
+            })),
         })
     }
 }

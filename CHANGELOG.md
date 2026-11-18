@@ -5,6 +5,40 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Result-level gaps of wave 18 (wave 19, unit `result_gaps`)
+
+- Fixes (ungated): the pin's top-N sorter — under an ORDER BY the loop
+  does not deliver, with a LIMIT and no DISTINCT, a row's ORDER BY key
+  is computed first and a row whose key is not below the largest of
+  the OFFSET + LIMIT rows held is skipped with no result column
+  computed (top level, streamed rows, FROM / IN subqueries, views and
+  CTEs read once, groups, windows, joins, each UNION ALL core of a
+  compound's merge; not a scalar subquery, an INSERT's SELECT, a
+  materialized CTE or an ORDER BY an index delivers in part). Every
+  projection computes the ORDER BY key before the result columns and
+  takes a column the key repeats from it.
+- A WITHOUT ROWID table read in its own order keeps its delivering
+  loop, so `ORDER BY k, abs(-9223372036854775808)` answers.
+- A lone FROM subquery's order delivers its reader's GROUP BY (either
+  direction): groups in its order, a group ending at the next key.
+- A subquery's ORDER BY ordinal or alias under COLLATE is that result
+  column for its reader (`SubPlan::ob_refs`).
+- An EXISTS computes no result column, ORDER BY or DISTINCT of its
+  UNION / UNION ALL cores; its aggregates, HAVING and windows still run.
+- A TEMP CREATE TABLE ... AS reading main keeps a FLEXNUM column's REAL.
+- A CTE reference counts one toward the "nested too deep" limit, plus
+  one per view or FROM subquery that expanded references
+  (`count_selects` removed).
+- The statement arena: the routers' token copies are rewound when a
+  statement stays on main, and an arena's last chunk takes its whole
+  remaining budget (was one exact chunk per allocation), so a VALUES
+  list of 3,400 non-constant rows reads under the default 64 KiB.
+- Without `sql`, the synchronous executor skips the OFFSET's rows and
+  the top-N sorter's before their columns.
+- Found on the way: a derived table's fifth equal column name is `:4`, as
+  on the pin (hipp refused it).
+- Sizes: tiny unchanged; full +3,896 B, max +4,460 B, xl +3,452 B.
+
 ### ATTACH parity (wave 19, unit `attach`, leaf `attach`)
 
 - A string literal is a name where the pin's grammar takes one

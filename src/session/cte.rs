@@ -42,12 +42,17 @@ use crate::sql::{
     CompoundOp, Cte, CteUse, FromSource, JoinKind, M10d, RecMark, UpsertAction, With,
 };
 
-/// How many SELECTs the expansion of one statement may copy out of
-/// view and CTE bodies before a CTE reference is refused (the pin's
-/// "VIEWs and/or subqueries nested too deep", `NestedTooDeep`:
-/// probed, a chain of 999 CTEs reads and 1000 do not; the copies of
-/// views read before count as well). It also bounds the work of a
-/// CTE whose references double at each level.
+/// The count past which a CTE reference is refused (the pin's
+/// "VIEWs and/or subqueries nested too deep", `NestedTooDeep`).
+/// Probed on the pin (v0.17): each CTE reference, view and written
+/// FROM subquery the expansion meets counts one, whatever its body's
+/// size (three reads of a 450-arm CTE expand), and only a CTE
+/// reference checks the count: a chain of 999 CTEs reads and 1,000 do
+/// not, 999 `(SELECT x FROM c)` read and 1,000 do not, 998 inside one
+/// FROM subquery read and 999 do not, 1,500 views or FROM subqueries
+/// without a CTE read, and 1,100 views before one reference do not. It
+/// also bounds the work of a CTE whose references double at each
+/// level.
 const MAX_COPIES: usize = 1000;
 
 /// What a reference to a CTE means while that CTE's own body is
@@ -858,6 +863,7 @@ impl Expander<'_> {
             return Ok(());
         }
         if let Some(d) = &mut f.derived {
+            self.copies = self.copies.saturating_add(1);
             self.select::<E>(d)?;
             // Under RETURNING, a FROM subquery is computed once for
             // the statement.
@@ -1102,7 +1108,7 @@ impl Expander<'_> {
             self.nest -= 1;
             return Err(e);
         }
-        self.copies = self.copies.saturating_add(count_selects(&select));
+        self.copies = self.copies.saturating_add(1);
         // A view's body sees no CTE of the query that reads it.
         let vis = core::mem::take(&mut self.vis);
         self.views.push(copy_vec(name));
@@ -1157,7 +1163,7 @@ impl Expander<'_> {
             Busy::Circular => return Err(schema_err(SchemaKind::CircularReference)),
             Busy::MultiRec => return Err(schema_err(SchemaKind::RecursiveReferences)),
         }
-        self.copies = self.copies.saturating_add(count_selects(&cte.select));
+        self.copies = self.copies.saturating_add(1);
         if self.copies >= MAX_COPIES {
             return Err(schema_err(SchemaKind::NestedTooDeep));
         }
@@ -1271,6 +1277,12 @@ impl Expander<'_> {
                 }
                 for s in core.from.as_mut_slice() {
                     if is_ref(s, name, self.arena) {
+                        // (The pin resolves the recursive reference as a
+                        // CTE reference: it counts too, v0.17.)
+                        self.copies = self.copies.saturating_add(1);
+                        if self.copies >= MAX_COPIES {
+                            return Err(schema_err(SchemaKind::NestedTooDeep));
+                        }
                         s.cte = Some(Box::new(CteUse {
                             columns: AVec::new(),
                             rec: RecMark::Ref { id },
@@ -1715,71 +1727,6 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut AVec<&'e Expr>) {
         }
         _ => out.push(e),
     }
-}
-
-/// How many SELECTs `s` holds: its cores, and those of its derived
-/// tables, subqueries and WITH clause.
-fn count_selects(s: &SelectStmt) -> usize {
-    let mut n = 0usize;
-    count_into(s, &mut n);
-    n
-}
-
-fn count_into(s: &SelectStmt, n: &mut usize) {
-    count_core(s, n);
-    // (The rows of a VALUES chain are one SELECT here, as before the
-    // chain was read row by row: v0.17 review fix, the pin reads a CTE
-    // of 3,000 chained rows.)
-    for (_, c) in s.compound.iter() {
-        if c.values.is_empty() {
-            count_core(c, n);
-        }
-    }
-    for (e, _) in s.order_by.iter() {
-        count_expr(e, n);
-    }
-    if let Some(w) = &s.with {
-        for c in w.ctes.iter() {
-            count_into(&c.select, n);
-        }
-    }
-}
-
-fn count_core(s: &SelectStmt, n: &mut usize) {
-    *n = n.saturating_add(1);
-    for it in s.items.iter() {
-        if let SelectItem::Expr(e, ..) = it {
-            count_expr(e, n);
-        }
-    }
-    for f in s.from.iter() {
-        if let Some(d) = &f.derived {
-            count_into(d, n);
-        }
-        if let Some(on) = &f.on {
-            count_expr(on, n);
-        }
-    }
-    for e in s
-        .filter
-        .iter()
-        .chain(s.having.iter())
-        .chain(s.group_by.iter())
-    {
-        count_expr(e, n);
-    }
-}
-
-fn count_expr(e: &Expr, n: &mut usize) {
-    crate::rules::expr_any(e, &mut |x| {
-        match x {
-            Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) | Expr::InSubquery(_, s, _) => {
-                count_into(s, n)
-            }
-            _ => {}
-        }
-        false
-    });
 }
 
 /// Whether FROM source `s` is a direct (recursive) reference to
@@ -2249,7 +2196,7 @@ impl<S: Storage> Statement<'_, S> {
             let mut r = Ok(());
             for step in steps.iter() {
                 match self
-                    .exec_subplan_core(step, outer, None, None, (0, usize::MAX))
+                    .exec_subplan_core(step, outer, None, None, (0, usize::MAX, usize::MAX))
                     .await
                 {
                     Ok(produced) => {

@@ -11,6 +11,218 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: result_gaps — result-level wrong answers left by wave 18 (2026-11-18)
+
+Wave 19's second unit (owner decision 2026-11-18: SQLite 3.54.1
+parity continues): the result-level honest gaps `order_offset` and
+`values_chain` recorded (and their review fixes), each probed on the
+live pin first (notes below), fixed at the root and differential-tested.
+All ungated fixes on claimed paths (ADR 0001); no new leaf. Eight of
+the nine items are closed (item 9's scan found and fixed one more: an
+EXISTS computed its result columns); what stays open is listed below.
+
+**Shipped.**
+1. **The pin's top-N sorter** (item 1; `TopN`, `pre_skip`'s third
+   bound): under an ORDER BY the loop does not deliver, with a LIMIT
+   and no DISTINCT, select.c's `pushOntoSorter` holds OFFSET + LIMIT
+   rows and loads a row's result columns only after its key entered
+   (`pDeferredRowLoad` after `OP_IfNotZero` / `OP_IdxLE`): a row whose
+   key is not below the largest it holds is skipped with no column
+   computed, ties never entering. Every projection now computes the
+   ORDER BY key first, and a result column the key repeats is taken
+   from it, never computed again (`key_col`; it was computed twice,
+   so `random()` there drew twice): the top level (the materializing
+   and streamed executors, the synchronous `query`-only one), FROM /
+   IN subqueries, views and CTEs read once (co-routines), groups
+   (every group's aggregates still finish first, as the pin's
+   AggFinal does), window queries (rows in the window's order), joins,
+   and each core of a compound's merge whose operators to its right
+   are all UNION ALL (`arm_top`: `multiSelectOrderBy`'s `regLimitA` /
+   `regLimitB`, the core sorted by the compound ORDER BY). Not: a
+   scalar subquery or an INSERT's SELECT (registers the pin
+   preallocates, `iSdst` set: `Statement::dest`), a materialized CTE,
+   DISTINCT, an ORDER BY an index delivers in part (`nOBSat`: the row
+   loads first). The sorter holds its own LIMIT's rows whatever its
+   reader takes (found by the corpus).
+2. **A WITHOUT ROWID table read in its own order keeps the loop that
+   delivers its ORDER BY** (item 2; `xplan::best_access`): the
+   executor knows the delivered order, so `ORDER BY k,
+   abs(-9223372036854775808)` over NOT NULL columns answers.
+3. **A lone FROM subquery's order delivers its reader's GROUP BY**
+   (item 3; `groups_adjacent`, `sub_delivers` under `WHERE_GROUPBY`,
+   direction and NULLS placement ignored): the groups come in the
+   subquery's order and a group ends where the next row's key differs
+   (`ORDER BY x COLLATE BINARY` under a NOCASE GROUP BY makes `A` and
+   `a` two groups, as on the pin). An index walk's groups close the
+   same way (one comparison per row, not a search of every group).
+4. **A subquery's ORDER BY written as an ordinal or alias under COLLATE
+   is that result column** (item 4; `SubPlan::ob_refs`, `written_refs`:
+   the pin's `resolveOrderGroupBy` strips the COLLATE before
+   `iOrderByCol`), so its reader keeps its order (`ORDER BY 1 COLLATE
+   BINARY LIMIT 10` read `ORDER BY x` is BINARY order); a column name
+   or expression under COLLATE is none.
+5. **A TEMP CREATE TABLE ... AS that reads main keeps a FLEXNUM
+   column's REAL** (item 5; `TempFeed::flex`): the temp INSERT takes
+   the column without affinity and the other values with NUMERIC.
+6. **The statement arena holds a long VALUES list** (item 6): the
+   recorded cause was not the chain — a non-constant row cost 24
+   bytes of arena beyond its text, constant ones nothing, because the
+   ATTACH and TEMP routers each lexed the statement into the arena
+   (every name copied three times), and a chunk that missed the
+   geometric size fell back to one exact chunk per allocation. The
+   routers' copies are rewound when the statement stays on main, and
+   the last chunk takes the rest of the budget (`Arena::alloc_pos`):
+   a row now costs its text plus one copy of its names, so 3,400
+   `(random())` rows (was 1,866) or 2,000 `((SELECT i))` rows read
+   under the default 64 KiB arena. A statement whose text and names
+   exceed `Config::stmt_max` still fails (by design; the pin has no
+   such arena).
+7. **A CTE reference counts one toward the "nested too deep" limit**
+   (item 7; `MAX_COPIES`): probed, the pin counts each CTE reference
+   (1,000 fail), whatever its body's size, plus one for each view or
+   written FROM subquery inside which references were expanded; a
+   view or FROM subquery without one counts nothing. hipp counted the
+   SELECTs of every copied body, so three reads of a 450-arm CTE (and
+   MATERIALIZED ones, and 600-CTE chains inside a view) were refused;
+   `count_selects` is gone.
+8. **Without `sql`, the synchronous executor skips the OFFSET's rows
+   and the top-N sorter's** (item 8; `project_rows` with `pre_skip`).
+9. **An EXISTS computes no result column, ORDER BY or DISTINCT** of a
+   UNION / UNION ALL core (found by item 9's scan while probing item
+   1; `DEST_EXISTS`, `mark_exists_inert`): the pin's `SRT_Exists`
+   codes no column and `IgnorableOrderby` drops its ORDER BY and
+   DISTINCT, a UNION being a UNION ALL there (its plan says so), so
+   `EXISTS (SELECT abs(-9223372036854775808) FROM t)` is 1 and
+   `EXISTS (SELECT DISTINCT a FROM t LIMIT 1 OFFSET 2)` counts rows.
+   Its aggregates still step and finish (a `sum()` overflow fails),
+   its HAVING and window terms run, and an INTERSECT / EXCEPT core
+   computes its values.
+
+**Oracle-probing notes** (live pin; EXPLAIN for the opcode order).
+Top-N: `EXPLAIN SELECT CASE .. FROM t ORDER BY b LIMIT 1` codes
+`Column b; Sequence; IfNotZero; Last; IdxLE; Delete` before the CASE's
+columns, `MakeRecord`, `IdxInsert`; the scalar form (`SELECT (SELECT
+.. LIMIT 1)`) codes the CASE before the key (`iSdst` set: no
+`pDeferredRowLoad`). Rows `(2,1),(3,2),(1,5),(4,0)` with `a=1`
+overflowing: `ORDER BY b LIMIT 1` / `LIMIT 2` / `LIMIT 1 OFFSET 1` /
+`b NULLS LAST` / `-b DESC` / `b+0` / `(SELECT t.b)` / `rowid DESC`
+answer; `LIMIT 3`, `LIMIT 1 OFFSET 2`, `LIMIT -1`, no LIMIT,
+`b DESC`, DISTINCT, `ORDER BY x` for its alias, a scalar subquery, an
+INSERT ... SELECT, a CTE read twice or MATERIALIZED fail; FROM / IN
+subqueries, a view, a CTE read once, CREATE TABLE AS, a join's FROM
+subquery after a table, `GROUP BY b ORDER BY b+0` / `sum(b)`, `sum(a)
+OVER ()`, `row_number() OVER (ORDER BY b)` answer, `OVER (ORDER BY
+a)` fails (the window's order brings the row first); ties (`ORDER BY
+b >= 1 LIMIT 1`) skip the equal key. Compounds: `b, X FROM t UNION
+ALL SELECT 9, 9 ORDER BY 1 LIMIT 1` / `LIMIT 2` / `LIMIT 1 OFFSET 1`
+answer, `UNION` and no LIMIT fail. WITHOUT ROWID: `w(k NOT NULL, v
+NOT NULL, z)`: `ORDER BY k, X` answers, `k, v, X` fails (`LAST TERM
+OF ORDER BY`). GROUP BY over a co-routine: `(.. ORDER BY 1 DESC)
+GROUP BY x` is `C, b, A, 1, NULL`; `ORDER BY x COLLATE BINARY DESC`
+under NOCASE `x` gives seven groups; `GROUP BY y, x` over `ORDER BY 1,
+2` sorts (positional); `NULLS FIRST` delivers; a join, an ORDER BY
+with only count() (the subquery's ORDER BY omitted) and `GROUP BY +x`
+sort. COLLATE ordinal: `ORDER BY 1 COLLATE BINARY LIMIT 10` / alias
+`x COLLATE BINARY` keep BINARY order under the reader's `ORDER BY x`;
+`c COLLATE BINARY`, `+x COLLATE BINARY` re-sort; a reader's own
+alias under COLLATE sorts. TEMP CTAS: `CAST(1 AS REAL) UNION ALL
+SELECT r FROM t` is `1.0|real` on the pin (`x NUM`). Arena (64 KiB,
+`Statement::arena_high_water`): `(abs(i))` rows cost 24 B each beyond
+their text before, 8 B after; `(i)` rows nothing. CTE limit, bisected
+on the pin: a chain of 999 CTEs reads, 1,000 fail; doubling chains
+fail at 1,023 references (9 levels read); 999 `(SELECT x FROM c0)`
+read, 1,000 fail (also MATERIALIZED, also as an IN list); inside one
+FROM subquery 998 read, 999 fail; inside two, 997 / 998; inside three,
+996 / 997; `(SELECT x FROM (SELECT x FROM c0))` counts two (500
+fail), two references in one FROM subquery three (334 fail); 1,500
+FROM subqueries without a CTE read; a view counts nothing (400 views
+of views read) unless it expands a CTE (`vc`: 500 fail); a recursive
+CTE counts its own reference too. EXISTS: `SELECT abs(..)`, `ORDER BY
+abs(..)`, `DISTINCT .. OFFSET 2`, `max(a), abs(..)`, `abs(sum(b) -
+..)`, `row_number() OVER (), abs(..)`, VALUES rows, UNION / UNION ALL
+cores (also after a non-empty one, and an INTERSECT on the left) are
+not computed (1); `sum()` overflow, HAVING, `OVER (ORDER BY abs(..))`,
+`SELECT * FROM (SELECT abs(..))`, INTERSECT / EXCEPT cores fail; the
+plan of `EXISTS (.. UNION SELECT y)` says `UNION ALL`.
+Found on the way: a derived table's fifth equal column name is `:4`
+(`sqlite3ColumnsFromExprList` forms it before switching to random
+suffixes at `cnt > 3`); hipp refused it (`rules::unique_names`), so
+`SELECT 1 FROM (SELECT (SELECT 1), ... x5)` was `Unsupported`.
+
+**Tests.** `tests/result_gaps_v17.rs` (11 tests, rows in order and,
+where shapes allow, plans against the live pin): 70 top-N shapes
+(every destination, groups, windows, joins, partial index orders,
+compound merges, reader bounds), 7 write scripts (INSERT ... SELECT,
+CREATE TABLE AS, UPDATE / DELETE subqueries), a generated top-N corpus
+of 240 queries over six row orders (xorshift; at least a quarter
+answer on the pin), 14 WITHOUT ROWID shapes, 31 co-routine GROUP BY
+shapes, 19 collated-ordinal shapes, 45 EXISTS shapes, 55 CTE-count
+boundaries (each probed limit on both sides of it), 5 equal-name
+shapes, 9 TEMP CTAS scripts and 12 long VALUES lists under the
+default arena. `tests/offset_query_v17.rs` (2 tests): 24 OFFSET /
+top-N shapes in the `query` grammar on the default build and,
+through a nested `cargo test --no-default-features --features
+std,query`, on the synchronous executor. `hipp-cli/tests/cli_v17_result_gaps.rs`
+(5 tests): the same fixes on stdin scripts and one-shot arguments,
+byte for byte; the top-N, EXISTS and co-routine GROUP BY scripts run
+only when the shell is not on the frozen VM (`on_vm`, see the gaps).
+Existing suites whose expectations moved: none (every v16 / v17
+suite passes unchanged).
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh` (fmt, clippy on
+default / all features / every feature set, workspace tests, the
+`--features vm` workspace suite with the frozen VM's strict suites,
+no_std builds for thumbv7em / thumbv6m / riscv32imac / wasm32, the four
+size gates): all gates passed. `tests/depth_v16.rs`,
+`tests/depth_tiny_v16.rs` and `tests/triggers_v16.rs` with debug info:
+pass (no `STACK_*` change; see the gaps for the pre-existing
+debug-info `--features vm` overflow of `depth_tiny_v16`).
+
+**Size Δ.** tiny 0 (76,928); full +3,896 (490,396 → 494,292); max
++4,460 (981,700 → 986,160); xl +3,452 (1,084,848 → 1,088,300).
+Ratchets raised to the measured figures with a reason each
+(`ci/size-ratchet.toml`). Offsets taken first: `count_selects` and
+`shown_keys` removed, the five projections' key / column loops shared
+in one `keyed` helper (-640 B on full against inline loops). `keyed` and the merge cores' ORDER BY copies are boxed (+136 B
+on full) so the projections' futures stay small: inline, a debug
+`--features vm` build's step overflowed `depth_tiny_v16`'s 512 KiB
+thread (`prepare`'s future is now 5,648 B, was 5,616; `step`'s is
+6,648 B, unchanged).
+
+**Honest gaps.**
+- The top-N sorter's partly delivered ORDER BY (`nOBSat > 0`, where
+  the pin loads every row first) is read from the first source's
+  index access only: a join path's or a window's own order that
+  delivers a prefix still defers in hipp. A FROM subquery the pin
+  materializes because it follows another subquery or an outer join
+  (`fromClauseTermCanBeCoroutine`) defers in hipp too; a trigger
+  body's SELECT (`SRT_Discard`, ORDER BY dropped) is not modelled.
+- The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) keeps its
+  own sorter, grouping and EXISTS handling: the library suites run
+  on today's executor under `vm`, and the CLI suite checks those
+  shapes only off the VM.
+- EXPLAIN QUERY PLAN still lists an EXISTS result column's
+  subqueries (the pin codes none; rows match).
+- `UPDATE ... WHERE x IN (...)` counts one more toward the CTE limit
+  on the pin (999 references fail there, 1,000 in hipp).
+- A statement whose text and names exceed `Config::stmt_max` still
+  fails with `ArenaExhausted` (by design; the pin has no such arena);
+  a derived table's sixth equal column name takes a random suffix on
+  the pin and stays `Unsupported` in hipp.
+- Observed, pre-existing: `tests/depth_tiny_v16.rs` overflows its
+  512 KiB thread in a debug-info `--features vm` build at the base
+  commit too (c5cd9b4, checked in a scratch clone); this unit's
+  futures stay within 32 B of the base's (`prepare` 5,648 B, `step`
+  6,648 B), and the gates' debug-free `--features vm` run passes.
+- Item 9's scan left (each needs planner or naming work beyond this
+  unit): `rowid = 1 COLLATE bogus` (the pin refuses the commuted form
+  and the term beside another one, so its rule is not the access path
+  alone), a trigger's `new.k` naming a VALUES column, two unaliased
+  pure chains' `*` ambiguity, a later group's error after printed
+  groups in hipp-cli, a co-routine's join order and partial order
+  match, a GROUP BY over a WITHOUT ROWID clustered index's NOT NULL
+  test, the omission under a window reader or UPDATE ... FROM.
+
 ### Parity: attach — ATTACH refusals and index access into attached databases (2026-11-18)
 
 Wave 19's unit (owner decision 2026-11-18: SQLite 3.54.1 parity
@@ -389,10 +601,11 @@ a shared `late` helper measured +104 B and was not kept.
   fixes — `inert_aggregates_on_the_vm` runs on the VM).
 - Item 7's scan of the older honest gaps found the alias push-down
   (fixed, item 7); left as recorded: a GROUP BY over a co-routine's
-  order and its partial ORDER BY match, a subquery's `ORDER BY 1
-  COLLATE BINARY` as column 1, a WITHOUT ROWID natural scan's ORDER BY
-  (`order_offset`'s gaps, planner work), and the push-down without
-  `planner` (by design, ADR 0004).
+  order (closed in v0.17: result_gaps) and its partial ORDER BY match,
+  a subquery's `ORDER BY 1 COLLATE BINARY` as column 1 (closed in
+  v0.17: result_gaps), a WITHOUT ROWID natural scan's ORDER BY (closed
+  in v0.17: result_gaps), and the push-down without `planner` (by
+  design, ADR 0004).
 
 **Review fixes (2026-11-17).** Eleven findings, each reproduced on the
 live pin first; all ungated fixes on claimed paths (`sql`, the
@@ -502,14 +715,14 @@ the VM); `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
 Size Δ of the review fixes: tiny 0 (76,928); full +2,992 (487,404 → 490,396); max +184 (976,508 → 976,692); xl +3,008 (1,074,624 → 1,077,632). Ratchets raised to the measured figures with a reason each; no offsetting saving found (`#[inline(never)]` on the new helpers measured +8 B on full and was dropped). max grows less than full: layout.
 
 Honest gaps the review fixes leave (new or found on the way):
-- A VALUES chain of a few thousand non-constant rows exhausts the
+- (closed in v0.17: result_gaps) A VALUES chain of a few thousand non-constant rows exhausts the
   default statement arena (`Config::stmt_max`; each row is a compound
   core now) where the pin reads it; the CLI's larger arena reads them.
-- A CTE whose body is a SELECT compound is copied per reference into
+- (closed in v0.17: result_gaps) A CTE whose body is a SELECT compound is copied per reference into
   the expansion's 1,000-SELECT limit (`MAX_COPIES`), so three uses of a
   450-arm CTE are "nested too deep" in hipp and read on the pin
   (pre-existing).
-- A TEMP CREATE TABLE ... AS inserts through the temp connection, so a
+- (closed in v0.17: result_gaps) A TEMP CREATE TABLE ... AS inserts through the temp connection, so a
   FLEXNUM column's REAL is stored as NUMERIC there (`2` for `2.0`).
 - A push-down through a merged body that the splice then gives up
   (hipp's own restrictions) loses the term in the arms, as before.
@@ -734,7 +947,7 @@ every DISTINCT check, `dedup_compound_rows` and `stream::rowid_order`
 removed.
 
 **Honest gaps.**
-- A GROUP BY over a co-routine's order: the pin's `wherePathMatchSubqueryOB`
+- (closed in v0.17: result_gaps) A GROUP BY over a co-routine's order: the pin's `wherePathMatchSubqueryOB`
   also delivers a GROUP BY (direction ignored), so its groups come in
   the subquery's order (`SELECT x, group_concat(n) FROM (SELECT c AS
   x, n FROM t ORDER BY 1 DESC) GROUP BY x` is C, b, A, NULL); hipp
@@ -745,19 +958,19 @@ removed.
   ORDER BY (rows differ only if the reader's collation splits the
   subquery's runs differently; EQP differs). A co-routine in a join
   delivers nothing in hipp (it keeps FROM order, pre-existing).
-- A subquery's `ORDER BY 1 COLLATE BINARY` is result column 1 on the
+- (closed in v0.17: result_gaps) A subquery's `ORDER BY 1 COLLATE BINARY` is result column 1 on the
   pin (the COLLATE of an integer term is stripped before
   `iOrderByCol`); hipp's resolved term is a COLLATE expression, so a
   reader's `ORDER BY x` is sorted again (rows in the reader's
   collation).
-- A WITHOUT ROWID table read in its own order (no access path, `SCAN
+- (closed in v0.17: result_gaps) A WITHOUT ROWID table read in its own order (no access path, `SCAN
   w`): `ORDER BY k, abs(..)` answers on the pin when the columns the
   pin walks past the key are NOT NULL, and fails in hipp — the plan
   (EXPLAIN QUERY PLAN) now matches, but the executor keeps no
   delivered order for a natural scan (it has no access path to carry
   it). Through an access path (`WHERE k > 0`, `k IN (..)`, DESC) it
   matches (review fix 7).
-- A sorter under a LIMIT computes every row's result columns in hipp;
+- (closed in v0.17: result_gaps) A sorter under a LIMIT computes every row's result columns in hipp;
   the pin's top-N sorter (select.c `pushOntoSorter` with
   `pDeferredRowLoad`, for SRT_Output / co-routine / scalar
   destinations, not a materialized one, no DISTINCT) computes the
@@ -768,7 +981,7 @@ removed.
   a window query's outer ORDER BY ... LIMIT and a grouped one (review
   finding 5; pre-existing, a separate mechanism from the OFFSET and
   delivered orders this unit fixes, recorded rather than built).
-- A subquery's ORDER BY alias under a COLLATE (`(SELECT c AS x, n FROM
+- (closed in v0.17: result_gaps) A subquery's ORDER BY alias under a COLLATE (`(SELECT c AS x, n FROM
   t ORDER BY x COLLATE NOCASE LIMIT 10) ORDER BY x`) is the same as
   `ORDER BY 1 COLLATE BINARY` above: the pin's term is result column
   1, so the reader keeps the subquery's NOCASE order (`NULL, 1, A, a,
@@ -779,7 +992,7 @@ removed.
 - The omission is not applied under a window function's reader (the
   pin's rewrite moves the FROM clause into a subquery that keeps or
   drops the ORDER BY by its own rules), nor for UPDATE ... FROM.
-- Without `sql` (the `query`-only builds) the synchronous projection
+- (closed in v0.17: result_gaps) Without `sql` (the `query`-only builds) the synchronous projection
   still computes an OFFSET row's columns.
 - The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) keeps its
   own OFFSET handling (it computes a skipped row's columns and skips a
