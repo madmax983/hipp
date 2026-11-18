@@ -630,28 +630,6 @@ impl<'a> Walk<'a> {
         // than UNION ALL (all of it under an ORDER BY), as hipp's
         // executor does (`session::run_compound`); the UNION ALL
         // members after that are appended.
-        // The pin's UNION-with-LIMIT-1 shortcut reads the members as
-        // UNION ALL ones until a row is found (`union_first_row`).
-        if s.comp_order == 0
-            && s.offset.is_none()
-            && matches!(s.limit, Some(RExpr::Literal(OwnedValue::Integer(1))))
-            && s.cores
-                .iter()
-                .skip(1)
-                .all(|(op, _)| *op == CompoundOp::Union)
-        {
-            let mut all = Sel {
-                cores: AVec::new(),
-                comp_order: 0,
-                limit: None,
-                offset: None,
-            };
-            for (_, c) in s.cores.iter() {
-                all.cores.push((CompoundOp::UnionAll, c.clone()));
-            }
-            self.chain(&all, n - 1, 0, parent);
-            return;
-        }
         let last = if s.comp_order > 0 {
             n - 1
         } else {

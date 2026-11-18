@@ -333,13 +333,7 @@ impl<S: Storage> Statement<'_, S> {
                 (0, 0),
                 (window.0, window.0.saturating_add(window.1)),
             );
-            Mode::Sort(
-                AVec::new(),
-                TopN {
-                    lim: top.2,
-                    heap: AVec::new(),
-                },
-            )
+            Mode::Sort(AVec::new(), TopN::new(top.2))
         } else if qp.distinct {
             Mode::Distinct(AVec::new())
         } else {
@@ -421,7 +415,9 @@ impl<S: Storage> Statement<'_, S> {
             if matches!(s.mode, Mode::Plain | Mode::Distinct(_)) && s.take == 0 {
                 return Ok(false);
             }
-            if !self.join_next(s).await? {
+            // (A partly delivered ORDER BY ends the loop at a prefix
+            // group past its LIMIT: `TopN::part`.)
+            if matches!(&s.mode, Mode::Sort(_, top) if top.done) || !self.join_next(s).await? {
                 self.stream_finish(s).await?;
                 return Ok(false);
             }

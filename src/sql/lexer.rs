@@ -1067,7 +1067,15 @@ fn lex_inner<E>(
                         i += 1;
                     }
                 }
-                let h = arena.alloc_copy_handle(buf.as_slice())?;
+                // (Without an escape the literal is its own text.)
+                #[cfg(feature = "query")]
+                let lit = match sql.get(off.saturating_add(1)..i.saturating_sub(1)) {
+                    Some(raw) if raw == buf.as_slice() => raw,
+                    _ => buf.as_slice(),
+                };
+                #[cfg(not(feature = "query"))]
+                let lit = buf.as_slice();
+                let h = arena.handle_or_copy(lit)?;
                 // ... and so is one after a dot (`aux.'t'`).
                 #[cfg(feature = "attach")]
                 let after_dot = matches!(toks.as_slice().last(), Some(Token { tok: Tok::Dot, .. }));
@@ -1118,7 +1126,7 @@ fn lex_inner<E>(
                 if i >= n {
                     return Err(perr(off, ParseKind::UnexpectedEof));
                 }
-                let h = arena.alloc_copy_handle(&sql[start..i])?;
+                let h = arena.handle_or_copy(&sql[start..i])?;
                 i += 1;
                 toks.push(Token {
                     tok: Tok::Ident(h, true),
@@ -1240,7 +1248,7 @@ fn lex_inner<E>(
                 while i < n && is_ident_char(sql[i]) {
                     i += 1;
                 }
-                let h = arena.alloc_copy_handle(&sql[start..i])?;
+                let h = arena.handle_or_copy(&sql[start..i])?;
                 toks.push(Token {
                     tok: Tok::Ident(h, false),
                     offset: off,

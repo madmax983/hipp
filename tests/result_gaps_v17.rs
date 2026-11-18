@@ -1034,3 +1034,405 @@ fn long_values_lists_fit_the_default_arena() {
         }
     }
 }
+
+// ------------------------------------------------- review fixes
+
+/// The pin's UNION-with-LIMIT-1 shortcut (review fix): a compound
+/// with no ORDER BY or OFFSET and a LIMIT of exactly 1 reads the
+/// UNIONs of its trailing run of UNION / UNION ALL operators as UNION
+/// ALL (also an EXISTS, whose ORDER BY is dropped, or a scalar
+/// subquery without a LIMIT); with another LIMIT or an OFFSET an
+/// EXISTS over a UNION merges and deduplicates, computing every core
+/// (regression: `mark_exists_inert` made every UNION a UNION ALL).
+#[test]
+fn union_limit_one_shortcut_and_exists_merges() {
+    let schema = "CREATE TABLE t(a,b); INSERT INTO t VALUES(2,1),(3,2),(1,5),(4,0),(2,7);";
+    let bad = BAD;
+    let mut qs: Vec<String> = [
+        // The reviewer's repro and its neighbours.
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t LIMIT 2 OFFSET 4), EXISTS (SELECT 1 FROM t UNION SELECT 1 FROM t LIMIT 1 OFFSET 1)",
+        "SELECT EXISTS (SELECT a FROM t UNION ALL SELECT a FROM t UNION SELECT a FROM t LIMIT 1 OFFSET 4)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t UNION ALL SELECT 5 LIMIT 1 OFFSET 4)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t UNION ALL SELECT 5 LIMIT 1 OFFSET 5)",
+        "SELECT EXISTS (SELECT DISTINCT a FROM t LIMIT 1 OFFSET 4)",
+        "SELECT EXISTS (SELECT a FROM t UNION ALL SELECT a FROM t ORDER BY 1 LIMIT 1 OFFSET 9)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t ORDER BY 1 LIMIT 1 OFFSET 4)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t LIMIT 0)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t LIMIT -1 OFFSET 4)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t LIMIT -1)",
+        "SELECT EXISTS (SELECT a FROM t EXCEPT SELECT a FROM t UNION SELECT 1 LIMIT 1 OFFSET 0)",
+        "SELECT EXISTS (SELECT a, b FROM t UNION SELECT a, b FROM t LIMIT 1 OFFSET 4)",
+        // Top level, FROM subqueries, CTEs, views and scalar subqueries.
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 1",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT +1",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT -(-1)",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 0x1",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT (1)",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 0+1",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT '1'",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 1.0",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 2",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 1 OFFSET 0",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 1 OFFSET 1",
+        "SELECT a FROM t UNION SELECT a FROM t LIMIT 0, 1",
+        "SELECT a FROM t UNION SELECT a FROM t ORDER BY 1 DESC LIMIT 1",
+        "SELECT a FROM t UNION ALL SELECT 3 UNION SELECT a FROM t LIMIT 1",
+        "SELECT a FROM t UNION SELECT 3 UNION ALL SELECT a FROM t LIMIT 1",
+        "SELECT a FROM t INTERSECT SELECT a FROM t UNION SELECT 0 LIMIT 1",
+        "SELECT a FROM t EXCEPT SELECT 1 UNION SELECT 0 LIMIT 1",
+        "SELECT a FROM t UNION SELECT a FROM t EXCEPT SELECT 9 UNION SELECT 0 LIMIT 1",
+        "SELECT b FROM t UNION SELECT a FROM t INTERSECT SELECT a FROM t LIMIT 1",
+        "SELECT a, count(*) FROM t GROUP BY a UNION SELECT b, 0 FROM t LIMIT 1",
+        "SELECT * FROM (SELECT a FROM t UNION ALL SELECT 3 UNION SELECT a FROM t LIMIT 1)",
+        "WITH c(x) AS (SELECT b FROM t UNION SELECT a FROM t LIMIT 1) SELECT * FROM c",
+        "SELECT (SELECT a FROM t UNION ALL SELECT 3 UNION SELECT a FROM t)",
+        "SELECT (SELECT a FROM t UNION ALL SELECT 3 UNION SELECT a FROM t LIMIT 1)",
+        "SELECT (SELECT a FROM t UNION SELECT a FROM t LIMIT 1)",
+        "SELECT (SELECT b FROM t UNION SELECT a FROM t LIMIT 0x1)",
+        "SELECT (SELECT b FROM t UNION SELECT a FROM t LIMIT (1))",
+        "SELECT (SELECT a FROM t UNION SELECT a FROM t LIMIT 2)",
+        "SELECT (SELECT a FROM t UNION SELECT a FROM t LIMIT 1 OFFSET 0)",
+        "SELECT (SELECT b FROM t UNION SELECT a FROM t ORDER BY 1 DESC)",
+        "SELECT 1 UNION ALL SELECT 2 UNION SELECT 1 LIMIT 1",
+    ]
+    .iter()
+    .map(|q| q.to_string())
+    .collect();
+    // Errors: a merge computes every core; the shortcut stops at its
+    // first row; a collation the merge would need is never looked up.
+    for q in [
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B LIMIT 2)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B LIMIT -1)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B LIMIT 1 OFFSET 0)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B LIMIT 1)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B ORDER BY 1)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B ORDER BY 1 LIMIT 1)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B ORDER BY 1 LIMIT 2)",
+        "SELECT EXISTS (SELECT a FROM t UNION ALL SELECT a FROM t UNION SELECT $B LIMIT 1)",
+        "SELECT EXISTS (SELECT a FROM t UNION ALL SELECT 1 UNION SELECT $B LIMIT 2)",
+        "SELECT EXISTS (SELECT $B FROM t UNION SELECT 1 UNION ALL SELECT 2 LIMIT 1)",
+        "SELECT EXISTS (SELECT $B FROM t UNION SELECT 1 UNION ALL SELECT 2 LIMIT 2)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT 1 UNION ALL SELECT $B LIMIT 1)",
+        "SELECT EXISTS (SELECT a FROM t EXCEPT SELECT a FROM t UNION SELECT $B)",
+        "SELECT EXISTS (SELECT a FROM t EXCEPT SELECT a FROM t UNION SELECT $B LIMIT 2)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t EXCEPT SELECT $B)",
+        "SELECT EXISTS (SELECT a FROM t UNION SELECT $B LIMIT 0)",
+        "SELECT 1 UNION SELECT $B LIMIT 1",
+        "SELECT 1 UNION SELECT $B LIMIT 2",
+        "SELECT (SELECT 1 UNION SELECT $B)",
+        "SELECT (SELECT 1 UNION SELECT $B LIMIT 1)",
+        "SELECT a COLLATE bogus FROM t UNION SELECT 1 LIMIT 1",
+        "SELECT a COLLATE bogus FROM t UNION SELECT 1 LIMIT 2",
+    ] {
+        qs.push(q.replace("$B", bad));
+    }
+    let path = fresh("ul1", schema);
+    let mut bad = diffs_on(&path, &qs, true);
+    // (Rows only: these plans differ for reasons of their own — the
+    // pin sorts a VALUES merge arm in a temp b-tree, and builds Bloom
+    // filters for an IN list's cores.)
+    let rows_only: Vec<String> = [
+        "SELECT EXISTS (VALUES(1),(1) UNION SELECT 1 LIMIT 1 OFFSET 1)",
+        "SELECT 5 IN (SELECT b FROM t UNION SELECT a FROM t LIMIT 1)",
+        "SELECT 5 IN (SELECT b FROM t UNION SELECT a FROM t LIMIT 2)",
+    ]
+    .iter()
+    .map(|q| q.to_string())
+    .collect();
+    bad.extend(diffs_on(&path, &rows_only, false));
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// GROUP BY and an equal ORDER BY over a FROM subquery ordered by an
+/// ordinal under another collation (review fix): the subquery's order
+/// delivers both, so the groups come in its order with no sorter, as
+/// on the pin (hipp sorted them again under the column's collation).
+#[test]
+fn coroutine_collated_order_delivers_group_and_order() {
+    let schema = "CREATE TABLE t(c, n); INSERT INTO t VALUES('a',1),('A',2),('b',3),('B',4),(NULL,5),('a',6); \
+                  CREATE TABLE u(c TEXT COLLATE NOCASE, n); INSERT INTO u SELECT * FROM t;";
+    let mut qs: Vec<String> = [
+        "SELECT x, count(*) FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x",
+        "SELECT x, count(*) FROM (SELECT c AS x, n FROM u ORDER BY 1 COLLATE BINARY LIMIT 9) GROUP BY x ORDER BY x",
+        "SELECT x, count(*) FROM (SELECT c AS x, n FROM t ORDER BY x COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x",
+        "SELECT x, sum(n) FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE, 2 LIMIT 9) GROUP BY x ORDER BY x",
+        "SELECT x, count(*) FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x DESC",
+        "SELECT x, count(*) FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x LIMIT 2 OFFSET 1",
+        "WITH q AS (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) SELECT x, count(*) FROM q GROUP BY x ORDER BY x",
+        "SELECT * FROM (SELECT x, count(*) FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x)",
+        "SELECT x, count(*) FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x, count(*)",
+        "SELECT DISTINCT x FROM (SELECT c AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY x",
+    ]
+    .iter()
+    .map(|q| q.to_string())
+    .collect();
+    // A generated corpus of subquery orders and reader GROUP BY /
+    // ORDER BY shapes.
+    let mut r = Rng(0x5eed_c011);
+    for _ in 0..240 {
+        let tbl = r.pick(&["t", "u"]);
+        let ob = r.pick(&["1", "x", "c", "1, 2", "2", "x, n", "2, 1"]);
+        let coll = r.pick(&["", " COLLATE NOCASE", " COLLATE BINARY", " COLLATE RTRIM"]);
+        let dir = r.pick(&["", " DESC", " NULLS LAST", " DESC NULLS FIRST"]);
+        let lim = r.pick(&[" LIMIT 9", "", " LIMIT 4", " LIMIT 9 OFFSET 1"]);
+        let mut parts: Vec<String> = ob.split(", ").map(str::to_string).collect();
+        parts[0] = format!("{}{coll}{dir}", parts[0]);
+        let gb = r.pick(&["x", "x, n", "n, x", "x COLLATE NOCASE", "x COLLATE BINARY"]);
+        let rob = r.pick(&[
+            "",
+            " ORDER BY x",
+            " ORDER BY x DESC",
+            " ORDER BY x, n",
+            " ORDER BY 1",
+            " ORDER BY x COLLATE NOCASE",
+            " ORDER BY x COLLATE BINARY",
+            " ORDER BY x NULLS LAST",
+            " ORDER BY n, x",
+        ]);
+        let hav = r.pick(&["", "", " HAVING count(*) > 0"]);
+        let rl = r.pick(&["", "", " LIMIT 3", " LIMIT 2 OFFSET 1"]);
+        qs.push(format!(
+            "SELECT x, count(*), sum(n) FROM (SELECT c AS x, n FROM {tbl} ORDER BY {}{lim}) GROUP BY {gb}{hav}{rob}{rl}",
+            parts.join(", ")
+        ));
+    }
+    let path = fresh("cgo", schema);
+    let bad = diffs_on(&path, &qs, false);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// An ORDER BY an index delivers in part, under a LIMIT (review fix):
+/// the pin computes each row as it comes and ends its loop at the
+/// first row of the prefix group past OFFSET + LIMIT rows
+/// (`pushOntoSorter`'s `OP_IfNot iLimit`), so a later row's failing
+/// result column is never computed.
+#[test]
+fn partly_delivered_order_stops_at_the_limit_group() {
+    let x = format!("CASE WHEN a=9 THEN {BAD} ELSE a END");
+    let base =
+        "CREATE TABLE t(a,b);; INSERT INTO t VALUES(1,0),(7,0),(2,0),(3,1),(5,1),(9,2),(4,3);;";
+    let mut scripts: Vec<String> = Vec::new();
+    for lim in [
+        "LIMIT 1",
+        "LIMIT 2",
+        "LIMIT 3",
+        "LIMIT 4",
+        "LIMIT 5",
+        "LIMIT 1 OFFSET 2",
+        "LIMIT 1 OFFSET 3",
+        "LIMIT 2 OFFSET 2",
+        "LIMIT 3 OFFSET 1",
+        "LIMIT 0",
+        "LIMIT -1",
+    ] {
+        for (idx, q) in [
+            (
+                "CREATE INDEX tb ON t(b)",
+                format!("SELECT {x} FROM t WHERE b>=0 ORDER BY b, a {lim}"),
+            ),
+            (
+                "CREATE INDEX tba ON t(b,a)",
+                format!("SELECT b, {x} FROM t ORDER BY b, 2 {lim}"),
+            ),
+            (
+                "CREATE INDEX tb ON t(b)",
+                format!("SELECT * FROM (SELECT {x} FROM t WHERE b>=0 ORDER BY b, a {lim})"),
+            ),
+            (
+                "CREATE INDEX tb ON t(b)",
+                format!("SELECT (SELECT {x} FROM t WHERE b>=0 ORDER BY b, a {lim})"),
+            ),
+            (
+                "CREATE INDEX tb ON t(b)",
+                format!("SELECT count(*) FROM (SELECT {x} FROM t WHERE b>=0 ORDER BY b, -a {lim})"),
+            ),
+        ] {
+            scripts.push(format!("{base} {idx};; {q}"));
+        }
+    }
+    // The reviewer's repro.
+    scripts.push(format!(
+        "CREATE TABLE t(a,b);; INSERT INTO t VALUES(2,1),(3,2),(1,5),(4,0);; CREATE INDEX tb ON t(b);; \
+         SELECT {} FROM t WHERE b>=0 ORDER BY b, a LIMIT 1",
+        x.replace("a=9", "a=1")
+    ));
+    // A generated corpus (no DISTINCT: see the gaps).
+    let mut r = Rng(0x0b5a_7001);
+    for _ in 0..200 {
+        let rows: Vec<String> = (0..2 + r.n(8))
+            .map(|_| {
+                let a = r.pick(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "9"]);
+                let b = r.pick(&["0", "1", "2", "3", "NULL"]);
+                format!("({a},{b})")
+            })
+            .collect();
+        let idx = r.pick(&[
+            "CREATE INDEX tb ON t(b)",
+            "CREATE INDEX tba ON t(b,a)",
+            "CREATE INDEX tbd ON t(b DESC)",
+        ]);
+        let sel = r.pick(&["$X", "b, $X", "a, $X", "$X, a"]);
+        let ob = r.pick(&[
+            "b, a",
+            "b, 2",
+            "b, a DESC",
+            "b DESC, a",
+            "b, -a",
+            "b, a+0",
+            "b, $X",
+            "b NULLS LAST, a",
+        ]);
+        // (Not `b IS NOT NULL`: the pin's planner reads it as an index
+        // range, hipp's does not — see the gaps.)
+        let wh = r.pick(&["", "WHERE b>=0 ", "WHERE b>0 "]);
+        let lim = r.pick(&[
+            "LIMIT 1",
+            "LIMIT 2",
+            "LIMIT 3",
+            "LIMIT 1 OFFSET 1",
+            "LIMIT 2 OFFSET 2",
+            "LIMIT 0",
+            "LIMIT 5",
+            "LIMIT -1",
+        ]);
+        let wrap = r.pick(&[
+            "{}",
+            "{}",
+            "SELECT * FROM ({})",
+            "SELECT count(*) FROM ({})",
+        ]);
+        let q = wrap.replace(
+            "{}",
+            &format!("SELECT {sel} FROM t {wh}ORDER BY {ob} {lim}"),
+        );
+        scripts.push(format!(
+            "CREATE TABLE t(a,b);; INSERT INTO t VALUES{};; {idx};; {}",
+            rows.join(","),
+            q.replace("$X", &x)
+        ));
+    }
+    let owned: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    script_same("pobs", "", &owned);
+}
+
+/// A constant multi-row INSERT of a few thousand rows under the
+/// default statement arena (review fix): a statement's names and
+/// string literals are handles into its stored text
+/// (`Arena::handle_or_copy`), so the arena holds little beyond the
+/// text — 4,000 rows of `(i, 'xi')` (61,800 B) insert as on the pin.
+#[test]
+fn long_insert_values_fit_the_default_arena() {
+    let shapes: [(&str, &dyn Fn(usize) -> String); 4] = [
+        ("t", &|i| format!("({i}, 'x{i}')")),
+        ("t", &|i| format!("(abs({i}), 1)")),
+        ("t", &|_| "(random(), 1)".to_string()),
+        ("u", &|_| "(random())".to_string()),
+    ];
+    for (k, (tbl, row)) in shapes.iter().enumerate() {
+        for n in [3000usize, 4000] {
+            let rows: Vec<String> = (0..n).map(row).collect();
+            let ins = format!("INSERT INTO {tbl} VALUES {}", rows.join(","));
+            let path = fresh(
+                &format!("arena{k}{n}"),
+                "CREATE TABLE t(a,b); CREATE TABLE u(a);",
+            );
+            let path2 = fresh(
+                &format!("arena{k}{n}p"),
+                "CREATE TABLE t(a,b); CREATE TABLE u(a);",
+            );
+            assert!(
+                pin(&path2, &ins).is_ok(),
+                "pin refused {n} rows of shape {k}"
+            );
+            let p = pin(&path2, &format!("SELECT count(*) FROM {tbl}")).expect("pin count");
+            let got = block_on(async {
+                let fs = FileStorage::open(&path).expect("fs open");
+                let mut db = Connection::open(fs, Config::default()).await.expect("open");
+                let mut st = db.prepare(&ins).await.map_err(|e| format!("{e:?}"))?;
+                while st.step().await.map_err(|e| format!("{e:?}"))? == Step::Row {}
+                let hw = st.arena_high_water();
+                drop(st);
+                let rows = collect(&mut db, &format!("SELECT count(*) FROM {tbl}"))
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                Ok::<_, String>((hw, String::from_utf8_lossy(&rows).to_string()))
+            });
+            let (hw, h) = got.unwrap_or_else(|e| panic!("hipp refused {n} rows of shape {k}: {e}"));
+            assert_eq!(h, p, "{n} rows of shape {k}");
+            // (The text, and little more: no per-row copy.)
+            assert!(
+                hw <= ins.len() + 4096,
+                "{n} rows of shape {k}: {hw} B for {} B",
+                ins.len()
+            );
+        }
+    }
+}
+
+/// The "nested too deep" count is the pin's cursor numbers when a CTE
+/// reference expands (review fix): every FROM item a select's
+/// expansion assigns before its expressions, an UPDATE / DELETE
+/// target and its indexes, UPDATE ... FROM's join. Each shape is
+/// checked on both sides of the pin's boundary.
+#[test]
+fn cte_limit_counts_the_pins_cursors() {
+    let refs = |n: usize| vec!["(SELECT x FROM c0)"; n].join(",");
+    let schema = "CREATE TABLE u(x); INSERT INTO u VALUES(1); CREATE TABLE w(y); INSERT INTO w VALUES(1); \
+                  CREATE VIEW v AS SELECT x FROM u; CREATE VIEW v2 AS SELECT * FROM v; \
+                  CREATE TABLE ui(x); INSERT INTO ui VALUES(1); CREATE INDEX uix ON ui(x); CREATE INDEX uix2 ON ui(x);";
+    // (shape, the pin's first failing count)
+    let shapes: [(&str, usize); 30] = [
+        ("SELECT 1 WHERE 1 IN ({})", 1000),
+        ("SELECT 1 FROM u WHERE 1 IN ({})", 999),
+        ("SELECT count(*) FROM u WHERE x IN ({})", 999),
+        ("SELECT 1 FROM u WHERE 1 = coalesce({})", 999),
+        ("SELECT 1 FROM u GROUP BY x HAVING 1 IN ({})", 999),
+        ("SELECT 1 FROM u GROUP BY coalesce({})", 999),
+        ("SELECT 1 FROM u ORDER BY coalesce({})", 999),
+        ("SELECT 1 FROM u JOIN w ON 1 IN ({})", 998),
+        ("SELECT coalesce({}) FROM u", 999),
+        ("SELECT 1 FROM u LIMIT coalesce({})", 999),
+        ("SELECT 1 FROM (SELECT 1) WHERE 1 IN ({})", 999),
+        ("SELECT 1 FROM u WHERE 1 IN ({}) UNION ALL SELECT 1", 999),
+        ("SELECT (SELECT 1 FROM u), {}", 999),
+        ("SELECT {}, (SELECT 1 FROM u)", 1000),
+        ("SELECT 1 FROM u, u AS u2, u AS u3 WHERE 1 IN ({})", 997),
+        ("SELECT 1 FROM json_each('[1]') WHERE 1 IN ({})", 999),
+        ("SELECT 1 FROM v WHERE 1 IN ({})", 998),
+        ("SELECT 1 FROM v2 WHERE 1 IN ({})", 997),
+        ("SELECT {} FROM v", 998),
+        ("SELECT 1 FROM u, (SELECT 1 WHERE 1 IN ({}))", 998),
+        ("SELECT 1 FROM (SELECT 1 WHERE 1 IN ({})), u", 998),
+        ("SELECT 1 FROM (SELECT 1 FROM u) WHERE 1 IN ({})", 998),
+        ("SELECT EXISTS (SELECT 1 FROM u), {}", 999),
+        (
+            "SELECT 1 FROM u WHERE EXISTS (SELECT 1 WHERE 1 IN ({}))",
+            999,
+        ),
+        ("DELETE FROM u WHERE x IN ({})", 999),
+        ("DELETE FROM ui WHERE x IN ({})", 997),
+        ("UPDATE ui SET x=1 WHERE x IN ({})", 997),
+        ("UPDATE u SET x=(SELECT 1 WHERE 1 IN ({}))", 999),
+        ("UPDATE u SET x=2 FROM w, w AS w2 WHERE 1 IN ({})", 994),
+        ("UPDATE u SET x=2 FROM (SELECT 1 WHERE 1 IN ({}))", 996),
+    ];
+    let mut scripts = Vec::new();
+    for (q, n) in shapes {
+        for k in [n - 1, n] {
+            scripts.push(format!(
+                "WITH c0 AS (SELECT 1 AS x) {};; SELECT 'done'",
+                q.replace("{}", &refs(k))
+            ));
+        }
+    }
+    scripts.push(format!(
+        "WITH c0 AS (SELECT 1 AS x), c1 AS (SELECT 1 FROM u, w) SELECT {} FROM c1",
+        refs(996)
+    ));
+    scripts.push(format!(
+        "WITH c0 AS (SELECT 1 AS x), c1 AS (SELECT 1 FROM u, w) SELECT {} FROM c1",
+        refs(997)
+    ));
+    let owned: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    script_same("ctecur", schema, &owned);
+}

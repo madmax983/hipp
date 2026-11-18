@@ -11,6 +11,162 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: result_gaps — review fixes (2026-11-18)
+
+Six review findings on `result_gaps` (404d6ab), each reproduced and
+probed on the live pin first. All ungated fixes on claimed paths; no
+new leaf.
+
+**Shipped.**
+1. **An EXISTS over a UNION with a LIMIT other than 1 or an OFFSET
+   merges again** (high; a regression of item 9's `mark_exists_inert`,
+   which made every UNION there a UNION ALL): `EXISTS (SELECT a FROM t
+   UNION SELECT a FROM t LIMIT 2 OFFSET 4)` is 0 and `EXISTS (SELECT a
+   FROM t UNION SELECT abs(-9223372036854775808) LIMIT 2)` fails, as on
+   the pin. The root cause was the pin's UNION-with-LIMIT-1 shortcut,
+   which hipp modelled in three places (executor, EQP, merge keys) for
+   all-UNION chains only; it is now one parser rule
+   (`parser::union_limit_one`), and the executor special cases
+   (`union_first_row`, `first_core_row`, the EQP and `merge_member`
+   branches, the VM's `CompInfo::first_row`) are gone. Its shapes,
+   probed: a compound with no ORDER BY (an EXISTS drops its own) and no
+   OFFSET whose LIMIT is exactly 1 reads the UNIONs of its trailing run
+   of UNION / UNION ALL operators as UNION ALL — the operators left of
+   its last INTERSECT / EXCEPT keep theirs (`a UNION ALL 3 UNION a
+   LIMIT 1` is t's first row, `a EXCEPT 1 UNION 0 LIMIT 1` is 2); the
+   LIMIT is an integer with any signs at the top level, in FROM / IN
+   subqueries, CTEs and views (`+1`, `-(-1)`, `(1)`, `0x1`; not `'1'`,
+   `1.0`, `0+1`, `1 OFFSET 0`, `0, 1`), and in a scalar / EXISTS
+   subquery the implicit one or a bare integer token 1 (the pin's `X <>
+   0` rewrite keeps no other). A shortcut core computes no later core
+   (`SELECT 1 UNION SELECT abs(..) LIMIT 1` is 1) and needs no merge
+   collation (`a COLLATE bogus .. UNION .. LIMIT 1` answers). An EXISTS
+   core is a placeholder only when every operator to its right is a
+   UNION ALL (`Statement::dest`).
+2. **A co-routine's collated order delivers an equal GROUP BY and
+   ORDER BY** (high; items 3 and 4): `SELECT x, count(*) FROM (SELECT c
+   AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY
+   x` keeps the subquery's NOCASE order (`|1 a|1 A|1 a|1 b|1 B|1`), as
+   the pin's `orderByGrp` with `sqlite3WhereIsSorted` omits the sorter;
+   the plan already said so, the executor sorted the groups again. The
+   reader's ORDER BY is dropped at plan time when the subquery's order
+   delivers the GROUP BY and that ORDER BY in its own directions
+   (`plan_core`, `sub_delivers`); a DESC reader still sorts.
+3. **A partly index-delivered ORDER BY ends its loop at the LIMIT's
+   prefix group** (medium; item 1): the pin computes every row as it
+   comes (`nOBSat > 0`), and `pushOntoSorter` flushes at each new prefix
+   group, ending the loop (`OP_IfNot iLimit -> labelDone`) once OFFSET
+   + LIMIT rows went out — the first row of the next group is computed,
+   later ones never visited. `TopN::part` (carried in `pre_skip`'s third
+   bound) stops the materializing, streamed, subquery and `query`-only
+   projections there: `SELECT CASE WHEN a=1 THEN abs(..) ELSE a END FROM
+   t WHERE b>=0 ORDER BY b, a LIMIT 1` over an index on b is 4, as on
+   the pin; a scalar subquery and an INSERT's SELECT stop too.
+4. **A statement's names and string literals are handles into its
+   stored text** (medium; item 6 overstated what shipped: a row still
+   cost 8 B of arena beyond its text, so a 3,000-row `(i, 'xi')` INSERT
+   of 45,800 B failed under the 64 KiB `stmt_max`): every lexer of
+   `prepare` reads the arena's copy of the text, and
+   `Arena::handle_or_copy` returns a handle to bytes the arena already
+   holds (an unquoted or bracketed name, a literal without `''`). The
+   arena's high water for such a statement is now its text: 4,000-row
+   `(i, 'xi')` (61,800 B), `(abs(i), 1)`, `(random(), 1)` and 5,000-row
+   `(random())` INSERTs run under `Config::default()`; only a statement
+   whose text nears `stmt_max` fails (by design).
+5. **The "nested too deep" count is the pin's cursor count** (low;
+   item 7 counted CTE references, views and FROM subqueries only):
+   probed, the count at a CTE reference is `Parse.nTab` — one cursor
+   per FROM item a select's `selectExpander` assigns before its
+   expressions (tables, views, CTE references, FROM subqueries with
+   their own items, table-valued functions), one for an UPDATE / DELETE
+   target and each of its indexes, and for UPDATE ... FROM one more
+   plus two per FROM item. `count_from` / `target_cursors` count them;
+   a core's FROM is expanded before its result columns, as the pin's
+   walk does. `SELECT count(*) FROM u WHERE x IN (999 refs)`, `DELETE`
+   / `UPDATE ... WHERE x IN (999 refs)`, `EXISTS (SELECT 1 WHERE 1 IN
+   (999 refs))` and `UPDATE u SET x=2 FROM (SELECT 1 WHERE 1 IN (996
+   refs))` now fail as on the pin.
+
+**Not fixed (evidence).**
+- Finding 3's compound half: a merge arm whose order an index delivers
+  is a co-routine the pin's merge stops at the LIMIT (UNION included);
+  hipp computes each core whole, so `SELECT b, X FROM t UNION SELECT
+  9,9 ORDER BY 1 LIMIT 1` over an index on b still fails (pre-existing;
+  a lazy merge is beyond this unit). Also DISTINCT under a partly
+  delivered ORDER BY: the pin stops after the LIMIT's distinct rows,
+  hipp computes every row (its projections keep duplicates until the
+  end, so counting there gave too few rows when tried).
+- Finding 6 (pre-existing, unrecorded until now): `x IN (SELECT col
+  FROM tbl ORDER BY <failing>)` where an index or the rowid covers
+  `col` — the pin reads the index (`sqlite3FindInIndex`) and never runs
+  the subquery or its ORDER BY; hipp runs it and fails. EQP's
+  `in_index` already models the choice; executing it needs the
+  catalog at the IN's evaluation (left open). Also pre-existing:
+  `SELECT * FROM w, s ORDER BY a, abs(-9223372036854775808)` (w WITHOUT
+  ROWID in a join) answers in hipp where the pin fails (`LAST TERM OF
+  ORDER BY`).
+
+**Oracle-probing notes.** Shortcut: EQP of `SELECT a FROM t UNION
+SELECT a FROM t LIMIT 1` is `COMPOUND QUERY / UNION ALL`, `LIMIT 2` and
+`LIMIT 1 OFFSET 0` are `MERGE (UNION)`; `a INTERSECT a UNION 9 LIMIT 1`
+is `MERGE (INTERSECT)` then `UNION ALL`; `a UNION a EXCEPT 9 UNION 3
+LIMIT 1` keeps `MERGE (UNION)` inside `MERGE (EXCEPT)`. `(SELECT a FROM
+t UNION SELECT a FROM t LIMIT 1)` is 2 (shortcut), `LIMIT +1` / `-(-1)`
+there is 1 (merge); at the top level both are 2. Group order: EQP of
+the collated case shows no temp b-tree; `ORDER BY x DESC` sorts.
+Partial order: rows `(1,0),(7,0),(2,0),(3,1),(5,1),(9,2),(4,3)`, a=9
+failing, index on b: `ORDER BY b, a LIMIT 1/2/3` and `LIMIT 1 OFFSET 2`
+answer, `LIMIT 4` and `LIMIT 1 OFFSET 3` fail (the next group's first
+row is computed); a=9 inside the first group always fails. Arena:
+`Statement::arena_high_water` equals the text length after the fix
+(was text + 8 B per row). Cursors, first failing reference counts:
+table-less 1,000; `FROM u` 999; `u JOIN w` 998; three tables 997; `FROM
+v` (a view of u) 998, a view of v 997; `SELECT refs, (SELECT 1 FROM u)`
+1,000 but `(SELECT 1 FROM u), refs` 999; DELETE / UPDATE with two
+indexes 997; INSERT 1,000; UPDATE ... FROM w 996, FROM w, w2 994.
+
+**Tests.** `tests/result_gaps_v17.rs` (+5 tests): 67 shortcut / EXISTS
+shapes with plans, 250 co-routine GROUP BY + ORDER BY shapes (240
+generated), 56 partial-order scripts plus 200 generated, 8 long INSERTs
+under the default arena (with their high water), 62 cursor-count
+boundaries (each shape on both sides). `hipp-cli/tests/cli_v17_result_gaps.rs`
+(+1 test, off the VM): the same on a stdin script.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh` (fmt, clippy on
+default / all features / every feature set, workspace tests, the
+`--features vm` workspace suite, no_std builds for thumbv7em / thumbv6m
+/ riscv32imac / wasm32, the four size gates): all gates passed.
+`tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info: pass (no `STACK_*` change).
+
+**Size Δ** (against 9225830). tiny 0 (76,928: the text-handle lookup
+and the literal check are `query`-only); full +768 (494,292 →
+495,060); max +760 (985,472 → 986,232); xl +768 (1,088,732 →
+1,089,500). Ratchets raised to the measured figures with a reason each
+(`ci/size-ratchet.toml`). Offsets taken first: the three executor / EQP
+copies of the UNION-with-LIMIT-1 shortcut (`union_first_row`,
+`first_core_row`, the EQP and `merge_member` branches, the VM's
+`CompInfo::first_row`) and the per-view / per-subquery count
+increments are gone.
+
+**Honest gaps.**
+- `LIMIT +1` in a scalar / EXISTS subquery takes the shortcut in hipp
+  (its parser folds the sign into the literal) and not on the pin.
+- The cursor count follows hipp's walk, which reads a compound's cores
+  left to right (the pin's rightmost first: `SELECT 1 WHERE 1 IN (999
+  refs) UNION ALL SELECT 1 FROM u` fails on the pin only) and an
+  expression's subqueries before a FROM subquery's body in a different
+  order in places; UPDATE ... RETURNING allocates about ten more cursors
+  on the pin before its RETURNING expressions (990 references fail
+  there).
+- The compound merge's lazy arms, DISTINCT under a partly delivered
+  ORDER BY, and the IN-index read (see "Not fixed").
+- Found by the partial-order corpus (pre-existing planner gaps): `WHERE
+  b IS NOT NULL` is no index range in hipp (the pin: `SEARCH t USING
+  INDEX tbd (b>?)`), so a top-N over it sorts every row; and an ORDER
+  BY term naming a delivered column again by ordinal (`ORDER BY b, 1`
+  with `b` result column 1) is not seen as delivered.
+
 ### Parity: result_gaps — result-level wrong answers left by wave 18 (2026-11-18)
 
 Wave 19's second unit (owner decision 2026-11-18: SQLite 3.54.1
@@ -42,7 +198,8 @@ EXISTS computed its result columns); what stays open is listed below.
    scalar subquery or an INSERT's SELECT (registers the pin
    preallocates, `iSdst` set: `Statement::dest`), a materialized CTE,
    DISTINCT, an ORDER BY an index delivers in part (`nOBSat`: the row
-   loads first). The sorter holds its own LIMIT's rows whatever its
+   loads first, and the loop ends at the LIMIT's prefix group — added
+   by the review fixes, `TopN::part`). The sorter holds its own LIMIT's rows whatever its
    reader takes (found by the corpus).
 2. **A WITHOUT ROWID table read in its own order keeps the loop that
    delivers its ORDER BY** (item 2; `xplan::best_access`): the
@@ -74,7 +231,9 @@ EXISTS computed its result columns); what stays open is listed below.
    the last chunk takes the rest of the budget (`Arena::alloc_pos`):
    a row now costs its text plus one copy of its names, so 3,400
    `(random())` rows (was 1,866) or 2,000 `((SELECT i))` rows read
-   under the default 64 KiB arena. A statement whose text and names
+   under the default 64 KiB arena. (Overstated: a row still cost 8 B
+   beyond its text; the review fixes make names handles into the
+   text, `Arena::handle_or_copy`.) A statement whose text and names
    exceed `Config::stmt_max` still fails (by design; the pin has no
    such arena).
 7. **A CTE reference counts one toward the "nested too deep" limit**
@@ -84,14 +243,16 @@ EXISTS computed its result columns); what stays open is listed below.
    view or FROM subquery without one counts nothing. hipp counted the
    SELECTs of every copied body, so three reads of a 450-arm CTE (and
    MATERIALIZED ones, and 600-CTE chains inside a view) were refused;
-   `count_selects` is gone.
+   `count_selects` is gone. (The review fixes count the pin's cursors
+   instead: every FROM item, DML targets and their indexes.)
 8. **Without `sql`, the synchronous executor skips the OFFSET's rows
    and the top-N sorter's** (item 8; `project_rows` with `pre_skip`).
 9. **An EXISTS computes no result column, ORDER BY or DISTINCT** of a
    UNION / UNION ALL core (found by item 9's scan while probing item
    1; `DEST_EXISTS`, `mark_exists_inert`): the pin's `SRT_Exists`
    codes no column and `IgnorableOrderby` drops its ORDER BY and
-   DISTINCT, a UNION being a UNION ALL there (its plan says so), so
+   DISTINCT, a UNION being a UNION ALL there (its plan says so — only
+   under the LIMIT-1 shortcut, corrected by the review fixes), so
    `EXISTS (SELECT abs(-9223372036854775808) FROM t)` is 1 and
    `EXISTS (SELECT DISTINCT a FROM t LIMIT 1 OFFSET 2)` counts rows.
    Its aggregates still step and finish (a `sum()` overflow fails),
@@ -204,7 +365,8 @@ thread (`prepare`'s future is now 5,648 B, was 5,616; `step`'s is
 - EXPLAIN QUERY PLAN still lists an EXISTS result column's
   subqueries (the pin codes none; rows match).
 - `UPDATE ... WHERE x IN (...)` counts one more toward the CTE limit
-  on the pin (999 references fail there, 1,000 in hipp).
+  on the pin (999 references fail there, 1,000 in hipp). (closed in
+  v0.17: result_gaps review fixes — the pin's cursor count)
 - A statement whose text and names exceed `Config::stmt_max` still
   fails with `ArenaExhausted` (by design; the pin has no such arena);
   a derived table's sixth equal column name takes a random suffix on

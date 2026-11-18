@@ -206,3 +206,37 @@ fn cte_references_render_like_the_pin() {
     let b = format!("WITH c0(x) AS (SELECT 1) SELECT {refs}");
     same_args("cte", &[&a, &b]);
 }
+
+/// Review fixes as the shell shows them: the UNION-with-LIMIT-1
+/// shortcut (and an EXISTS over a UNION with another LIMIT merging),
+/// groups and an equal ORDER BY a co-routine's collated order
+/// delivers, a partly delivered ORDER BY ending its loop at the
+/// LIMIT's group, and the cursor-counted CTE limit.
+#[test]
+fn review_fixes_render_like_the_pin() {
+    if on_vm() {
+        return;
+    }
+    let refs = vec!["(SELECT x FROM c0)"; 999].join(",");
+    same(
+        "rev",
+        SETUP,
+        &format!(
+            "SELECT EXISTS (SELECT a FROM t UNION SELECT a FROM t LIMIT 2 OFFSET 5), EXISTS (SELECT 1 FROM t UNION SELECT 1 FROM t LIMIT 1 OFFSET 1);
+SELECT EXISTS (SELECT a FROM t UNION SELECT abs(-9223372036854775808) LIMIT 2);
+SELECT 'next';
+SELECT EXISTS (SELECT a FROM t UNION SELECT abs(-9223372036854775808) LIMIT 1);
+SELECT a FROM t UNION ALL SELECT 3 UNION SELECT a FROM t LIMIT 1;
+SELECT (SELECT b FROM t UNION SELECT a FROM t LIMIT 1);
+EXPLAIN QUERY PLAN SELECT a FROM t UNION ALL SELECT 3 UNION SELECT a FROM t LIMIT 1;
+SELECT x, count(*) FROM (SELECT c AS x, n FROM g ORDER BY 1 COLLATE BINARY LIMIT 9) GROUP BY x ORDER BY x;
+EXPLAIN QUERY PLAN SELECT x, count(*) FROM (SELECT c AS x, n FROM g ORDER BY 1 COLLATE BINARY LIMIT 9) GROUP BY x ORDER BY x;
+CREATE INDEX tb ON t(b);
+SELECT CASE WHEN a=1 THEN abs(-9223372036854775808) ELSE a END FROM t WHERE b>=0 ORDER BY b, a LIMIT 2;
+SELECT CASE WHEN a=1 THEN abs(-9223372036854775808) ELSE a END FROM t WHERE b>=0 ORDER BY b, a LIMIT 3;
+SELECT 'then';
+WITH c0 AS (SELECT 1 AS x) SELECT count(*) FROM t WHERE a IN ({refs});
+SELECT 'end';"
+        ),
+    );
+}

@@ -66,6 +66,44 @@ fn perr<E>(offset: usize, kind: ParseKind) -> Error<E> {
     Error::Parse { offset, kind }
 }
 
+/// The pin's UNION-with-LIMIT-1 shortcut (3.54.0, v0.17 review fix):
+/// a compound with no OFFSET, no ORDER BY (an EXISTS drops its own,
+/// `IgnorableOrderby`) and a LIMIT of exactly 1 reads the UNIONs of
+/// its trailing run of UNION / UNION ALL operators as UNION ALL — the
+/// operators left of its last INTERSECT / EXCEPT keep theirs. Probed:
+/// the LIMIT is an integer with any signs (`+1`, `-(-1)`; `'1'`,
+/// `1.0`, `0+1` are not), or for a scalar / EXISTS subquery (`sub`
+/// 1 / 2) the implicit one or a written integer token 1 (that rewrite
+/// `X <> 0` keeps only a bare 1). So `SELECT a FROM t UNION ALL
+/// SELECT 3 UNION SELECT a FROM t LIMIT 1` is t's first row, and
+/// `EXISTS (SELECT a FROM t UNION SELECT abs(..) LIMIT 2)` computes
+/// every core (a merge).
+#[cfg(feature = "sql")]
+fn union_limit_one(s: &mut SelectStmt, sub: u8) {
+    fn int(e: &Expr, signs: bool) -> Option<i64> {
+        match e {
+            Expr::Literal(Literal::Integer(n)) => Some(*n),
+            Expr::Neg(x) if signs => int(x, true)?.checked_neg(),
+            Expr::Pos(x) if signs => int(x, true),
+            _ => None,
+        }
+    }
+    let one = match s.limit.as_deref() {
+        None => sub > 0,
+        Some(e) => int(e, sub == 0) == Some(1),
+    };
+    if !one || s.offset.is_some() || (sub < 2 && !s.order_by.is_empty()) {
+        return;
+    }
+    for (op, _) in s.compound.as_mut_slice().iter_mut().rev() {
+        match op {
+            CompoundOp::Union => *op = CompoundOp::UnionAll,
+            CompoundOp::UnionAll => {}
+            _ => break,
+        }
+    }
+}
+
 /// Resolve an arena handle to bytes.
 pub fn handle_bytes(arena: &Arena, h: ABytes) -> &[u8] {
     arena
@@ -155,6 +193,11 @@ struct Parser<'a> {
     /// 500-SELECT limit.
     #[cfg(feature = "sql")]
     vtail: bool,
+    /// The select `select_body` parses next reads its first row only
+    /// (v0.17 review fix, `sql`): 1 for a scalar subquery, 2 for an
+    /// EXISTS (`union_limit_one`). Taken at the body's start.
+    #[cfg(feature = "sql")]
+    first_sub: u8,
     /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
     /// a view's tree in its reduced form, whose leaves lose their
     /// height, so a leaf the pin resolves on its own (`SELECT a`,
@@ -824,6 +867,8 @@ impl<'a> Parser<'a> {
             with_seen: false,
             #[cfg(feature = "sql")]
             vtail: false,
+            #[cfg(feature = "sql")]
+            first_sub: 0,
             #[cfg(feature = "query")]
             reduced: false,
             #[cfg(feature = "query")]
@@ -4033,6 +4078,7 @@ impl<'a> Parser<'a> {
             return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
         }
         // `EXISTS LP select RP`.
+        self.first_sub = 2;
         #[allow(unused_mut)]
         let mut stmt = self.subquery::<E>(2 + extra_parens)?;
         #[cfg(feature = "expr_index")]
@@ -4074,6 +4120,7 @@ impl<'a> Parser<'a> {
     fn paren_subquery<E>(&mut self) -> Result<Expr, E> {
         #[cfg(feature = "sql")]
         {
+            self.first_sub = 1;
             #[allow(unused_mut)]
             let mut stmt = self.subquery::<E>(1)?;
             #[cfg(feature = "expr_index")]
@@ -4624,6 +4671,8 @@ impl<'a> Parser<'a> {
 
     fn select_body<E>(&mut self) -> Result<SelectStmt, E> {
         let hs = self.held;
+        #[cfg(feature = "sql")]
+        let first_sub = core::mem::take(&mut self.first_sub);
         // `select ::= WITH [RECURSIVE] wqlist selectnowith`: the
         // cores sit two symbols up (three after RECURSIVE).
         #[cfg(feature = "sql")]
@@ -4739,6 +4788,8 @@ impl<'a> Parser<'a> {
         {
             return Err(perr(self.cur().offset, ParseKind::TooManyCompoundTerms));
         }
+        #[cfg(feature = "sql")]
+        union_limit_one(&mut head, first_sub);
         Ok(head)
     }
 

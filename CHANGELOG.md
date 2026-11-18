@@ -38,6 +38,21 @@ All notable changes to hipp. Versions follow the milestones in
 - Found on the way: a derived table's fifth equal column name is `:4`, as
   on the pin (hipp refused it).
 - Sizes: tiny unchanged; full +3,896 B, max +4,460 B, xl +3,452 B.
+- Review fixes (ungated): an EXISTS over a UNION with a LIMIT other
+  than 1 or an OFFSET merges and deduplicates as on the pin (the unit
+  had made every UNION there a UNION ALL); the pin's
+  UNION-with-LIMIT-1 shortcut is now one parser rule
+  (`union_limit_one`: the trailing run of UNION / UNION ALL operators,
+  written `LIMIT 1` with any signs, the implicit or bare-`1` LIMIT of
+  a scalar / EXISTS subquery), replacing three executor and EQP
+  special cases; a co-routine's collated order that delivers the GROUP
+  BY also delivers an equal ORDER BY; a partly index-delivered ORDER
+  BY under a LIMIT ends its loop at the first row of the prefix group
+  past OFFSET + LIMIT (`TopN::part`); lexer names and unescaped string
+  literals are handles into the statement's stored text
+  (`Arena::handle_or_copy`), so the default 64 KiB arena holds a
+  statement of nearly its size; the CTE "nested too deep" limit counts
+  the pin's cursors (`count_from`, `target_cursors`).
 
 ### ATTACH parity (wave 19, unit `attach`, leaf `attach`)
 

@@ -274,6 +274,44 @@ impl Arena {
         })
     }
 
+    /// The handle of `data` when it already lies in this arena (a
+    /// slice of bytes it handed out, such as the statement text the
+    /// lexer reads), else a copy's (v0.17 review fix: a statement's
+    /// names and string literals cost no arena beyond its text). Only
+    /// addresses are compared; stored bytes are never written again.
+    /// (The tiny profile, no `query`, copies: its statements are
+    /// short, and the lookup would cost it code.)
+    pub fn handle_or_copy(&self, data: &[u8]) -> Result<ABytes, ArenaError> {
+        #[cfg(feature = "query")]
+        if let Some(h) = self.handle_of(data) {
+            return Ok(h);
+        }
+        self.alloc_copy_handle(data)
+    }
+
+    /// `handle_or_copy`'s lookup.
+    #[cfg(feature = "query")]
+    fn handle_of(&self, data: &[u8]) -> Option<ABytes> {
+        let inner = unsafe { &*self.inner.get() };
+        let at = data.as_ptr() as usize;
+        let mut base = 0usize;
+        for (c, used) in inner.chunks.iter().zip(inner.offs.iter()) {
+            let start = c.ptr as usize;
+            if at >= start
+                && let Some(off) = at.checked_sub(start)
+                && off.checked_add(data.len()).is_some_and(|e| e <= *used)
+                && let (Ok(pos), Ok(len)) = (
+                    u32::try_from(base.saturating_add(off)),
+                    u32::try_from(data.len()),
+                )
+            {
+                return Some(ABytes { pos, len });
+            }
+            base = base.saturating_add(*used);
+        }
+        None
+    }
+
     /// Consume `bytes` of budget without retaining a slice (used to
     /// charge a scope for fixed per-transaction structures, SPEC
     /// §7.5.4). The bump stays until reset/rewind, exactly like a real

@@ -2088,9 +2088,9 @@ pub type SubPlanner<'p, E> =
 /// left alone, as are IN subqueries and derived tables.
 ///
 /// Without a LIMIT of its own the subquery gets the pin's
-/// implicit integer `LIMIT 1`, which is what lets a UNION
-/// compound take the pin's first-row shortcut
-/// (`session::union_first_row`; v0.16, CI against the pin).
+/// implicit integer `LIMIT 1` (its UNION-with-LIMIT-1 shortcut is
+/// the parser's `union_limit_one`; v0.16, CI against the
+/// pin).
 #[cfg(feature = "sql")]
 fn first_row_limit(mut plan: SubPlan) -> SubPlan {
     plan.limit = Some(match plan.limit.take() {
@@ -3942,16 +3942,18 @@ pub fn mark_exists_inert(p: &mut SubPlan) {
         core(t);
     }
     // The pin drops an EXISTS's ORDER BY and DISTINCT
-    // (`IgnorableOrderby`, v0.17), and a UNION there is a UNION ALL
-    // (no core's column is computed: `Statement::dest`).
+    // (`IgnorableOrderby`, v0.17); a core with only UNION ALL to its
+    // right computes no column (`Statement::dest`). Its UNIONs are
+    // UNION ALL only under the LIMIT-1 shortcut (the parser's
+    // `union_limit_one`; v0.17 review fix: with another LIMIT or an
+    // OFFSET the pin merges, deduplicating every core's values).
     fn drop_order(p: &mut SubPlan) {
         p.order_by.clear();
         p.distinct = false;
     }
     drop_order(p);
     p.comp_order.clear();
-    for (op, t) in p.compound.as_mut_slice() {
-        *op = crate::sql::CompoundOp::UnionAll;
+    for (_, t) in p.compound.as_mut_slice() {
         drop_order(t);
     }
 }

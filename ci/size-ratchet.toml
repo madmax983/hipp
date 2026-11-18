@@ -118,7 +118,13 @@ justify_over = 4096
 # FLEXNUM. Offsets: `count_selects` and `shown_keys` removed, the
 # projections' key/column loops shared (`keyed`, -640 B; boxed, +136 B,
 # which keeps the projections' futures, and a debug step's stack, small).
-ratchet = 494292
+# 494,292 -> 495,060 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +768 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+ratchet = 495060
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -212,7 +218,13 @@ justify_over = 16384
 # access path and the co-routine GROUP BY plan line (`explain`).
 # 986,160 -> 985,472 (v0.17 attach review fixes, `attach` leaf; STATUS.md):
 # -688 B. The router finds the write target by its token (one lookup).
-ratchet = 985472
+# 985,472 -> 986,232 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +760 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+ratchet = 986232
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -297,7 +309,13 @@ justify_over = 32768
 # 1,088,300 -> 1,088,732 (v0.17 attach review fixes, `attach` leaf;
 # STATUS.md): +432 B, layout/inlining (max shrank 688 B): WITH-target
 # routing, routed rows before an error, temp opened by integrity_check.
-ratchet = 1088732
+# 1,088,732 -> 1,089,500 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +768 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+ratchet = 1089500
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

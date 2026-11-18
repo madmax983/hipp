@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 494,292 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 985,472 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,088,732 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 495,060 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 986,232 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,089,500 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -88,7 +88,17 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   run); a VALUES list of a few thousand non-constant rows fits the
   default statement arena (names are copied once, the arena's last
   chunk takes its whole remaining budget); the `query`-only executor
-  skips OFFSET rows before their columns.
+  skips OFFSET rows before their columns. Review fixes: the pin's
+  UNION-with-LIMIT-1 shortcut (the trailing UNIONs of a compound
+  with a LIMIT of exactly 1 and no ORDER BY / OFFSET are UNION ALL,
+  so `a UNION ALL 3 UNION a LIMIT 1` is the first row and an EXISTS
+  over a UNION with another LIMIT deduplicates again); a co-routine's
+  collated order delivers an equal GROUP BY and ORDER BY (no second
+  sort); an ORDER BY an index delivers in part ends the loop at the
+  LIMIT's prefix group; a statement's names and string literals are
+  handles into its stored text (a 4,000-row constant INSERT fits the
+  default arena); the "nested too deep" count is the pin's cursor
+  count (every FROM item, UPDATE / DELETE targets and their indexes).
 - **ATTACH parity** (unit `attach`, leaf `attach`). A string literal
   names a schema, table or column where the pin's grammar takes a name
   (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `FROM 't'`, `WITH 'c'`, `SET
