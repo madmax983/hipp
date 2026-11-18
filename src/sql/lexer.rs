@@ -1032,6 +1032,14 @@ fn lex_inner<E>(
                 i += 1;
             }
             b'.' if !(i + 1 < n && sql[i + 1].is_ascii_digit()) => {
+                // v0.17 (`attach`): a string literal before a dot is a
+                // name (`'aux'.t`), the pin's `nm ::= STRING`.
+                #[cfg(feature = "attach")]
+                if let Some(t) = toks.as_mut_slice().last_mut()
+                    && let Tok::Text(h) = t.tok
+                {
+                    t.tok = Tok::Ident(h, true);
+                }
                 toks.push(Token {
                     tok: Tok::Dot,
                     offset: off,
@@ -1060,8 +1068,17 @@ fn lex_inner<E>(
                     }
                 }
                 let h = arena.alloc_copy_handle(buf.as_slice())?;
+                // ... and so is one after a dot (`aux.'t'`).
+                #[cfg(feature = "attach")]
+                let after_dot = matches!(toks.as_slice().last(), Some(Token { tok: Tok::Dot, .. }));
+                #[cfg(not(feature = "attach"))]
+                let after_dot = false;
                 toks.push(Token {
-                    tok: Tok::Text(h),
+                    tok: if after_dot {
+                        Tok::Ident(h, true)
+                    } else {
+                        Tok::Text(h)
+                    },
                     offset: off,
                 });
             }

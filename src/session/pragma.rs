@@ -347,7 +347,7 @@ impl PragmaPlan {
     }
 }
 
-type Rows = AVec<AVec<OwnedValue>>;
+pub(super) type Rows = AVec<AVec<OwnedValue>>;
 
 /// A table the integrity check visits: name, root, and its
 /// indexes' (name, root) in the pin's order.
@@ -408,7 +408,7 @@ pub(super) fn dec(mut v: i64, out: &mut AVec<u8>) {
 /// (`0x...`, at most 8 digits, no sign bit) or decimal number
 /// read to its first non-digit; `None` without a digit or on
 /// overflow.
-fn get_int32(z: &[u8]) -> Option<i32> {
+pub(super) fn get_int32(z: &[u8]) -> Option<i32> {
     let mut i = 0usize;
     let mut neg = false;
     match z.first() {
@@ -1948,7 +1948,19 @@ impl<S: Storage> Statement<'_, S> {
             return Ok(AVec::new());
         };
         if matches!(prag, Prag::IntegrityCheck | Prag::QuickCheck) {
-            return self.integrity(&p, prag == Prag::QuickCheck).await;
+            let quick = prag == Prag::QuickCheck;
+            // v0.17 (`attach`): unqualified, the pin goes on to the
+            // temp and attached databases.
+            #[cfg(feature = "attach")]
+            {
+                let rows = self.integrity(&p, quick).await?;
+                if p.main_only {
+                    return Ok(rows);
+                }
+                return self.integrity_rest(&p, quick, rows).await;
+            }
+            #[cfg(not(feature = "attach"))]
+            return self.integrity(&p, quick).await;
         }
         #[cfg(feature = "foreign_keys")]
         if prag == Prag::ForeignKeyCheck {
@@ -2337,6 +2349,14 @@ impl<S: Storage> Statement<'_, S> {
         }
         if !ck.msgs.is_empty() {
             let mut m: AVec<u8> = AVec::new();
+            // v0.17 (`attach`): an attached database's own name.
+            #[cfg(feature = "attach")]
+            {
+                m.extend_from_slice(b"*** in database ");
+                m.extend_from_slice(self.conn.schema_label());
+                m.extend_from_slice(b" ***\n");
+            }
+            #[cfg(not(feature = "attach"))]
             m.extend_from_slice(b"*** in database main ***\n");
             m.extend_from_slice(ck.msgs.as_slice());
             let mut r = AVec::new();

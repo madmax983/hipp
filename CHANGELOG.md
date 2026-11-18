@@ -5,6 +5,33 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### ATTACH parity (wave 19, unit `attach`, leaf `attach`)
+
+- A string literal is a name where the pin's grammar takes one
+  (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `INSERT INTO 'aux'.t`, `PRAGMA
+  'aux'.x`, `FROM 't'`, `t AS 'x'`).
+- An unqualified `PRAGMA integrity_check` / `quick_check` checks main,
+  the TEMP database and every attached database in order under one
+  error limit, `ok` only when none reports anything; a B-tree message
+  of an attached database names it (`*** in database aux ***`).
+- An attached database's view is read on main with its names bound to
+  its own database (beside main's tables, in joins, subqueries, CTEs,
+  compounds, INSERT ... SELECT into main; `SELECT * FROM v, aux.v`).
+  Fix: `aux.v` beside a main table read main's view `v` when main had
+  one.
+- A TEMP UPDATE / DELETE / INSERT VALUES (RETURNING, upsert, UPDATE ...
+  FROM) reading main or attached tables runs (on the TEMP database,
+  the tables handed over as external sources).
+- A write of an attached table reads another database's same-named
+  table by an unqualified name (`UPDATE aux.m SET y = (SELECT y FROM
+  m)`), other databases' tables by three-part names (`main.m.y`), and
+  `UPDATE aux.m ... FROM main.m` is no repeat of its target.
+- Still refused: TEMP triggers on main or attached tables or writing
+  another database, a write of an attached / TEMP table reading
+  another database's view; attached and TEMP tables have no index
+  access paths yet.
+- Sizes: tiny and full unchanged; max +5,008 B, xl +7,216 B.
+
 ### VALUES chains, lazy collations, inert aggregates (wave 18, unit `values_chain`)
 
 - Fixes (ungated): a multi-row VALUES is parsed as the pin's

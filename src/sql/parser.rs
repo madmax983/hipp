@@ -947,6 +947,15 @@ impl<'a> Parser<'a> {
 
     /// A table/column name: any identifier token (quoted or not).
     fn name<E>(&mut self) -> Result<ABytes, E> {
+        // v0.17 (`attach`): a string literal is a name too (the pin's
+        // `nm ::= STRING`): the router hands `aux.'t'` on as `'t'`.
+        // (One before a dot is already a name token, `lexer`.)
+        #[cfg(feature = "attach")]
+        if let Tok::Text(h) = self.cur().tok {
+            self.pos += 1;
+            self.last_schema = None;
+            return Ok(h);
+        }
         match self.cur().tok {
             Tok::Ident(h, _) => {
                 self.pos += 1;

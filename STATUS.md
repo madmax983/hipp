@@ -11,6 +11,203 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: attach — ATTACH refusals and index access into attached databases (2026-11-18)
+
+Wave 19's unit (owner decision 2026-11-18: SQLite 3.54.1 parity
+continues): the ATTACH honest gaps of the v0.16 unit (README "Not
+yet", STATUS.md's ATTACH / DETACH gaps), each probed on the live pin
+first (notes below). Four of the seven items are closed, one in part;
+three stay open with the reason recorded. Everything new is behind the
+`attach` leaf (in `max`); no new leaf, and no path without the leaf
+changes (tiny and full Δ 0).
+
+**Shipped.**
+1. **Item 7 — a string literal is a name** (`nm ::= STRING`): `'aux'.t`,
+   `aux.'t'`, `'aux'.'t'.c`, `INSERT INTO 'aux'.t`, `CREATE TABLE
+   'aux'.z`, `PRAGMA 'aux'.table_info('t')`, `DROP TABLE 'aux'.z`. The
+   lexer reads a string literal next to a dot as a quoted name, and the
+   parser's `name()` takes a string literal where it takes a name (so
+   `FROM 't'`, `INSERT INTO 't'('a')`, `t AS 'x'` and the router's
+   `INSERT INTO aux.'z'` → `INSERT INTO 'z'` parse there too).
+2. **Item 6 — the integrity check over every database.** An unqualified
+   `PRAGMA integrity_check` / `quick_check` (also `(N)`) checks main,
+   then the TEMP database, then each attached one in attach order
+   (`Statement::integrity_rest`), under one error limit, and answers
+   `ok` only when no database reported anything; a B-tree row names its
+   database (`*** in database aux ***`: it said `main` for an attached
+   database). Reading a database inside a transaction locks it against
+   DETACH, as on the pin. `PRAGMA x.integrity_check`, a table argument
+   and `foreign_key_check` (unqualified: main only on the pin too) were
+   already the pin's.
+3. **Item 4 — names across databases.**
+   - *An attached database's view read on main*: the expander looks
+     `aux.v` (and an unqualified name only an attached database has) up
+     in that database's catalog and expands the view with every name in
+     its body bound to its own database (`Expander::att_source`, the
+     pin's `DbFixer` binding; nested views and CTEs included); the
+     view's columns answer to `aux.v.c` and its `*` expands as the
+     pin's `aux.v.c` (`SELECT * FROM v, aux.v` answers). Before, such
+     a statement was refused, and `aux.v` beside a main table read
+     *main's* view `v` when main had one (a silent wrong answer).
+   - *A write of an attached table reading a same-named table of
+     another database by an unqualified name* (`UPDATE aux.m SET y =
+     (SELECT y FROM m)`: main's `m`): the router writes that
+     database's qualifier into the text it hands the attached database
+     (`ext_on`, `edit`), so the two `m`s stay apart there.
+   - *Three-part names of another database inside such a write*
+     (`UPDATE aux.t SET b = bb.t.b FROM bb.t WHERE bb.t.a = aux.t.a`,
+     `main.m.y`): an external source answers to its own database's name
+     (`ExtTab::dbname`, `SourceDesc::dbname`; the column resolver now
+     looks every schema name up there first, `main` / `temp`
+     included), and the attached database's own three-part names keep
+     their qualifier (its sources answer to its alias), so `aux.m.x`
+     beside main's `m` stays the outer row. `UPDATE aux.m ... FROM
+     main.m` is no repeat of the target (`foreign_from`; it was "target
+     object/alias may not appear in FROM clause").
+4. **Item 3 — TEMP writes reading other databases.** A TEMP UPDATE /
+   DELETE / INSERT VALUES (RETURNING, upsert, UPDATE ... FROM, inside
+   transactions and savepoints) that reads main or attached tables runs
+   on the temp database with those tables handed over as external
+   sources, as a write of an attached database does (`AttPlan` with
+   `TEMP_DB`; `run_routed` / `width_on` shared by both; EXPLAIN QUERY
+   PLAN requalified `temp`). Works with or without ATTACH (the
+   `attach` leaf only: without it such a write stays `Unsupported`).
+   INSERT ... SELECT / CTAS keep the TEMP feed.
+
+**Not closed (honest gaps, below).** Items 1 and 2 (TEMP triggers on a
+main or attached table; TEMP triggers writing a schema-qualified table
+of another database) and item 5 (index access paths into attached /
+TEMP tables). Both need what the per-database `Connection` model does
+not have, and neither fits this wave's size line:
+- A trigger program runs as statements of the connection that fires it
+  (`trigger::run_step`, planned on `self`); the TEMP database and each
+  attached database are child connections of main with no route back
+  to it, so a program fired in one cannot reach another. Running TEMP
+  programs through main's router would need their `NEW.` / `OLD.`
+  values written into routed text (`TrigValue` carries affinity and
+  collation) and — the larger part — statement-level transactions
+  spanning databases: a main statement whose TEMP trigger writes `aux`
+  must join `aux` to its statement journal and commit both through the
+  super-journal (or roll both back on ABORT), which today happens only
+  for explicit transactions. Probed: the pin fires `CREATE TEMP
+  TRIGGER tr AFTER INSERT ON m BEGIN INSERT INTO aux.t ...; END` and
+  `... ON aux.t BEGIN INSERT INTO main.m ...; UPDATE aux.u ...; DELETE
+  FROM m ...; END`; hipp still refuses both at CREATE (`Unsupported`),
+  and a TEMP trigger on a TEMP table whose body names a main table
+  fails when it fires ("no such table"), as before.
+- Another database's table is read whole into main as an external
+  source (`scan_ext`); index and rowid seeks into it need the planner's
+  access paths and the join planner over another connection's pager
+  and catalog. Probed: the pin plans `SEARCH aux.t USING INTEGER
+  PRIMARY KEY (rowid=?)` / `USING COVERING INDEX tb (b=?)` for a
+  correlated lookup and a join, and `SCAN tt` / `SEARCH m USING
+  INTEGER PRIMARY KEY` for a TEMP table joined with main (driving the
+  join from the TEMP table); hipp shows `SCAN aux.t` and keeps FROM
+  order (rows equal; unordered join rows can come in another order).
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin;
+`.dbconfig defensive off` for the corrupt files): `'aux'.t`,
+`aux.'t'`, `'aux'.'t'.c`, `"aux".t.c`, `PRAGMA 'main'.user_version`,
+`FROM 't'`, `t AS 'x'` / `'x'.a` all parse; `'nosuch'.t` is "no such
+table: nosuch.t". Unqualified `integrity_check` over main + two
+attached copies of a file with a NOT NULL / CHECK violation and a
+missing index row: the six messages (`NULL value in t.x`, `CHECK
+constraint failed in t`, `row 1 missing from index ti`, twice);
+`integrity_check(3)` stops after three; `quick_check` skips the index
+rows; `integrity_check(t)` checks the first `t` the search order finds
+(aux) only; `PRAGMA main.integrity_check` is `ok`; `pragma_integrity_check`
+as a table-valued function answers there (hipp: `Unsupported`, the
+v0.16 PRAGMA unit's gap); `pragma_quick_check(2)` is "no such table:
+2". Unqualified `foreign_key_check` lists main's violations only (aux's
+`c2` and TEMP's `tc` need their name or qualifier). `SELECT * FROM v,
+aux.v` answers (`main.v.w`, `aux.v.w` differ); `FROM t, t` and `FROM
+(...) AS v, (...) AS v` are "ambiguous column name" on both. `UPDATE
+aux.m SET y = (SELECT y FROM m WHERE m.x = aux.m.x)`: inner `m` is
+main's, `aux.m.x` the target row. `UPDATE aux.m ... FROM main.m` and
+`UPDATE aux.t ... FROM bb.t` run. TEMP `UPDATE tt SET v = (SELECT b
+FROM aux.t WHERE a = k) || (SELECT y FROM m WHERE x = k)`, `DELETE ...
+IN (SELECT x FROM main.m)`, `INSERT INTO tt VALUES ((SELECT max(a) FROM
+aux.t), ...) RETURNING`, upserts and `UPDATE tt ... FROM aux.t` run, as
+without ATTACH. A view `aux.only AS SELECT b FROM aux.t` (own
+qualifier) is stored, but the shell then cannot open `a.db` on its own
+("malformed database schema ... cannot reference objects in database
+aux").
+
+**Tests.** `tests/attach_v17.rs` (8 tests; every script on both
+engines in twin directories: rows, failing statements, and the pin's
+integrity check and `.dump` of every file): string-literal names (two
+scripts), TEMP writes reading main / attached tables (with and without
+ATTACH, transactions, savepoints, DETACH), views and same-named tables
+across three databases, the integrity check over every database (two
+corrupt attached files made by the pin, limits, quick_check, a table
+argument, qualified forms, DETACH locks) and `foreign_key_check`, the
+regressions below, the refusals left, and a generated corpus
+(xorshift64: same-named tables in main and `a`, views in `a`, TEMP
+writes, three-part and string qualifiers, transactions; 24 scripts by
+default, `HIPP_ATTACH_CORPUS=300` ran clean, and the v16 corpus at 200).
+`hipp-cli/tests/cli_v17_attach.rs` (3 tests, one-shot and stdin
+byte-identical). Updated against the pin: `tests/attach_v16.rs`
+`documented_refusals` and `tests/temp_v16.rs` `both_databases_meet`
+(the TEMP writes and the attached view beside main now answer; the
+former keeps the trigger refusals). No new multi-database *write*
+path: a TEMP write writes only the TEMP database (memory), an attached
+write only its own, so `tests/crash.rs` is unchanged (it passes).
+
+**Regressions found while building it.** `aux.v` beside a main table
+read main's view `v` when main had one; `INSERT INTO aux.'z'` became
+`INSERT INTO 'z'` after the router's cut and did not parse; cutting an
+attached database's own three-part names (`aux.m.x` → `m.x`) made them
+read a same-named table of another database; `UPDATE aux.m ... FROM
+main.m` was "target ... may not appear in FROM clause"; the TEMP
+database's handed-over tables were cleared by its own `prepare`; a
+first cut awaited `temp_conn()` (the TEMP database's open) inside
+`prepare_att`, which grew every statement's `prepare` future enough to
+overflow `tests/depth_tiny_v16.rs`'s 512 KiB thread under `vm` (the
+route exists only while the TEMP database does, so it now uses it
+directly). `tests/depth_v16.rs`, `triggers_v16.rs` and
+`depth_tiny_v16.rs` were run with debug info on; no `STACK_*`
+constant needed re-measuring.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (fmt, clippy on every feature set, workspace tests, the `vm`
+suites, no_std builds, all four size gates).
+
+**Size Δ.** tiny 0 (76,928); full 0 (490,396); max +5,008 (976,692 →
+981,700); xl +7,216 (1,077,632 → 1,084,848). Ratchets raised to the
+measured figures (`ci/size-ratchet.toml`): the integrity check's walk
+over the other databases (≈1.4 KB), the router's TEMP route and
+qualifier insertion (≈1.2 KB), the shared `run_routed` / `width_on`
+instantiated for the TEMP database (≈1.2 KB), the expander's attached
+views (≈0.8 KB); on xl `Statement::step` inlines the larger `step_att`
+(+2 KB of the xl figure). Offsets taken: `collect_on` dropped for `run_routed`
+(-160 B), `foreign_from` reduced to the qualifier test (-384 B); an
+out-of-line `att_source` and one boxed future per database measured no
+smaller and were not kept.
+
+**Honest gaps.**
+- (open: items 1 and 2) TEMP triggers on main or attached tables, and
+  TEMP triggers writing another database's table (qualified or not),
+  are refused (`Unsupported`) or fail when they fire; see "Not closed"
+  above. Non-TEMP triggers' qualified writes are the pin's error
+  ("qualified table names are not allowed ...", unchanged).
+- (open: item 5) No index or rowid access path into attached or TEMP
+  tables (read whole once per execution, scanned per outer row); EXPLAIN
+  QUERY PLAN shows `SCAN`, and a join with such a table keeps FROM
+  order.
+- A write of an attached (or the TEMP) database reading *another*
+  database's view is refused (`Unsupported`): external sources are
+  tables only (a view's rows would need its column affinities there).
+  Reads on main (queries, INSERT into main) expand such views.
+- A three-part name of another database whose table the statement
+  does not read (`UPDATE aux.t SET b = main.m.y`) is refused, where the
+  pin reports "no such column".
+- `UPDATE 't' SET 'a' = 5` (a string as a SET column name) does not
+  parse (found along the way; not a qualifier).
+- `pragma_integrity_check` / `pragma_quick_check` as table-valued
+  functions are refused (the v0.16 PRAGMA unit's gap, unchanged).
+- With a TEMP database every INSERT / UPDATE / DELETE is parsed once
+  more by the ATTACH router (to find a TEMP write reading main).
+
 ### Parity: values_chain — VALUES chains, lazy collations, inert aggregates (2026-11-17)
 
 Wave 18's second unit (owner decision 2026-11-17: close the
@@ -13000,8 +13197,8 @@ points (boxed futures).
 
 **Honest gaps:**
 
-- External sources are read whole, in rowid / key order, with no
-  index access path: an unordered query whose pin plan walks an index
+- (still open in v0.17: `attach` unit, item 5) External sources are
+  read whole, in rowid / key order, with no index access path: an unordered query whose pin plan walks an index
   of an attached table (or an `INSERT ... SELECT` without ORDER BY
   feeding one) can list rows in another order. `INDEXED BY` on such a
   source is not checked there.
@@ -13011,22 +13208,29 @@ points (boxed futures).
   scan stays linear per outer row (the review's 3000 x 3000 lookup:
   about 10 s in a debug build, where the pin seeks its rowid).
 - Refused (`Unsupported`) where the pin answers: an attached database's
-  view read together with another database's table; a TEMP trigger on
+  view read together with another database's table (closed in v0.17:
+  `attach` — on main; a write of another database reading it is still
+  refused); a TEMP trigger on
   a main or attached table (the TEMP unit's gap), or one writing a
   schema-qualified table (`INSERT INTO main.m ...` / `a.t`: a trigger
   program runs inside the database that fires it, with no router to
-  the others); a TEMP UPDATE / DELETE / INSERT VALUES reading
+  the others) (still open in v0.17: `attach` unit, items 1 and 2); a
+  TEMP UPDATE / DELETE / INSERT VALUES reading
   another database (only `INSERT ... SELECT` / CTAS feed the temp
-  database); a three-part name of another database inside a write of
-  an attached table; an unqualified name meaning a table of another
+  database) (closed in v0.17: `attach`); a three-part name of another
+  database inside a write of
+  an attached table (closed in v0.17: `attach`); an unqualified name
+  meaning a table of another
   database in a statement that also names the same-named table of the
-  attached database it writes; attaching a file the connection already
-  has open.
+  attached database it writes (closed in v0.17: `attach`); attaching a
+  file the connection already has open.
 - An unqualified `PRAGMA integrity_check` / `quick_check` /
   `foreign_key_check` checks main only (the pin checks every
-  database); `PRAGMA aux.x` checks aux.
+  database); `PRAGMA aux.x` checks aux. (closed in v0.17: `attach` —
+  integrity_check / quick_check check every database; the pin's
+  unqualified `foreign_key_check` checks main only, as hipp's does.)
 - A string-literal schema qualifier (`'aux'.t`) does not parse
-  (`"aux".t` does).
+  (`"aux".t` does). (closed in v0.17: `attach`)
 - A super-journal whose writing was cut before any journal pointed at
   it stays behind (as on the pin). Below `v16` (tiny, the lower
   rungs) recovery still rolls back every hot journal, so a pin-made

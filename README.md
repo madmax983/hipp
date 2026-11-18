@@ -33,8 +33,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 490,396 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 976,692 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,077,632 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 981,700 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,084,848 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,20 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **ATTACH parity** (unit `attach`, leaf `attach`). A string literal
+  names a schema, table or column where the pin's grammar takes a name
+  (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `FROM 't'`); an unqualified
+  `PRAGMA integrity_check` / `quick_check` checks main, temp and every
+  attached database in turn under one error limit (a B-tree message
+  names its own database); an attached database's view is read beside
+  other databases' tables with its names bound to its own database (and
+  `aux.v` no longer reads main's `v`); a TEMP UPDATE / DELETE / INSERT
+  VALUES reads main and attached tables; a write of an attached table
+  reads another database's same-named table by an unqualified name and
+  other databases' tables by three-part names. Still open (STATUS.md):
+  TEMP triggers on main or attached tables or writing another
+  database, index / rowid access paths into attached and TEMP tables,
+  and an attached or TEMP write reading another database's view.
 - **VALUES chains, lazy collations, inert aggregates** (unit
   `values_chain`, ungated fixes). A multi-row VALUES is the pin's
   `sqlite3MultiValues` row by row — a co-routine, or one-row selects
@@ -1168,7 +1182,11 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   order (temp, main, then attached in attach order). Not yet: TEMP
   triggers on main or attached tables, or writing schema-qualified
   tables (refused cleanly), and index access paths into another
-  database's tables (they are read whole, once per execution). Each attached
+  database's tables (they are read whole, once per execution). (v0.17
+  `attach` closed the string-literal qualifier, the integrity check
+  over every database, attached views beside other databases' tables,
+  TEMP writes reading other databases and same-named / three-part
+  names in attached writes; see "What v0.17 does".) Each attached
   database is a connection of its own owned by the main one — the
   TEMP database's model made N-ary — so every feature works inside
   it; statements across databases (joins, subqueries, compounds,

@@ -1790,7 +1790,7 @@ impl<S: Storage> Connection<S> {
         // is routed first (`session::attach`); the tables of other
         // databases the last one read are forgotten.
         #[cfg(feature = "attach")]
-        if self.alias.is_none() {
+        if self.alias.is_none() && !self.is_temp {
             self.ext.borrow_mut().clear();
         }
         #[cfg(feature = "attach")]
@@ -1969,7 +1969,11 @@ impl<S: Storage> Connection<S> {
         }
         #[allow(unused_mut)]
         let mut rows = st.eqp_rows().await?;
-        if let Plan::Temp { .. } = &st.plan {
+        #[cfg(feature = "attach")]
+        let temp_att = matches!(&st.plan, Plan::Att(p) if p.db == attach::TEMP_DB);
+        #[cfg(not(feature = "attach"))]
+        let temp_att = false;
+        if matches!(st.plan, Plan::Temp { .. }) || temp_att {
             eqp::requalify::<S::Error>(&mut rows, rest.as_bytes(), b"temp", true, &st.arena);
         }
         #[cfg(feature = "attach")]
@@ -4446,9 +4450,16 @@ impl<S: Storage> Connection<S> {
         // FROM t AS x`; `FROM t AS t` and `FROM t AS t2` are
         // accepted). Review finding: hipp ran it as a self-join.
         let alias_b = alias.map(|a| handle_bytes(arena, a));
+        // Another database's table of the name is no repeat (v0.17,
+        // `attach`).
+        #[cfg(feature = "attach")]
+        let foreign = |s: &crate::sql::FromSource| self.foreign_from(s, arena);
+        #[cfg(not(feature = "attach"))]
+        let foreign = |_: &crate::sql::FromSource| false;
         if from.iter().any(|s| {
             s.derived.is_none()
                 && eq_ci(handle_bytes(arena, s.table), tname)
+                && !foreign(s)
                 && match (s.alias.map(|a| handle_bytes(arena, a)), alias_b) {
                     (None, None) => true,
                     (Some(x), Some(y)) => eq_ci(x, y),
@@ -6046,6 +6057,20 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "attach")]
             {
                 desc.dbname = self.own_dbname();
+                // An attached database's view read on main (v0.17):
+                // its database's, as its tables are (`ext_source`).
+                if let Some(i) = s
+                    .schema
+                    .and_then(|q| self.att_index(handle_bytes(arena, q)))
+                {
+                    desc.db = u8::try_from(i + 4).unwrap_or(u8::MAX);
+                    desc.dbname = self
+                        .attached
+                        .as_slice()
+                        .get(i)
+                        .map(|a| a.name.clone())
+                        .unwrap_or_default();
+                }
             }
         } else if s.derived.is_none() {
             let n = handle_bytes(arena, s.table);

@@ -2575,6 +2575,16 @@ impl<S: Storage> Statement<'_, S> {
         if let Plan::Att(p) = &self.plan {
             let (db, t) = (p.db, text(p.sql.as_slice()));
             let tabs = self.conn.ext_tabs(p.ext.as_slice())?;
+            // A TEMP write reading other databases (v0.17).
+            if db == super::attach::TEMP_DB {
+                let Some(c) = self.conn.temp.as_deref_mut() else {
+                    return Err(Error::Unsupported);
+                };
+                *c.ext.borrow_mut() = tabs;
+                let r = collect(c, t.as_slice()).await.map_err(temp::mem_err);
+                c.ext.borrow_mut().clear();
+                return r;
+            }
             let Some(a) = self.conn.attached.as_mut_slice().get_mut(db) else {
                 return Err(Error::Schema {
                     kind: SchemaKind::NoSuchDatabase,

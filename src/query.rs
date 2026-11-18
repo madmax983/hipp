@@ -2209,7 +2209,9 @@ fn resolve_node<E>(
             // `attach`).
             #[cfg(feature = "attach")]
             let db = match schema {
-                Some(sc) if db == 3 => {
+                // (v0.17: any name, `main` / `temp` included: a source
+                // another database handed over is reached by its own.)
+                Some(sc) => {
                     let n = handle_bytes(arena, *sc);
                     core::iter::once(cur)
                         .chain(enclosing.iter())

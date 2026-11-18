@@ -164,6 +164,18 @@ struct Expander<'c> {
     /// fix, `planner`; see `cte`).
     #[cfg(feature = "planner")]
     in_rhs: bool,
+    /// The attached databases' names and catalogs, and the TEMP
+    /// database's catalog (v0.17, `attach`): a view of an attached
+    /// database read by a statement of main is expanded here with
+    /// its names bound to its own database.
+    #[cfg(feature = "attach")]
+    att: AVec<(&'c [u8], &'c Catalog, &'c Arena)>,
+    #[cfg(feature = "attach")]
+    tmp: Option<(&'c Catalog, &'c Arena)>,
+    /// Walking the body of attached database `db`'s view (`catalog`
+    /// and `ca` are that database's then).
+    #[cfg(feature = "attach")]
+    db: Option<usize>,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -197,6 +209,16 @@ impl<S: Storage> Connection<S> {
             fix_main: false,
             #[cfg(feature = "planner")]
             in_rhs: false,
+            #[cfg(feature = "attach")]
+            att: self
+                .attached
+                .iter()
+                .map(|a| (a.name.as_slice(), &a.conn.catalog, &a.conn.catalog_arena))
+                .collect(),
+            #[cfg(feature = "attach")]
+            tmp: self.temp.as_deref().map(|c| (&c.catalog, &c.catalog_arena)),
+            #[cfg(feature = "attach")]
+            db: None,
         }
     }
 
@@ -902,6 +924,10 @@ impl Expander<'_> {
             }
             return Ok(());
         }
+        #[cfg(feature = "attach")]
+        if self.att_source::<E>(f, name.as_slice())? {
+            return Ok(());
+        }
         if self.fix_main {
             f.qualified = true;
         }
@@ -999,6 +1025,59 @@ impl Expander<'_> {
                 }
             }
         }
+    }
+
+    /// A FROM name of an attached database on main (v0.17, `attach`;
+    /// `true`: settled here). `aux.v`, an unqualified name only an
+    /// attached database has, and every name in the body of such a
+    /// database's view (bound to that database, as the pin's
+    /// `DbFixer` binds a stored view's names) are looked up in its
+    /// catalog: a view is expanded there, a table is left to the
+    /// planner as that database's (`ext_source`), its schema named.
+    /// Before, `aux.v` read main's view `v` when main had one, and
+    /// a view of another database read beside main's tables was
+    /// refused.
+    #[cfg(feature = "attach")]
+    fn att_source<E>(&mut self, f: &mut FromSource, name: &[u8]) -> Result<bool, E> {
+        let q = f.schema.map(|h| handle_bytes(self.arena, h));
+        let i = match (self.db, q) {
+            (Some(i), _) => i,
+            (None, Some(q)) => {
+                if eq_ci(q, b"main") || eq_ci(q, b"temp") {
+                    return Ok(false);
+                }
+                match self.att.iter().position(|a| eq_ci(a.0, q)) {
+                    Some(i) => i,
+                    None => return Ok(true),
+                }
+            }
+            (None, None) => {
+                let mine = |c: &Catalog, a: &Arena| c.taken(a, name) == Some(false);
+                if self.fix_main
+                    || mine(self.catalog, self.ca)
+                    || self.tmp.is_some_and(|(c, a)| mine(c, a))
+                {
+                    return Ok(false);
+                }
+                match self.att.iter().position(|a| mine(a.1, a.2)) {
+                    Some(i) => i,
+                    None => return Ok(false),
+                }
+            }
+        };
+        let Some(&(an, cat, ca)) = self.att.as_slice().get(i) else {
+            return Ok(true);
+        };
+        if let Some(v) = cat.find_view(ca, name) {
+            let saved = (self.catalog, self.ca, self.db);
+            (self.catalog, self.ca, self.db) = (cat, ca, Some(i));
+            let r = self.view::<E>(f, v);
+            (self.catalog, self.ca, self.db) = saved;
+            r?;
+        }
+        // (A view's columns answer to its database's name too.)
+        f.schema = Some(self.arena.alloc_copy_handle(an)?);
+        Ok(true)
     }
 
     /// Rewrite `f` into the derived table of view `v`.

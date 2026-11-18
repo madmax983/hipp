@@ -29,8 +29,10 @@
 //!   read temp tables (`plan_temp_source`: an unqualified name is
 //!   temp first), and a temp INSERT ... SELECT / CREATE TABLE ... AS
 //!   SELECT that reads main is fed the SELECT's rows from main
-//!   (`Route::TempFed`); a temp UPDATE / DELETE that reads main is
-//!   still refused (`Unsupported`).
+//!   (`Route::TempFed`); a temp UPDATE / DELETE / INSERT VALUES that
+//!   reads main runs on the temp database with main's tables handed
+//!   over as external sources (v0.17, `attach`: the ATTACH router's
+//!   `TEMP_DB` route), and is refused (`Unsupported`) without it.
 //!
 //! The connection-wide pragmas (`foreign_keys`, `case_sensitive_like`,
 //! `ignore_check_constraints`, ...) are the main connection's, copied
