@@ -1760,6 +1760,7 @@ impl<S: Storage> Connection<S> {
                     select: Some(select),
                     sql,
                     affs,
+                    ..
                 } = self.plan_create_as(arena, name.as_slice(), sel)?
                 else {
                     return Err(Error::Unsupported);

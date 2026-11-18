@@ -105,7 +105,7 @@ enum Mode {
     /// Project and return it.
     Plain,
     /// Project it; return it unless an equal row came before.
-    Distinct(AVec<AVec<OwnedValue>>),
+    Distinct(AVec<Produced>),
     /// Fold it into the aggregates.
     Agg(Box<AggRun>),
     /// Keep it for the grouping projection at the end.
@@ -196,32 +196,6 @@ fn agg_streams(p: &crate::query::AggParts<'_>) -> bool {
     ) && !p.distinct
         && p.order.is_empty()
         && (p.star || p.args.len() == 1)
-}
-
-/// Whether ORDER BY `order` is source `sp`'s own row order: the
-/// order of the index or rowid loop that reads it, when that loop
-/// delivers every term; else its rowid (or INTEGER PRIMARY KEY),
-/// ascending, over a table read in rowid order.
-fn rowid_order(sp: &SourcePlan, order: &[(RExpr, crate::sql::SortOrder)]) -> bool {
-    // An index (or rowid) loop that delivers every term (v0.16
-    // `expr_index`'s access planner).
-    #[cfg(feature = "expr_index")]
-    if let Some(a) = sp.access.as_deref() {
-        return !a.lateral && a.sorted >= order.len();
-    }
-    let [(e, o)] = order else {
-        return false;
-    };
-    let plain = sp.derived.is_none() && !sp.temp;
-    #[cfg(feature = "expr_index")]
-    let plain = plain && sp.access.is_none();
-    plain
-        && !o.desc
-        && match e {
-            RExpr::Rowid(0) => true,
-            RExpr::Column(slot, ..) => sp.rowid_alias.is_some_and(|a| a == *slot),
-            _ => false,
-        }
 }
 
 impl<S: Storage> Statement<'_, S> {
@@ -343,12 +317,11 @@ impl<S: Storage> Statement<'_, S> {
             }
         } else if !qp.order_by.is_empty()
             && !(qp.sources.len() == 1
-                && !qp.distinct
                 && qp
                     .sources
                     .as_slice()
                     .first()
-                    .is_some_and(|s| rowid_order(s, qp.order_by.as_slice())))
+                    .is_some_and(|s| order_delivered(s, (0, 0), qp.order_by.as_slice())))
         {
             Mode::Sort(AVec::new())
         } else if qp.distinct {
@@ -459,13 +432,14 @@ impl<S: Storage> Statement<'_, S> {
                     let vals = self.stream_items(s.qp.items.as_slice(), &s.acc).await?;
                     self.side_drop(s.row_side, s.pinned);
                     let colls = crate::query::exprs_colls(s.qp.items.as_slice());
-                    if seen.iter().any(|k| {
-                        k.len() == vals.len()
-                            && compound_rows_equal(k.as_slice(), vals.as_slice(), colls.as_slice())
-                    }) {
+                    if dup_row(seen.as_slice(), vals.as_slice(), colls.as_slice()) {
                         continue;
                     }
-                    seen.push(vals.clone());
+                    seen.push(Produced {
+                        out: vals.clone(),
+                        keys: AVec::new(),
+                        rowid: None,
+                    });
                     if s.skip > 0 {
                         s.skip -= 1;
                         continue;
@@ -1041,6 +1015,11 @@ impl<S: Storage> Statement<'_, S> {
                         Acc::Ext(b) => b.clone().unwrap_or(OwnedValue::Null),
                     });
                 }
+                // The one row an OFFSET skips: its aggregates finish,
+                // its columns are never computed (`pre_skip`).
+                if s.window.0 > 0 {
+                    return Ok(());
+                }
                 let mut out = AVec::new();
                 let mut at = 0usize;
                 for it in s.qp.items.iter() {
@@ -1067,10 +1046,19 @@ impl<S: Storage> Statement<'_, S> {
                     s.qp.group_by.as_slice(),
                     s.qp.order_by.as_slice(),
                     s.qp.sources.as_slice(),
-                    s.qp.distinct,
                     s.window,
                 );
-                self.project_qp_async(&s.qp, rows.as_slice(), cap).await?
+                let pre = pre_skip(
+                    s.qp.items.as_slice(),
+                    s.qp.group_by.as_slice(),
+                    s.qp.order_by.as_slice(),
+                    s.qp.sources.as_slice(),
+                    (s.qp.distinct, s.qp.has_agg),
+                    (0, 0),
+                    (s.window.0, s.window.0.saturating_add(s.window.1)),
+                );
+                self.project_qp_async(&s.qp, rows.as_slice(), cap, pre)
+                    .await?
             }
             Mode::Sort(out) => core::mem::take(out),
         };

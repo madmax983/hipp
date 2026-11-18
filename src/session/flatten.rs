@@ -595,12 +595,19 @@ impl<S: Storage> Connection<S> {
             let Some(d) = f.derived.as_deref() else {
                 continue;
             };
-            if f.flat
+            // (A subquery the flattener merges takes the term only to
+            // pass it on to the one FROM subquery it reads, as the pin
+            // pushes it once the merge brought that subquery up: v0.17
+            // review fix, `SELECT x FROM (SELECT * FROM (compound))`.)
+            if (f.flat && !passes_on(d))
                 || f.cte
                     .as_ref()
                     .is_some_and(|c| c.mat != 0 || !matches!(c.rec, crate::sql::RecMark::None))
                 || d.limit.is_some()
                 || !matches!(f.kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left)
+                // (A VALUES chain of one-row selects throughout, the
+                // pin's `SF_MultiValue`, takes no term: v0.17, probed.)
+                || (d.vchain && d.compound.iter().all(|(_, c)| c.vchain))
             {
                 continue;
             }
@@ -629,7 +636,7 @@ impl<S: Storage> Connection<S> {
             // no arm's column has a collation other than BINARY: the
             // pin's restriction (8); v0.17 fix.)
             ok &= arms.iter().all(|(a, q)| {
-                a.items.iter().all(|it| matches!(it, SelectItem::Expr(..)))
+                (a.items.iter().all(|it| matches!(it, SelectItem::Expr(..))) || star_arm(a, q))
                     && !q.items.iter().any(has_win)
                     && !q.values.iter().flat_map(|r| r.iter()).any(has_win)
                     && (union_all
@@ -793,10 +800,25 @@ impl<S: Storage> Connection<S> {
                         };
                         let c = slot.checked_sub(o_k).filter(|c| *c < nk);
                         let it = c.and_then(|c| match row {
-                            Some(r) => r.as_slice().get(c).map(|e| (c, e)),
-                            None => match a.items.as_slice().get(c) {
-                                Some(SelectItem::Expr(e, ..)) => Some((c, e)),
-                                _ => None,
+                            Some(r) => r.as_slice().get(c).map(|e| (c, e.clone())),
+                            None => match a.items.as_slice() {
+                                // (`SELECT * FROM (...)`: the column by
+                                // its name, v0.17 review fix.)
+                                [SelectItem::Star] => {
+                                    let n = q.result_names.as_slice().get(c)?;
+                                    Some((
+                                        c,
+                                        Expr::Column {
+                                            table: None,
+                                            name: arena.alloc_copy_handle(n.as_slice()).ok()?,
+                                            schema: None,
+                                        },
+                                    ))
+                                }
+                                items => match items.get(c) {
+                                    Some(SelectItem::Expr(e, ..)) => Some((c, e.clone())),
+                                    _ => None,
+                                },
                             },
                         });
                         match it {
@@ -827,12 +849,9 @@ impl<S: Storage> Connection<S> {
                                     if want == coll(q)
                                         && matches!(ie, Expr::Column { .. } | Expr::Collate(..))
                                     {
-                                        ie.clone()
+                                        ie
                                     } else {
-                                        Expr::Collate(
-                                            Box::new(ie.clone()),
-                                            want.unwrap_or_default(),
-                                        )
+                                        Expr::Collate(Box::new(ie), want.unwrap_or_default())
                                     },
                                 )
                             }
@@ -906,7 +925,22 @@ impl<S: Storage> Connection<S> {
             }
             let mut f2 = f.clone();
             f2.derived = Some(Box::new(d2));
-            self.replan_flat(arena, &f2, enclosing, p, k)?;
+            // (A merged body is planned for its splice again, and keeps
+            // its own WHERE: the term stays in the reader once.)
+            let old = f.flat.then(|| dp.filter.clone());
+            self.flat_raw.set(f.flat);
+            let r = self.replan_flat(arena, &f2, enclosing, p, k);
+            self.flat_raw.set(false);
+            r?;
+            if let (Some(w), Some(d)) = (
+                old,
+                p.sources
+                    .as_mut_slice()
+                    .get_mut(k)
+                    .and_then(|s| s.derived.as_deref_mut()),
+            ) {
+                d.filter = w;
+            }
         }
         Ok(())
     }
@@ -945,6 +979,36 @@ impl<S: Storage> Connection<S> {
         }
         Ok(())
     }
+}
+
+/// A body the flattener merges that reads one FROM subquery that a
+/// pushed term reaches (one not merged itself, or such a body).
+fn passes_on(d: &SelectStmt) -> bool {
+    match d.from.as_slice() {
+        [g] => {
+            d.compound.is_empty()
+                && d.values.is_empty()
+                && g.derived
+                    .as_deref()
+                    .is_some_and(|x| !g.flat || passes_on(x))
+        }
+        _ => false,
+    }
+}
+
+/// An arm written `SELECT * FROM (...)` over one FROM item whose
+/// columns' names are distinct (v0.17 review fix): a pushed term names
+/// each column by its name (a later VALUES chain's wrapper, a view or
+/// subquery that reads a compound).
+fn star_arm(a: &SelectStmt, q: &SubPlan) -> bool {
+    let n = q.result_names.as_slice();
+    matches!(a.items.as_slice(), [SelectItem::Star])
+        && a.from.len() == 1
+        && n.iter().enumerate().all(|(i, x)| {
+            !n.iter()
+                .skip(i + 1)
+                .any(|y| x.as_slice().eq_ignore_ascii_case(y.as_slice()))
+        })
 }
 
 /// A one-row VALUES core as the pin's one-row select (`SF_Values`), so

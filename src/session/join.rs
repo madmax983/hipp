@@ -1646,6 +1646,19 @@ impl<S: Storage> Connection<S> {
         let Some(plan) = crate::xjoin::plan(jsrcs.as_slice(), &jq) else {
             return Ok(false);
         };
+        // The ORDER BY terms the path delivers only because its rows
+        // are distinct by then are never computed (v0.17 fix: `ORDER BY
+        // a.rowid, b.rowid, abs(-9223372036854775808)` answers); the
+        // rest still order the rows.
+        if !group && !has_agg && plan.ob_od != 0 && plan.ob_sat >= order_by.len() {
+            let mut kept: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+            for (i, t) in order_by.iter().enumerate() {
+                if plan.ob_od & (1u64 << i) == 0 {
+                    kept.push(t.clone());
+                }
+            }
+            *order_by = kept;
+        }
         // The LEFT JOINs the pin's plan omits (EXPLAIN QUERY PLAN).
         #[cfg(feature = "explain")]
         let mut omit: AVec<bool> = AVec::new();

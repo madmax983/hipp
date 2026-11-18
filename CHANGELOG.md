@@ -5,6 +5,91 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### VALUES chains, lazy collations, inert aggregates (wave 18, unit `values_chain`)
+
+- Fixes (ungated): a multi-row VALUES is parsed as the pin's
+  `sqlite3MultiValues` builds it, row by row — a co-routine, or a
+  UNION ALL chain of one-row selects after a WITH clause, in a view's
+  or a trigger's text, for a non-constant row (a column, a subquery,
+  a non-deterministic or aggregate / window call) or after a one-row
+  select that is not constant or has an affinity, a later constant row
+  starting a co-routine again; a later chain is the pin's `SELECT *
+  FROM (chain)`. A reader's WHERE term is pushed into each chained
+  row with its own affinity, into a later chain's wrapper with the
+  chain's column affinity (whose REAL column reads every integer as a
+  real), never into a chain of one-row selects throughout; plans show
+  `SCAN CONSTANT ROW`, `SCAN n CONSTANT ROWS`, `0-ROW VALUES CLAUSE`
+  and a FROM-less core's WHERE subqueries. A VALUES column a first-row
+  column reference fills is named by that column (`(VALUES (t.r),
+  (2))` has `r`). An unknown collation (`Coll::Unknown`) is looked up
+  only where the pin does — comparisons, an IN list's left operand,
+  min / max / nullif, ORDER BY / GROUP BY / DISTINCT / merge / window
+  / aggregate keys, a FROM subquery's or CREATE TABLE AS's columns —
+  so `SELECT 1 COLLATE bogus` runs and a CHECK naming one fails only
+  the write that codes it. An enclosing query's aggregate in a dropped
+  ORDER BY or an EXISTS result list steps in its aggregate owner; a
+  nested window query's ORDER BY inside a dropped term raises no
+  code-generation error; a view column read through a compound FROM
+  subquery takes its type from the rightmost core (`INT`, `REAL`,
+  `NUM`); a result alias in a WHERE term is pushed down as the item it
+  names (`planner`).
+- Review fixes (ungated): a later VALUES arm is the pin's `SELECT *
+  FROM (chain)` again, so a correlated chain's named column (`(t.i)`)
+  no longer fails as "no such column", and a pushed WHERE term reaches
+  a `SELECT * FROM (...)` arm by column name; a WHERE term reaches a
+  compound through a merged `SELECT ... FROM (compound)` subquery or
+  view (a view's VALUES chain included), each arm comparing with its
+  own affinity; a trigger's `new.rowid` keeps its INTEGER affinity as a
+  result item; a VALUES co-routine begun after 500+ chained rows is
+  exempt from the compound limit and a CTE's chained rows count as one
+  SELECT; `SELECT count(*) FROM (compound)` of 1,000+ arms fails as
+  "Expression tree is too large" (the pin's `countOfViewOptimization`);
+  a CHECK under an unknown collation fails ADD COLUMN when it verifies
+  the rows, an UPDATE only when it reads a changed column, a foreign
+  key action only when it reads the child key, and `integrity_check`;
+  PRAGMA table_info and ALTER TABLE resolve views without coding them
+  (only a view's column collations are looked up, by table_info);
+  CREATE TABLE ... AS keeps a REAL in a FLEXNUM (`NUM`) column.
+- Tests: `tests/values_chain_v17.rs` (rows and plans against the live
+  pin, generated corpora; one suite on the frozen VM under `vm`),
+  `hipp-cli/tests/cli_v17_values_chain.rs`.
+- Size: tiny 0, full +3,100 B, max +3,564 B, xl +3,516 B (ratchets
+  raised to the measured figures); review fixes: full +2,992 B, max +184 B, xl +3,008 B.
+
+### ORDER BY / OFFSET parity (wave 18, unit `order_offset`)
+
+- Fixes (ungated): the OFFSET skips a row before its result columns
+  are computed — FROM-less cores, subqueries, views, CTEs, UNION ALL
+  chains (whose plain cores also stop at the LIMIT), window queries,
+  aggregates (their aggregates still step) and delivered ORDER BYs —
+  as the pin's `selectInnerLoop` does; an ORDER BY whose loop makes the
+  rows distinct (the rowid, a UNIQUE NOT NULL key, a NOT NULL WITHOUT
+  ROWID key, a join's distinct loops) delivers its later
+  table-reading or constant terms uncomputed (`isOrderDistinct`), and
+  any other later term sorts the whole ORDER BY; a FROM subquery's
+  ORDER BY is dropped where the pin's `SQLITE_OmitOrderBy` drops it
+  (kept under a LIMIT, an order-sensitive aggregate, a window or a
+  MATERIALIZED CTE); a lone co-routine's ORDER BY or compound merge key
+  delivers the reader's ORDER BY by column number
+  (`SQLITE_OrderBySubq`); a DISTINCT subquery under a LIMIT stops at
+  it; a UNION ALL compound's ORDER BY keeps ties in core order.
+- Review fixes (ungated): an ORDER BY the loop delivers under a
+  COLLATE or with later plain columns (`ORDER BY rowid, b`, an INTEGER
+  PRIMARY KEY `a COLLATE NOCASE`) skips its OFFSET and stops at its
+  LIMIT, in correlated subqueries too, where an enclosing query's
+  rowid no longer reads as the subquery's own order; isOrderDistinct
+  counts an IN equality as `=` and walks a WITHOUT ROWID index's
+  columns past its key (NOT NULL each) — rows and EXPLAIN QUERY PLAN
+  as the pin's; a single-row aggregate's DISTINCT / ORDER BY no longer
+  makes its OFFSET row computed; window queries, DISTINCT UNION ALL
+  cores and DISTINCT groupings stop at their LIMIT; a DISTINCT
+  subquery under a LIMIT deduplicates once (back to base speed).
+- Tests: `tests/order_offset_v17.rs` (rows and EQP against the live
+  pin, generated corpora), `hipp-cli/tests/cli_v17_order_offset.rs`.
+- Size: tiny 0, full +2,720 B, max +3,504 B, xl +3,456 B (ratchets
+  raised to the measured figures); review fixes: tiny 0, full +520 B,
+  max +968 B, xl +936 B.
+
 ### Planner and CLI parity (wave 17, unit `gaps_plan_cli`)
 
 - Fixes (ungated): `INDEXED BY` an index of another table (or of a

@@ -1401,7 +1401,11 @@ pub fn sub_col_affinity(plan: &SubPlan, j: usize) -> Option<Affinity> {
 /// VALUES core's items carry none.
 pub fn item_result_affinity(r: &RExpr) -> Option<Affinity> {
     match r {
-        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) => Some(*aff),
+        // (A trigger's `new.rowid` keeps its INTEGER affinity: v0.17
+        // review fix.)
+        RExpr::Column(_, aff, _) | RExpr::Cast(_, aff) | RExpr::AffLiteral(_, Some(aff), _) => {
+            Some(*aff)
+        }
         RExpr::Collate(x, _) => item_result_affinity(x),
         RExpr::Rowid(_) => Some(Affinity::Integer),
         // A scalar subquery carries its own result's affinity
@@ -2138,8 +2142,40 @@ pub fn resolve<E>(
 /// Resolve a parser `Expr` against the current scope group plus
 /// enclosing groups (nearest first), planning subqueries through
 /// `planner` (v0.6). Column resolution shadows outward: the
-/// current group answers first.
+/// current group answers first. A comparison or other collating
+/// use of an unknown collation is the pin's code-generation error
+/// "no such collation sequence" (v0.17, `coll_misses`; it waits in
+/// an ORDER BY the pin never codes, `late`).
 pub fn resolve_scoped<E>(
+    expr: &Expr,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+    planner: SubPlanner<'_, E>,
+) -> Result<RExpr, E> {
+    let r = resolve_node::<E>(expr, arena, cur, enclosing, planner)?;
+    #[cfg(feature = "sql")]
+    if coll_misses(&r) {
+        late::<E>(SchemaKind::UnknownCollation, cur, enclosing)?;
+    }
+    Ok(r)
+}
+
+/// `resolve_scoped` with no collation looked up and no enclosing
+/// scope (v0.17 review fix, `sql`): a CHECK, whose collations are
+/// looked up only by the writes that code it (`TableRules::coded`).
+#[cfg(feature = "sql")]
+pub(crate) fn resolve_lazy<E>(
+    expr: &Expr,
+    arena: &Arena,
+    cur: &ScopeGroup,
+    planner: SubPlanner<'_, E>,
+) -> Result<RExpr, E> {
+    resolve_node::<E>(expr, arena, cur, &[], planner)
+}
+
+/// `resolve_scoped`'s recursion.
+fn resolve_node<E>(
     expr: &Expr,
     arena: &Arena,
     cur: &ScopeGroup,
@@ -2198,36 +2234,24 @@ pub fn resolve_scoped<E>(
         }
         Expr::Binary(op, l, r) => RExpr::Binary(
             *op,
-            Box::new(resolve_scoped::<E>(
-                l,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
-            Box::new(resolve_scoped::<E>(
-                r,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
+            Box::new(resolve_node::<E>(l, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_node::<E>(r, arena, cur, enclosing, &mut *planner)?),
         ),
-        Expr::Neg(e) => RExpr::Neg(Box::new(resolve_scoped::<E>(
+        Expr::Neg(e) => RExpr::Neg(Box::new(resolve_node::<E>(
             e,
             arena,
             cur,
             enclosing,
             &mut *planner,
         )?)),
-        Expr::Pos(e) => RExpr::Pos(Box::new(resolve_scoped::<E>(
+        Expr::Pos(e) => RExpr::Pos(Box::new(resolve_node::<E>(
             e,
             arena,
             cur,
             enclosing,
             &mut *planner,
         )?)),
-        Expr::Not(e) => RExpr::Not(Box::new(resolve_scoped::<E>(
+        Expr::Not(e) => RExpr::Not(Box::new(resolve_node::<E>(
             e,
             arena,
             cur,
@@ -2235,34 +2259,16 @@ pub fn resolve_scoped<E>(
             &mut *planner,
         )?)),
         Expr::IsNull(e, neg) => RExpr::IsNull(
-            Box::new(resolve_scoped::<E>(
-                e,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
+            Box::new(resolve_node::<E>(e, arena, cur, enclosing, &mut *planner)?),
             *neg,
         ),
         Expr::Cast(e, ty) => RExpr::Cast(
-            Box::new(resolve_scoped::<E>(
-                e,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
+            Box::new(resolve_node::<E>(e, arena, cur, enclosing, &mut *planner)?),
             crate::record::cast_affinity(handle_bytes(arena, *ty)),
         ),
         #[cfg(feature = "sql")]
         Expr::Collate(e, c) => RExpr::Collate(
-            Box::new(resolve_scoped::<E>(
-                e,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
+            Box::new(resolve_node::<E>(e, arena, cur, enclosing, &mut *planner)?),
             *c,
         ),
         // Everything else (subqueries, row values, lists, CASE,
@@ -2398,7 +2404,7 @@ fn resolve_other<E>(
             }
             let mut args = AVec::new();
             if let Some(m) = msg {
-                args.push(resolve_scoped::<E>(m, arena, cur, enclosing, p)?);
+                args.push(resolve_node::<E>(m, arena, cur, enclosing, p)?);
             }
             RExpr::Scalar(ScalarFn::Raise(*kind), args)
         }
@@ -2449,7 +2455,7 @@ fn res_in_sub<E>(
     #[allow(unreachable_patterns)]
     Ok(match expr {
         Expr::InSubquery(x, stmt, neg) => {
-            let xr = resolve_scoped::<E>(x, arena, cur, enclosing, &mut *planner)?;
+            let xr = resolve_node::<E>(x, arena, cur, enclosing, &mut *planner)?;
             let plan = planner(stmt, cur, enclosing)?;
             if plan.width() != 1 {
                 return late::<E>(SchemaKind::ColumnCountMismatch, cur, enclosing);
@@ -2498,13 +2504,7 @@ fn res_bit_not<E>(
     Ok(match expr {
         Expr::BitNot(e) => {
             let mut args = AVec::new();
-            args.push(resolve_scoped::<E>(
-                e,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?);
+            args.push(resolve_node::<E>(e, arena, cur, enclosing, &mut *planner)?);
             RExpr::Scalar(ScalarFn::BitNot, args)
         }
         _ => return Err(Error::Unsupported),
@@ -2659,14 +2659,14 @@ fn res_row_case<E>(
                 let wp = resolve_row::<E>(w, arena, cur, enclosing, &mut *planner)?;
                 ws.push((
                     row_cmp::<E>(BinOp::Eq, bp.as_slice(), wp.as_slice())?,
-                    resolve_scoped::<E>(t, arena, cur, enclosing, &mut *planner)?,
+                    resolve_node::<E>(t, arena, cur, enclosing, &mut *planner)?,
                 ));
             }
             RExpr::Case {
                 base: None,
                 whens: ws,
                 otherwise: match otherwise {
-                    Some(o) => Some(Box::new(resolve_scoped::<E>(
+                    Some(o) => Some(Box::new(resolve_node::<E>(
                         o,
                         arena,
                         cur,
@@ -2717,22 +2717,10 @@ fn res_in_list<E>(
         Expr::InList(x, list, neg) => {
             let mut out = AVec::new();
             for e in list.iter() {
-                out.push(resolve_scoped::<E>(
-                    e,
-                    arena,
-                    cur,
-                    enclosing,
-                    &mut *planner,
-                )?);
+                out.push(resolve_node::<E>(e, arena, cur, enclosing, &mut *planner)?);
             }
             RExpr::InList(
-                Box::new(resolve_scoped::<E>(
-                    x,
-                    arena,
-                    cur,
-                    enclosing,
-                    &mut *planner,
-                )?),
+                Box::new(resolve_node::<E>(x, arena, cur, enclosing, &mut *planner)?),
                 out,
                 *neg,
                 false,
@@ -2755,27 +2743,9 @@ fn res_between<E>(
     #[allow(unreachable_patterns)]
     Ok(match expr {
         Expr::Between(x, lo, hi, neg) => RExpr::Between(
-            Box::new(resolve_scoped::<E>(
-                x,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
-            Box::new(resolve_scoped::<E>(
-                lo,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
-            Box::new(resolve_scoped::<E>(
-                hi,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
+            Box::new(resolve_node::<E>(x, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_node::<E>(lo, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_node::<E>(hi, arena, cur, enclosing, &mut *planner)?),
             *neg,
         ),
         _ => return Err(Error::Unsupported),
@@ -2795,20 +2765,8 @@ fn res_like<E>(
     #[allow(unreachable_patterns)]
     Ok(match expr {
         Expr::Like(x, p, neg) => RExpr::Like(
-            Box::new(resolve_scoped::<E>(
-                x,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
-            Box::new(resolve_scoped::<E>(
-                p,
-                arena,
-                cur,
-                enclosing,
-                &mut *planner,
-            )?),
+            Box::new(resolve_node::<E>(x, arena, cur, enclosing, &mut *planner)?),
+            Box::new(resolve_node::<E>(p, arena, cur, enclosing, &mut *planner)?),
             *neg,
         ),
         _ => return Err(Error::Unsupported),
@@ -2835,13 +2793,13 @@ fn res_case<E>(
             let mut ws = AVec::new();
             for (w, t) in whens.iter() {
                 ws.push((
-                    resolve_scoped::<E>(w, arena, cur, enclosing, &mut *planner)?,
-                    resolve_scoped::<E>(t, arena, cur, enclosing, &mut *planner)?,
+                    resolve_node::<E>(w, arena, cur, enclosing, &mut *planner)?,
+                    resolve_node::<E>(t, arena, cur, enclosing, &mut *planner)?,
                 ));
             }
             RExpr::Case {
                 base: match base {
-                    Some(b) => Some(Box::new(resolve_scoped::<E>(
+                    Some(b) => Some(Box::new(resolve_node::<E>(
                         b,
                         arena,
                         cur,
@@ -2852,7 +2810,7 @@ fn res_case<E>(
                 },
                 whens: ws,
                 otherwise: match otherwise {
-                    Some(o) => Some(Box::new(resolve_scoped::<E>(
+                    Some(o) => Some(Box::new(resolve_node::<E>(
                         o,
                         arena,
                         cur,
@@ -2874,7 +2832,11 @@ fn res_case<E>(
 /// it or an enclosing group), the first such error waits there and
 /// the expression stands as NULL; elsewhere it fails now.
 #[cfg(feature = "sql")]
-fn late<E>(kind: SchemaKind, cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> Result<RExpr, E> {
+pub(crate) fn late<E>(
+    kind: SchemaKind,
+    cur: &ScopeGroup,
+    enclosing: &[ScopeGroup],
+) -> Result<RExpr, E> {
     let Some(g) = core::iter::once(cur)
         .chain(enclosing)
         .find(|g| g.late.get().is_some())
@@ -2885,6 +2847,51 @@ fn late<E>(kind: SchemaKind, cur: &ScopeGroup, enclosing: &[ScopeGroup]) -> Resu
         g.late.set(Some(Some(kind)));
     }
     Ok(RExpr::Literal(OwnedValue::Null))
+}
+
+/// A FROM subquery's (or CTE's, view's, CREATE TABLE AS's) columns
+/// look their collations up as the pin takes their types
+/// (`sqlite3SubqueryColumnTypes`, at prepare, v0.17): its leftmost
+/// core's items, an unknown one failing at once.
+#[cfg(feature = "sql")]
+pub(crate) fn lead_colls<E>(p: &SubPlan) -> Result<(), E> {
+    let lead = match p.values.as_slice().first() {
+        Some(r) if p.items.is_empty() => r.as_slice(),
+        _ => p.items.as_slice(),
+    };
+    lead_row::<E>(lead)
+}
+
+/// `lead_colls` over one row of items.
+#[cfg(feature = "sql")]
+pub(crate) fn lead_row<E>(lead: &[RExpr]) -> Result<(), E> {
+    if lead.iter().any(|e| expr_coll(e) == Some(Coll::Unknown)) {
+        return Err(Error::Schema {
+            kind: SchemaKind::UnknownCollation,
+        });
+    }
+    Ok(())
+}
+
+/// A sort or comparison key's collation (v0.17, `sql`): the pin
+/// builds an ORDER BY's, GROUP BY's, DISTINCT's or compound's key
+/// whenever it codes the SELECT, so an unknown collation there fails
+/// (even where the ORDER BY is then dropped), unless the SELECT sits
+/// in an enclosing term the pin never codes (`late`, on an enclosing
+/// group only).
+#[cfg(feature = "sql")]
+pub(crate) fn key_coll<E>(c: Coll, enclosing: &[ScopeGroup]) -> Result<(), E> {
+    if c != Coll::Unknown {
+        return Ok(());
+    }
+    let kind = SchemaKind::UnknownCollation;
+    let Some(g) = enclosing.iter().find(|g| g.late.get().is_some()) else {
+        return Err(Error::Schema { kind });
+    };
+    if g.late.get() == Some(None) {
+        g.late.set(Some(Some(kind)));
+    }
+    Ok(())
 }
 
 /// `late` without the `sql` feature: the error, now.
@@ -2943,13 +2950,7 @@ fn resolve_row<E>(
     match e {
         Expr::Vector(items) => {
             for x in items.iter() {
-                out.push(resolve_scoped::<E>(
-                    x,
-                    arena,
-                    cur,
-                    enclosing,
-                    &mut *planner,
-                )?);
+                out.push(resolve_node::<E>(x, arena, cur, enclosing, &mut *planner)?);
             }
         }
         Expr::ScalarSubquery(stmt) => {
@@ -2960,13 +2961,7 @@ fn resolve_row<E>(
                 out.push(RExpr::SubScalar(Box::new(p)));
             }
         }
-        _ => out.push(resolve_scoped::<E>(
-            e,
-            arena,
-            cur,
-            enclosing,
-            &mut *planner,
-        )?),
+        _ => out.push(resolve_node::<E>(e, arena, cur, enclosing, &mut *planner)?),
     }
     Ok(out)
 }
@@ -3039,13 +3034,7 @@ fn resolve_args<E>(
 ) -> Result<AVec<RExpr>, E> {
     let mut out = AVec::new();
     for a in args.iter() {
-        out.push(resolve_scoped::<E>(
-            a,
-            arena,
-            cur,
-            enclosing,
-            &mut *planner,
-        )?);
+        out.push(resolve_node::<E>(a, arena, cur, enclosing, &mut *planner)?);
     }
     Ok(out)
 }
@@ -3348,7 +3337,7 @@ fn resolve_call_body<E>(
             }
             f.args = Some(a);
         }
-        return resolve_scoped::<E>(
+        return resolve_node::<E>(
             &Expr::ScalarSubquery(Box::new(sel)),
             arena,
             cur,
@@ -3486,7 +3475,7 @@ fn resolve_call_body<E>(
                 let minmax = matches!(kind, AggKind::Min | AggKind::Max);
                 let mut order = AVec::new();
                 for (k, o) in c.order_by.iter() {
-                    let r = resolve_scoped::<E>(k, arena, cur, enclosing, &mut *planner)?;
+                    let r = resolve_node::<E>(k, arena, cur, enclosing, &mut *planner)?;
                     if minmax {
                         ignored.push(r);
                         continue;
@@ -3502,13 +3491,7 @@ fn resolve_call_body<E>(
                     && matches!((all.as_slice().first(), all.as_slice().get(1)), (Some(a), Some(b)) if same_expr(a, b));
                 let filter = match &c.filter {
                     Some(f) => {
-                        all.push(resolve_scoped::<E>(
-                            f,
-                            arena,
-                            cur,
-                            enclosing,
-                            &mut *planner,
-                        )?);
+                        all.push(resolve_node::<E>(f, arena, cur, enclosing, &mut *planner)?);
                         true
                     }
                     None => false,
@@ -4069,7 +4052,7 @@ fn direct_agg(e: &RExpr, p: &dyn Fn(&RExpr) -> bool) -> bool {
 /// evaluation must substitute it before executing the subquery.
 pub fn has_owned_sub_agg(e: &RExpr) -> bool {
     let mut any = false;
-    visit_aggs(e, 0, &mut |a, d| any |= d > 0 && !is_inert(a));
+    visit_aggs(e, 0, &mut |_, d| any |= d > 0);
     any
 }
 
@@ -4099,8 +4082,9 @@ pub fn collect_aggs<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
 /// Replace every aggregate of the current query inside nested
 /// subquery plans of `e` (depth >= 1, `visit_aggs`) by the
 /// value `fold` gives it (v0.16): the owner's group evaluation,
-/// before it executes those subqueries. Inert aggregates stay
-/// (they evaluate as NULL, and nothing reads them).
+/// before it executes those subqueries. Inert aggregates fold too
+/// (v0.17: nothing reads their value, but the pin steps them in their
+/// owner, so `SELECT EXISTS(SELECT sum(<overflow>)) FROM t` fails).
 pub fn subst_owned_aggs<E>(
     e: &mut RExpr,
     d: u8,
@@ -4110,9 +4094,7 @@ pub fn subst_owned_aggs<E>(
     // waits here while the walk stops on the unit signal.
     let mut err = None;
     let _ = walk_aggs_mut(e, d, &mut |a, dd| {
-        if let RExpr::Agg {
-            lvl, inert: false, ..
-        } = a
+        if let RExpr::Agg { lvl, .. } = a
             && *lvl == dd
             && dd > 0
         {
@@ -6052,6 +6034,126 @@ pub fn binary_coll(l: &RExpr, r: &RExpr) -> Coll {
         expr_coll(l).or_else(|| expr_coll(r))
     }
     .unwrap_or_default()
+}
+
+/// Call `f` on every direct child of `e` that evaluates against the
+/// same row (subquery plans are other cores and are not entered).
+#[cfg(feature = "sql")]
+pub(crate) fn each_child<'x>(e: &'x RExpr, f: &mut dyn FnMut(&'x RExpr)) {
+    match e {
+        RExpr::Literal(_)
+        | RExpr::AffLiteral(..)
+        | RExpr::Column(..)
+        | RExpr::Rowid(_)
+        | RExpr::Raise(_)
+        | RExpr::SubScalar(_)
+        | RExpr::SubExists(_) => {}
+        RExpr::InSub(x, ..)
+        | RExpr::Neg(x)
+        | RExpr::Pos(x)
+        | RExpr::Not(x)
+        | RExpr::IsNull(x, _)
+        | RExpr::Cast(x, _)
+        | RExpr::Collate(x, _) => f(x),
+        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
+            f(a);
+            f(b);
+        }
+        RExpr::InList(x, l, ..) => {
+            f(x);
+            l.iter().for_each(f);
+        }
+        RExpr::Between(x, a, b, _) => {
+            f(x);
+            f(a);
+            f(b);
+        }
+        RExpr::Case {
+            base,
+            whens,
+            otherwise,
+        } => {
+            if let Some(b) = base {
+                f(b);
+            }
+            for (w, t) in whens.iter() {
+                f(w);
+                f(t);
+            }
+            if let Some(o) = otherwise {
+                f(o);
+            }
+        }
+        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } | RExpr::Win(_, args) => {
+            args.iter().for_each(f)
+        }
+    }
+}
+
+/// Whether resolved expression `e` uses an unknown collation
+/// (`Coll::Unknown`) where the pin looks one up in code generation
+/// (v0.17, `sql`; "no such collation sequence"): a comparison's
+/// (`sqlite3BinaryCompareCollSeq`: `=`, `<`, `IS`, BETWEEN, a CASE's
+/// operand against each WHEN, row values), an IN list's left operand
+/// (its items never: the pin compares by the left operand alone), an
+/// IN subquery's against its rightmost core's item, min() / max() /
+/// nullif()'s first argument with a collation (`SQLITE_FUNC_NEEDCOLL`),
+/// an aggregate's or window call's DISTINCT / ORDER BY / PARTITION BY
+/// key. A COLLATE that only rides along (`SELECT 1 COLLATE bogus`,
+/// `x COLLATE bogus IS NULL`, LIKE, a function argument) is never
+/// looked up. Subquery plans are checked where they resolve.
+#[cfg(feature = "sql")]
+pub(crate) fn coll_misses(e: &RExpr) -> bool {
+    let u = |c: Coll| c == Coll::Unknown;
+    let k = |x: &RExpr| expr_coll(x) == Some(Coll::Unknown);
+    let own = match e {
+        RExpr::Binary(op, l, r) if is_cmp_op(*op) => u(binary_coll(l, r)),
+        RExpr::Between(x, a, b, _) => u(binary_coll(x, a)) || u(binary_coll(x, b)),
+        RExpr::InList(x, l, ..) => !l.is_empty() && k(x),
+        RExpr::InSub(x, plan, _) => {
+            let core = plan.compound.as_slice().last().map_or(&**plan, |(_, t)| t);
+            let items = match core.values.as_slice().first() {
+                Some(r) if core.items.is_empty() => r.as_slice(),
+                _ => core.items.as_slice(),
+            };
+            match &**x {
+                RExpr::Scalar(ScalarFn::Vector, xs) => xs
+                    .iter()
+                    .zip(items.iter())
+                    .any(|(x, i)| u(binary_coll(x, i))),
+                x => items.first().map_or_else(|| k(x), |i| u(binary_coll(x, i))),
+            }
+        }
+        RExpr::Case {
+            base: Some(b),
+            whens,
+            ..
+        } => whens.iter().any(|(w, _)| u(binary_coll(b, w))),
+        RExpr::Scalar(ScalarFn::MinN | ScalarFn::MaxN | ScalarFn::Nullif, args) => {
+            u(args_coll(args.as_slice()))
+        }
+        RExpr::Agg { .. } => agg_parts(e).is_some_and(|p| {
+            (matches!(p.kind, AggKind::Min | AggKind::Max) && u(args_coll(p.args)))
+                || (p.distinct && p.args.iter().any(k))
+                || p.inputs().get(p.args.len()..).unwrap_or(&[]).iter().any(k)
+        }),
+        #[cfg(feature = "window")]
+        RExpr::Win(w, kids) => {
+            let kids = kids.as_slice();
+            let keys = w.nargs.saturating_add(usize::from(w.filter));
+            (matches!(
+                w.func,
+                crate::window::WinFn::Agg(AggKind::Min | AggKind::Max)
+            ) && u(args_coll(kids.get(..w.nargs).unwrap_or(&[]))))
+                || kids.get(keys..).unwrap_or(&[]).iter().any(k)
+        }
+        _ => false,
+    };
+    own || {
+        let mut any = false;
+        each_child(e, &mut |c| any = any || coll_misses(c));
+        any
+    }
 }
 
 /// The collation a collation-sensitive function or aggregate
@@ -8289,8 +8391,8 @@ pub fn and_terms<'e>(e: &'e RExpr, out: &mut AVec<&'e RExpr>) {
 }
 
 /// A constant the pin computes once per statement: no column, no
-/// subquery, nothing non-deterministic.
-fn factorable(e: &RExpr) -> bool {
+/// subquery, nothing non-deterministic (its `sqlite3ExprIsConstant`).
+pub(crate) fn factorable(e: &RExpr) -> bool {
     #[cfg(feature = "sql")]
     if any_scalar(e, &|f| f.nondeterministic()) {
         return false;

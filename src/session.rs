@@ -746,6 +746,9 @@ enum Plan {
         select: Option<Box<crate::query::SubPlan>>,
         sql: AVec<u8>,
         affs: AVec<crate::record::Affinity>,
+        /// The columns of the pin's FLEXNUM affinity (v0.17 review
+        /// fix, `rules::flex_col`): NUMERIC that leaves a REAL alone.
+        flex: AVec<bool>,
     },
     /// `CREATE [UNIQUE] INDEX` (v0.3): everything population needs
     /// is resolved at plan time.
@@ -1093,6 +1096,10 @@ pub(crate) struct QueryPlan {
     /// The pin's select number (v0.16, `explain`; `SubPlan::sel`).
     #[cfg(feature = "explain")]
     sel: u32,
+    /// A core of a VALUES chain of one-row selects (v0.17, `explain`;
+    /// `SubPlan::vchain`).
+    #[cfg(feature = "explain")]
+    vchain: bool,
 }
 
 #[cfg(all(feature = "vm", feature = "sql"))]
@@ -1124,6 +1131,8 @@ impl QueryPlan {
             comp_order: p.comp_order.clone(),
             #[cfg(feature = "explain")]
             sel: p.sel,
+            #[cfg(feature = "explain")]
+            vchain: p.vchain,
         }
     }
 
@@ -1527,6 +1536,11 @@ pub struct Connection<S: Storage> {
     /// plans for flattening.
     #[cfg(feature = "planner")]
     flat_from: core::cell::Cell<bool>,
+    /// Planning a SELECT that ALTER TABLE edits and never codes
+    /// (v0.17 review fix, `sql`; `Connection::plan_uncoded`): its FROM
+    /// subqueries' column collations are not looked up either.
+    #[cfg(feature = "sql")]
+    uncoded: core::cell::Cell<bool>,
     /// The recursive CTEs whose recursive SELECTs are being
     /// planned (v0.16, `sql`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
@@ -1635,6 +1649,8 @@ impl<S: Storage> Connection<S> {
             flat_raw: core::cell::Cell::new(false),
             #[cfg(feature = "planner")]
             flat_from: core::cell::Cell::new(false),
+            #[cfg(feature = "sql")]
+            uncoded: core::cell::Cell::new(false),
             #[cfg(feature = "sql")]
             rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "query")]
@@ -2300,6 +2316,7 @@ impl<S: Storage> Connection<S> {
                                 select: None,
                                 sql: AVec::new(),
                                 affs: AVec::new(),
+                                flex: AVec::new(),
                             });
                         }
                         return Err(Error::Schema {
@@ -2345,6 +2362,7 @@ impl<S: Storage> Connection<S> {
                     kept.as_slice(),
                     strict,
                     !wr_def,
+                    true,
                 )?;
                 #[cfg(feature = "sql")]
                 if self.prag.like_redefined
@@ -2801,7 +2819,14 @@ impl<S: Storage> Connection<S> {
                     #[cfg(feature = "indexes")]
                     indexes,
                     #[cfg(feature = "query")]
-                    rules: self.table_rules(arena, t)?,
+                    rules: {
+                        let r = self.table_rules(arena, t)?;
+                        #[cfg(feature = "sql")]
+                        if let Some(r) = r.as_deref() {
+                            r.coded::<S::Error>(None)?;
+                        }
+                        r
+                    },
                     #[cfg(feature = "sql")]
                     autoinc: if t.autoinc {
                         Some(copy_vec(handle_bytes(&self.catalog_arena, t.name)))
@@ -2831,7 +2856,7 @@ impl<S: Storage> Connection<S> {
                 table,
                 column,
                 text,
-                ..
+                checks: new_checks,
             } => {
                 let tname = handle_bytes(arena, *table);
                 let t = match self.catalog.find(&self.catalog_arena, tname) {
@@ -2965,6 +2990,10 @@ impl<S: Storage> Connection<S> {
                     checks.as_slice(),
                     strict_def,
                     t.has_rowid(),
+                    // (The pin's quick_check after ADD COLUMN codes every
+                    // CHECK when the new column has one, is a NOT NULL
+                    // generated column or the table is STRICT.)
+                    new_checks.is_empty() && !(column.generated && column.not_null) && !strict_def,
                 )?;
                 // The pin re-checks the whole rewritten definition.
                 #[cfg(feature = "sql")]
@@ -3215,10 +3244,13 @@ impl<S: Storage> Connection<S> {
     ) -> Result<Plan, S::Error> {
         use crate::record::Affinity;
         let plan = self.plan_subquery(sel, arena, &[])?;
+        crate::query::lead_colls::<S::Error>(&plan)?;
         let w = plan.width();
         let mut names = self.result_col_names(&plan, (0, 0))?;
         let mut affs: AVec<Affinity> = AVec::new();
+        let mut flex = AVec::new();
         for i in 0..w {
+            flex.push(crate::rules::flex_col(&plan, i));
             let item = plan.items.as_slice().get(i);
             // Demoted across compound cores; a numeric CAST is the
             // pin's FLEXNUM, declared ` NUM`.
@@ -3240,6 +3272,7 @@ impl<S: Storage> Connection<S> {
             select: Some(Box::new(plan)),
             sql: crate::rules::ctas_sql(tname, cols.as_slice()),
             affs,
+            flex,
         })
     }
 
@@ -3927,9 +3960,62 @@ impl<S: Storage> Connection<S> {
             }
             rows_r.push(rr);
         }
+        // `columnN`, but a column reference in the first row (an
+        // enclosing query's, a trigger's `new.k`) names its column, as
+        // the pin's `sqlite3ColumnsFromExprList` names a select's
+        // (v0.17: `(VALUES (t.r), (2))` has a column `r`).
         let mut names = AVec::new();
         for i in 0..width.unwrap_or(0) {
-            names.push(Some(values_col_name(i)));
+            let mut e = rows_r.as_slice().first().and_then(|r| r.as_slice().get(i));
+            while let Some(RExpr::Collate(x, _)) = e {
+                e = Some(&**x);
+            }
+            let outer = match e {
+                Some(RExpr::Column(slot, ..)) => enclosing.iter().find_map(|g| {
+                    g.sources.iter().zip(g.offsets.iter()).find_map(|(s, o)| {
+                        s.columns
+                            .as_slice()
+                            .get(slot.checked_sub(*o)?)
+                            .map(|(n, _)| n.clone())
+                    })
+                }),
+                // (`rowid` as written, else the rowid alias's name.)
+                Some(RExpr::Rowid(src)) => Some(
+                    enclosing
+                        .iter()
+                        .find_map(|g| {
+                            let s = g.sources.as_slice().get(src.checked_sub(g.first_src)?)?;
+                            s.columns
+                                .as_slice()
+                                .get(s.rowid_alias?)
+                                .map(|(n, _)| n.clone())
+                        })
+                        .filter(|_| {
+                            let mut x = stmt
+                                .values
+                                .as_slice()
+                                .first()
+                                .and_then(|r| r.as_slice().get(i));
+                            while let Some(Expr::Collate(y, _)) = x {
+                                x = Some(&**y);
+                            }
+                            matches!(x, Some(Expr::Column { name, .. })
+                                if !crate::query::is_rowid_name(handle_bytes(arena, *name)))
+                        })
+                        .unwrap_or_else(|| copy_vec(b"rowid")),
+                ),
+                _ => None,
+            };
+            names.push(Some(outer.unwrap_or_else(|| values_col_name(i))));
+        }
+        // A co-routine is read through a FROM subquery on the pin,
+        // whose column types look its first row's collations up
+        // (v0.17; a chain's rows are cores of their own).
+        #[cfg(feature = "sql")]
+        if rows_r.len() > 1 && !stmt.vchain {
+            crate::query::lead_row::<S::Error>(
+                rows_r.as_slice().first().map_or(&[], |r| r.as_slice()),
+            )?;
         }
         let colls = core_colls(&[], rows_r.as_slice());
         Ok((
@@ -3986,6 +4072,8 @@ impl<S: Storage> Connection<S> {
             head,
             keys.as_slice(),
             width,
+            enclosing,
+            stmt,
         )?;
         Ok((tails, comp_order))
     }
@@ -4027,6 +4115,8 @@ impl<S: Storage> Connection<S> {
             head,
             keys.as_slice(),
             width,
+            &[],
+            stmt,
         )?;
         Ok((tails, comp_order))
     }
@@ -4502,6 +4592,12 @@ impl<S: Storage> Connection<S> {
         )?;
         #[cfg(all(feature = "sql", not(feature = "expr_index")))]
         let _ = hint;
+        let rules = self.table_rules(arena, t)?;
+        #[cfg(feature = "sql")]
+        if let Some(r) = rules.as_deref() {
+            let (m, rowid) = assigned_columns(sets.as_slice(), t.columns.len(), t.rowid_alias);
+            r.coded::<S::Error>(Some((m.as_slice(), rowid)))?;
+        }
         Ok(Plan::Update {
             #[cfg(feature = "expr_index")]
             access,
@@ -4526,7 +4622,7 @@ impl<S: Storage> Connection<S> {
             returning: returning_r,
             #[cfg(feature = "indexes")]
             indexes,
-            rules: self.table_rules(arena, t)?,
+            rules,
         })
     }
 
@@ -5001,6 +5097,8 @@ impl<S: Storage> Connection<S> {
                 comp_order,
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
+                #[cfg(feature = "explain")]
+                vchain: stmt.vchain,
             };
             return Ok((qp, keys));
         }
@@ -5043,6 +5141,8 @@ impl<S: Storage> Connection<S> {
             comp_order,
             #[cfg(feature = "explain")]
             sel: stmt.sel,
+            #[cfg(feature = "explain")]
+            vchain: false,
         };
         // A compound's cores sort by its ORDER BY (and, under
         // UNION / INTERSECT / EXCEPT, every column) on the pin,
@@ -5097,6 +5197,13 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
     ) -> Result<CorePlan, S::Error> {
         use crate::query::{ScopeGroup, has_agg, item_result_affinity, resolve_scoped};
+        #[cfg(feature = "sql")]
+        if count_of_view(stmt, arena, self.cfg.max_expr_depth) {
+            return Err(Error::Parse {
+                offset: 0,
+                kind: crate::error::ParseKind::ExprTooDeep,
+            });
+        }
         #[cfg(feature = "expr_index")]
         let merge = self.merge_core.take();
         let (base_width, base_src) = ScopeGroup::stack_end(enclosing);
@@ -5324,7 +5431,22 @@ impl<S: Storage> Connection<S> {
                     kind: SchemaKind::MisusedAggregate,
                 });
             }
+            #[cfg(feature = "sql")]
+            crate::query::key_coll::<S::Error>(
+                crate::query::expr_coll(&r).unwrap_or_default(),
+                enclosing,
+            )?;
             group_by.push(r);
+        }
+        // DISTINCT's key is every result column (v0.17).
+        #[cfg(feature = "sql")]
+        if stmt.distinct {
+            for it in items.iter() {
+                crate::query::key_coll::<S::Error>(
+                    crate::query::expr_coll(it).unwrap_or_default(),
+                    enclosing,
+                )?;
+            }
         }
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut having = match &stmt.having {
@@ -5397,6 +5519,8 @@ impl<S: Storage> Connection<S> {
                 // v0.16: the term sorts by its collation.
                 let mut dir = *dir;
                 dir.coll = crate::query::expr_coll(&r).unwrap_or_default();
+                #[cfg(feature = "sql")]
+                crate::query::key_coll::<S::Error>(dir.coll, enclosing)?;
                 order_by.push((r, dir));
             }
             #[cfg(feature = "window")]
@@ -5504,11 +5628,20 @@ impl<S: Storage> Connection<S> {
         }
         // A code-generation error of a term the pin codes after all.
         #[cfg(feature = "sql")]
+        // (Inside an enclosing ORDER BY the pin never codes, the error
+        // waits there instead: v0.17, a nested window query's own
+        // ORDER BY, `SELECT 1 ORDER BY (SELECT row_number() OVER ()
+        // ORDER BY (1,2))` is 1.)
         if let Some(kind) = late
             && !dropped
         {
-            return Err(Error::Schema { kind });
+            crate::query::late::<S::Error>(kind, &cur, enclosing)?;
         }
+        // (The result aliases stay visible to the flattener's WHERE
+        // push-down, v0.17: the pin's WHERE reads `x` of `column1 AS
+        // x` as the item it names, `resolveAlias`, before it pushes
+        // the term.)
+        #[cfg(not(feature = "planner"))]
         cur.aliases.clear();
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut limit = self.plan_limit(stmt.limit.as_deref(), arena)?;
@@ -5536,6 +5669,8 @@ impl<S: Storage> Connection<S> {
                 raw,
             },
         )?;
+        #[cfg(feature = "planner")]
+        cur.aliases.clear();
         // v0.16 (`expr_index`): each table source's index access
         // path, the pin's choice (`xplan`).
         // A merged compound member's loop delivers the merge key if
@@ -5659,6 +5794,48 @@ impl<S: Storage> Connection<S> {
         }
         #[cfg(not(feature = "expr_index"))]
         let _ = joined;
+        #[cfg(not(feature = "expr_index"))]
+        let keyed = false;
+        // An ORDER BY the lone table's loop delivers whole is no
+        // sorter on the pin: none of its terms is computed (v0.17
+        // fix, ungated: `ORDER BY rowid, abs(-9223372036854775808)`
+        // and `ORDER BY a, abs(..)` over a UNIQUE NOT NULL `a` answer;
+        // see `xplan::order_sat` for the distinct rows' later terms).
+        // (Its plain column terms stay, harmless, for a reader that
+        // matches its order against them: `sub_delivers`.)
+        if plain
+            && !has_agg
+            && group_by.is_empty()
+            && !keyed
+            && !joined
+            && let [sp] = sources.as_slice()
+        {
+            if order_delivered(
+                sp,
+                (
+                    cur.offsets.as_slice().first().copied().unwrap_or(0),
+                    cur.first_src,
+                ),
+                order_by.as_slice(),
+            ) {
+                let mut kept: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
+                for t in order_by.iter() {
+                    if matches!(skip_coll(&t.0), RExpr::Column(..) | RExpr::Rowid(_)) {
+                        kept.push(t.clone());
+                    }
+                }
+                order_by = kept;
+            } else {
+                #[cfg(feature = "sql")]
+                if sp
+                    .derived
+                    .as_deref()
+                    .is_some_and(|d| sub_delivers(d, cur.offsets.as_slice(), order_by.as_slice()))
+                {
+                    order_by.clear();
+                }
+            }
+        }
         // v0.16 (`json`, `vtab`): what a lateral `json_each` or
         // virtual table may drop from the rows it joins onto; and
         // (`vtab`) each virtual table's constraints (its xBestIndex).
@@ -5829,6 +6006,13 @@ impl<S: Storage> Connection<S> {
         let realify = s.derived.is_some() && (!dplan.compound.is_empty() || !s.flat);
         #[cfg(not(feature = "planner"))]
         let realify = s.derived.is_some() && !dplan.compound.is_empty();
+        // Its columns' collations are looked up as its column types
+        // are taken (the pin's `sqlite3SubqueryColumnTypes`, at
+        // prepare: an unknown one fails, v0.17), its leftmost core's.
+        #[cfg(feature = "sql")]
+        if !self.uncoded.get() {
+            crate::query::lead_colls::<S::Error>(&dplan)?;
+        }
         let mut real_cols = AVec::new();
         for (i, (nm, aff)) in names.iter().zip(dplan.result_affs.iter()).enumerate() {
             // A compound's column affinity is demoted across
@@ -8377,12 +8561,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             // as the pin re-prepares on a schema change.
             self.plan = self.conn.plan(&self.arena, &self.ast)?;
         }
-        let (select, sql, affs) = match &self.plan {
+        let (select, sql, affs, flex) = match &self.plan {
             Plan::CreateTableAs {
                 select: Some(select),
                 sql,
                 affs,
-            } => (select.clone(), sql.clone(), affs.clone()),
+                flex,
+            } => (select.clone(), sql.clone(), affs.clone(), flex.clone()),
             _ => return Err(Error::Unsupported),
         };
         let rows = self.exec_subplan(&select, &RowData::empty()).await?;
@@ -8396,8 +8581,11 @@ impl<'c, S: Storage> Statement<'c, S> {
                 kind: SchemaKind::DatatypeMismatch,
             })?;
             let mut rec = AVec::new();
-            for (v, a) in row.iter().zip(affs.iter()) {
-                rec.push(apply_affinity(v.clone(), *a));
+            for (i, (v, a)) in row.iter().zip(affs.iter()).enumerate() {
+                rec.push(match v {
+                    OwnedValue::Real(_) if flex.as_slice().get(i) == Some(&true) => v.clone(),
+                    _ => apply_affinity(v.clone(), *a),
+                });
             }
             let bytes = crate::rules::encode_rec(rec.as_slice(), None, None);
             btree::btree_insert(&mut self.conn.pager, root, rowid, bytes.as_slice()).await?;
@@ -12319,13 +12507,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 &self.conn.env,
                 &qp,
                 rows.as_slice(),
+                // (`project_rows` keeps a DISTINCT's duplicates.)
                 group_cap(
                     qp.group_by.as_slice(),
                     qp.order_by.as_slice(),
                     qp.sources.as_slice(),
-                    qp.distinct,
                     window,
-                ),
+                )
+                .filter(|_| !qp.distinct),
             )?;
             self.finish_produced(&qp, produced, window);
             Ok(())
@@ -12555,12 +12744,39 @@ impl<'c, S: Storage> Statement<'c, S> {
         if self.limit_zero(window) {
             return Ok(());
         }
-        let head = self.exec_qp_core_values(qp).await?;
+        // The OFFSET skips rows before their columns are computed
+        // (`pre_skip`) across a UNION ALL chain's cores.
+        let chain = qp.comp_order.is_empty()
+            && qp
+                .compound
+                .iter()
+                .all(|(op, _)| *op == crate::sql::CompoundOp::UnionAll);
+        let bounds = |c: &QueryPlan, seen: usize| {
+            arm_bounds(
+                c.items.as_slice(),
+                c.group_by.as_slice(),
+                c.order_by.as_slice(),
+                c.sources.as_slice(),
+                (c.distinct, c.has_agg, chain),
+                window,
+                ((0, 0), seen),
+            )
+        };
+        let (hcap, hpre) = bounds(qp, 0);
+        let head = self.exec_qp_core_values(qp, hcap, hpre).await?;
+        let mut seen = head.len();
         let mut tails = AVec::new();
         let mut cores = AVec::new();
         cores.push(core_colls(qp.items.as_slice(), qp.values.as_slice()));
         for (op, tail) in qp.compound.iter() {
-            tails.push((*op, self.exec_qp_core_values(tail).await?));
+            let (tcap, tpre) = bounds(tail, seen);
+            let rows = if tcap == Some(0) {
+                AVec::new()
+            } else {
+                self.exec_qp_core_values(tail, tcap, tpre).await?
+            };
+            seen = seen.saturating_add(rows.len());
+            tails.push((*op, rows));
             cores.push(core_colls(tail.items.as_slice(), tail.values.as_slice()));
         }
         let rows = if union_first_row(
@@ -12598,6 +12814,8 @@ impl<'c, S: Storage> Statement<'c, S> {
     async fn exec_qp_core_values(
         &mut self,
         qp: &QueryPlan,
+        cap: Option<usize>,
+        pre: (usize, usize),
     ) -> Result<AVec<AVec<OwnedValue>>, S::Error> {
         if !qp.values.is_empty() {
             let empty = RowData::empty();
@@ -12629,14 +12847,14 @@ impl<'c, S: Storage> Statement<'c, S> {
             &mut rows,
         )
         .await?;
-        let produced = self.project_qp_async(qp, rows.as_slice(), None).await?;
+        let mut produced = self.project_qp_async(qp, rows.as_slice(), cap, pre).await?;
+        if qp.distinct {
+            let colls = crate::query::exprs_colls(qp.items.as_slice());
+            produced = dedup_produced(produced, colls.as_slice());
+        }
         let mut out: AVec<AVec<OwnedValue>> = AVec::new();
         for p in produced.iter() {
             out.push(p.out.clone());
-        }
-        if qp.distinct {
-            let colls = crate::query::exprs_colls(qp.items.as_slice());
-            out = dedup_compound_rows(out, colls.as_slice());
         }
         Ok(out)
     }
@@ -12745,8 +12963,16 @@ impl<'c, S: Storage> Statement<'c, S> {
                     qp.group_by.as_slice(),
                     qp.order_by.as_slice(),
                     qp.sources.as_slice(),
-                    qp.distinct,
                     window,
+                ),
+                pre_skip(
+                    qp.items.as_slice(),
+                    qp.group_by.as_slice(),
+                    qp.order_by.as_slice(),
+                    qp.sources.as_slice(),
+                    (qp.distinct, qp.has_agg),
+                    (0, 0),
+                    (window.0, window.0.saturating_add(window.1)),
                 ),
             )
             .await?;
@@ -13323,7 +13549,6 @@ impl<'c, S: Storage> Statement<'c, S> {
                 plan.group_by.as_slice(),
                 plan.order_by.as_slice(),
                 plan.sources.as_slice(),
-                plan.distinct,
                 streamed,
             )
         } else {
@@ -13333,12 +13558,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         // only the rows its LIMIT keeps, as the pin's loop stops there
         // (v0.17 review fix, ungated: a later row's result column that
         // overflows was raised).
+        // (A DISTINCT one too: `sub_project` drops its duplicates as
+        // they come, v0.17.)
+        // (An ORDER BY its lone table's loop delivers too: no sorter.)
+        let band = (outer.vals.len(), outer.rowids.len());
         let cap = match cap {
             None if lone
                 && !plan.has_agg
                 && plan.group_by.is_empty()
-                && plan.order_by.is_empty()
-                && !plan.distinct
+                && (plan.order_by.is_empty()
+                    || matches!(plan.sources.as_slice(), [s] if order_delivered(s, band, plan.order_by.as_slice())))
                 && streamed.1 != usize::MAX =>
             {
                 Some(streamed.0.saturating_add(streamed.1))
@@ -13379,9 +13608,43 @@ impl<'c, S: Storage> Statement<'c, S> {
         let grow = false;
         let target = streamed.0.saturating_add(streamed.1);
         let mut n = if grow { target.max(1) } else { 0 };
+        // The OFFSET skips rows before their columns are computed
+        // (`pre_skip`), across a UNION ALL chain's cores too.
+        #[cfg(feature = "sql")]
+        let chain = plan.comp_order.is_empty()
+            && plan
+                .compound
+                .iter()
+                .all(|(op, _)| *op == crate::sql::CompoundOp::UnionAll);
+        #[cfg(not(feature = "sql"))]
+        let chain = true;
+        let bounds = |c: &crate::query::SubPlan, seen: usize| {
+            arm_bounds(
+                c.items.as_slice(),
+                c.group_by.as_slice(),
+                c.order_by.as_slice(),
+                c.sources.as_slice(),
+                (c.distinct, c.has_agg, chain),
+                streamed,
+                (band, seen),
+            )
+        };
+        let (head_cap, head_pre) = bounds(plan, 0);
+        #[cfg(feature = "sql")]
+        let cap = if plan.compound.is_empty() {
+            cap
+        } else {
+            head_cap
+        };
         let produced = loop {
             let (p, first) = self
-                .exec_subplan_core_n(plan, outer, cap, if grow { Some(n) } else { src_need })
+                .exec_subplan_core_n(
+                    plan,
+                    outer,
+                    cap,
+                    if grow { Some(n) } else { src_need },
+                    head_pre,
+                )
                 .await?;
             if !grow || p.len() >= target || first < n {
                 break p;
@@ -13400,8 +13663,16 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut tails = AVec::new();
             let mut cores = AVec::new();
             cores.push(core_colls(plan.items.as_slice(), plan.values.as_slice()));
+            let mut seen = head.len();
             for (op, tail) in plan.compound.iter() {
-                let tp = self.exec_subplan_core(tail, outer, None, None).await?;
+                let (tcap, tpre) = bounds(tail, seen);
+                let tp = if tcap == Some(0) {
+                    AVec::new()
+                } else {
+                    self.exec_subplan_core(tail, outer, tcap, None, tpre)
+                        .await?
+                };
+                seen = seen.saturating_add(tp.len());
                 let mut right: AVec<AVec<OwnedValue>> = AVec::new();
                 for p in tp.iter() {
                     right.push(p.out.clone());
@@ -13450,8 +13721,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
         cap: Option<usize>,
         need: Option<usize>,
+        pre: (usize, usize),
     ) -> Result<AVec<Produced>, S::Error> {
-        Ok(self.exec_subplan_core_n(plan, outer, cap, need).await?.0)
+        Ok(self
+            .exec_subplan_core_n(plan, outer, cap, need, pre)
+            .await?
+            .0)
     }
 
     /// `exec_subplan_core`, also returning how many rows its first
@@ -13464,6 +13739,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
         cap: Option<usize>,
         need: Option<usize>,
+        pre: (usize, usize),
     ) -> Result<(AVec<Produced>, usize), S::Error> {
         // A VALUES core (v0.9): the rows evaluate against the
         // outer row directly.
@@ -13507,9 +13783,15 @@ impl<'c, S: Storage> Statement<'c, S> {
         )
         .await?;
         let mut produced = self
-            .sub_project(plan, outer, joined.as_slice(), cap)
+            .sub_project(plan, outer, joined.as_slice(), cap, pre)
             .await?;
-        if plan.distinct {
+        // (`sub_project` dropped a plain capped core's duplicates.)
+        #[cfg(feature = "window")]
+        let inline = cap.is_some()
+            && crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice()).is_empty();
+        #[cfg(not(feature = "window"))]
+        let inline = cap.is_some();
+        if plan.distinct && !inline {
             produced = dedup_produced(
                 produced,
                 crate::query::exprs_colls(plan.items.as_slice()).as_slice(),
@@ -13768,6 +14050,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         qp: &QueryPlan,
         rows: &[RowData],
         cap: Option<usize>,
+        pre: (usize, usize),
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
         let cols = order_cols(qp.order_by.as_slice(), qp.items.as_slice());
@@ -13776,6 +14059,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         let wins = crate::window::calls(qp.items.as_slice(), qp.order_by.as_slice());
         #[cfg(feature = "window")]
         let cap = if wins.is_empty() { cap } else { None };
+        // (A DISTINCT core under a cap drops its duplicates as they
+        // come, as `sub_project` does.)
+        let dd = qp.distinct && cap.is_some();
+        let colls = if dd {
+            crate::query::exprs_colls(qp.items.as_slice())
+        } else {
+            AVec::new()
+        };
         #[cfg(feature = "window")]
         let mut pend: AVec<WinUnit> = AVec::new();
         if !qp.has_agg {
@@ -13800,6 +14091,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                     row_at += 1;
                     continue;
                 }
+                // (`cap`: a plain core's LIMIT, rows past it unseen.)
+                if cap.is_some_and(|c| out.len() >= c) {
+                    break;
+                }
+                if out.len() < pre.0 {
+                    out.push(skipped_row());
+                    continue;
+                }
                 let mut vals = AVec::new();
                 for it in qp.items.iter() {
                     vals.push(self.eval_row_sub(it, r).await?);
@@ -13809,6 +14108,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                     keys.push(self.eval_row_sub(e, r).await?);
                 }
                 shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
+                if dd && dup_row(out.as_slice(), vals.as_slice(), colls.as_slice()) {
+                    continue;
+                }
                 let rowid = if qp.sources.len() == 1 {
                     r.rowids.as_slice()[0]
                 } else {
@@ -13831,6 +14133,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         pend,
                         rows,
                         &[],
+                        (pre, qp.distinct),
                     )
                     .await;
             }
@@ -13938,7 +14241,8 @@ impl<'c, S: Storage> Statement<'c, S> {
             // runs, the HAVING's own included (its AND / OR then stop
             // early over the values), or before result terms that may
             // skip one (`lazy_aggs`).
-            if qp.having.is_some() || lazy {
+            // (A group the OFFSET skips steps them too: `pre_skip`.)
+            if qp.having.is_some() || lazy || out.len() < pre.0 {
                 let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
                 if let Some(h) = &qp.having {
                     crate::query::collect_outer_aggs(h, &mut aggs);
@@ -13969,6 +14273,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 });
                 continue;
             }
+            // A group the OFFSET skips: its aggregates have stepped,
+            // its result columns are never computed (`pre_skip`).
+            if out.len() < pre.0 {
+                out.push(skipped_row());
+                continue;
+            }
             let mut vals = AVec::new();
             for it in qp.items.iter() {
                 vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
@@ -13978,6 +14288,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
             }
             shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
+            if dd && dup_row(out.as_slice(), vals.as_slice(), colls.as_slice()) {
+                continue;
+            }
             out.push(Produced {
                 out: vals,
                 keys,
@@ -13995,6 +14308,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     pend,
                     rows,
                     groups.as_slice(),
+                    (pre, qp.distinct),
                 )
                 .await;
         }
@@ -14012,6 +14326,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         outer: &RowData,
         rows: &[RowData],
         cap: Option<usize>,
+        pre: (usize, usize),
     ) -> Result<AVec<Produced>, S::Error> {
         let mut out = AVec::new();
         let cols = order_cols(plan.order_by.as_slice(), plan.items.as_slice());
@@ -14020,6 +14335,14 @@ impl<'c, S: Storage> Statement<'c, S> {
         let wins = crate::window::calls(plan.items.as_slice(), plan.order_by.as_slice());
         #[cfg(feature = "window")]
         let cap = if wins.is_empty() { cap } else { None };
+        // (A DISTINCT core under a LIMIT: its duplicates go as they
+        // come, `exec_subplan_core_n` then dedups nothing again.)
+        let dd = plan.distinct && cap.is_some();
+        let colls = if dd {
+            crate::query::exprs_colls(plan.items.as_slice())
+        } else {
+            AVec::new()
+        };
         #[cfg(feature = "window")]
         let mut pend: AVec<WinUnit> = AVec::new();
         if !plan.has_agg {
@@ -14048,6 +14371,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if cap.is_some_and(|c| out.len() >= c) {
                     break;
                 }
+                if out.len() < pre.0 {
+                    out.push(skipped_row());
+                    continue;
+                }
                 let mut vals = AVec::new();
                 for it in plan.items.iter() {
                     vals.push(self.eval_row_sub(it, r).await?);
@@ -14057,6 +14384,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                     keys.push(self.eval_row_sub(e, r).await?);
                 }
                 shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
+                // A DISTINCT core under a LIMIT drops its duplicates as
+                // they come, so `cap` counts distinct rows (the pin's
+                // loop stops at the LIMIT; v0.17).
+                if dd && dup_row(out.as_slice(), vals.as_slice(), colls.as_slice()) {
+                    continue;
+                }
                 out.push(Produced {
                     out: vals,
                     keys,
@@ -14074,6 +14407,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                         pend,
                         rows,
                         &[],
+                        (pre, plan.distinct),
                     )
                     .await;
             }
@@ -14176,7 +14510,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
             }
-            if plan.having.is_some() || lazy {
+            // (A group the OFFSET skips steps them too: `pre_skip`.)
+            if plan.having.is_some() || lazy || out.len() < pre.0 {
                 let mut aggs = group_aggs(plan.items.as_slice(), plan.order_by.as_slice());
                 if let Some(h) = &plan.having {
                     crate::query::collect_outer_aggs(h, &mut aggs);
@@ -14207,6 +14542,12 @@ impl<'c, S: Storage> Statement<'c, S> {
                 });
                 continue;
             }
+            // A group the OFFSET skips: its aggregates have stepped,
+            // its result columns are never computed (`pre_skip`).
+            if out.len() < pre.0 {
+                out.push(skipped_row());
+                continue;
+            }
             let mut vals = AVec::new();
             for it in plan.items.iter() {
                 vals.push(self.eval_group_sub(it, grows.as_slice(), &rep).await?);
@@ -14216,6 +14557,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 keys.push(self.eval_group_sub(e, grows.as_slice(), &rep).await?);
             }
             shown_keys(keys.as_mut_slice(), cols.as_slice(), vals.as_slice());
+            if dd && dup_row(out.as_slice(), vals.as_slice(), colls.as_slice()) {
+                continue;
+            }
             out.push(Produced {
                 out: vals,
                 keys,
@@ -14233,6 +14577,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     pend,
                     rows,
                     groups.as_slice(),
+                    (pre, plan.distinct),
                 )
                 .await;
         }
@@ -14253,7 +14598,13 @@ impl<'c, S: Storage> Statement<'c, S> {
         mut units: AVec<WinUnit>,
         rows: &[RowData],
         groups: &[(AVec<OwnedValue>, AVec<RowData>)],
+        (pre, distinct): ((usize, usize), bool),
     ) -> Result<AVec<Produced>, S::Error> {
+        let colls = if distinct {
+            crate::query::exprs_colls(items)
+        } else {
+            AVec::new()
+        };
         let (order, vals, ti, to) = win_results::<S::Error>(
             wins,
             &mut units,
@@ -14267,6 +14618,17 @@ impl<'c, S: Storage> Statement<'c, S> {
             let (Some(unit), Some(v)) = (units.as_slice().get(u), vals.as_slice().get(u)) else {
                 continue;
             };
+            // Rows past the LIMIT of a window query no sorter or
+            // DISTINCT handles are never computed (v0.17 review fix:
+            // the pin's loop over the window rewrite's rows stops
+            // there).
+            if out.len() >= pre.1 {
+                break;
+            }
+            if out.len() < pre.0 {
+                out.push(skipped_row());
+                continue;
+            }
             let mut vs = AVec::new();
             let mut keys = AVec::new();
             let mut rowid = None;
@@ -14291,6 +14653,9 @@ impl<'c, S: Storage> Statement<'c, S> {
                 } else {
                     keys.push(x);
                 }
+            }
+            if distinct && dup_row(out.as_slice(), vs.as_slice(), colls.as_slice()) {
+                continue;
             }
             out.push(Produced {
                 out: vs,
@@ -14712,6 +15077,79 @@ fn values_col_name(i: usize) -> AVec<u8> {
     v
 }
 
+/// The pin's `countOfViewOptimization` (v0.17 review fix): `SELECT
+/// count(*) FROM (a UNION ALL b ...)` — one FROM subquery that is not a
+/// CTE's own body, read through any plain `SELECT ... FROM (...)` the
+/// flattener merges first, no WHERE / GROUP BY / HAVING / ORDER BY, arms
+/// with no WHERE, LIMIT, aggregate or DISTINCT — becomes the sum of
+/// each arm's `(SELECT count(*) FROM arm)` (each optimized in turn),
+/// which the pin refuses as "Expression tree is too large" once the
+/// arms reach the depth limit (1000: a VALUES chain).
+#[cfg(feature = "sql")]
+fn count_of_view(stmt: &SelectStmt, arena: &Arena, depth: usize) -> bool {
+    // A core the flattener merges whole: no clause but its FROM.
+    fn plain(c: &SelectStmt) -> bool {
+        c.filter.is_none()
+            && c.limit.is_none()
+            && !c.distinct
+            && c.group_by.is_empty()
+            && c.having.is_none()
+            && !c.items.iter().any(|it| match it {
+                SelectItem::Expr(e, ..) => {
+                    crate::rules::expr_any(e, &mut |x| matches!(x, Expr::Func { .. }))
+                }
+                _ => false,
+            })
+    }
+    // `SELECT count(*) FROM f` (`f` read through merged cores).
+    fn deep(mut f: &crate::sql::FromSource, depth: usize) -> bool {
+        loop {
+            let Some(d) = f.derived.as_deref() else {
+                return false;
+            };
+            if !d.compound.is_empty() {
+                let arms = core::iter::once(d).chain(d.compound.iter().map(|(_, c)| c));
+                return f.cte.as_ref().is_none_or(|c| c.view)
+                    && plain(d)
+                    && d.compound
+                        .iter()
+                        .all(|(op, c)| *op == crate::sql::CompoundOp::UnionAll && plain(c))
+                    && (d.compound.len().saturating_add(1) >= depth
+                        || arms.into_iter().any(|c| match c.from.as_slice() {
+                            [g] => c.order_by.is_empty() && deep(g, depth),
+                            _ => false,
+                        }));
+            }
+            match d.from.as_slice() {
+                [g] if plain(d) && d.values.is_empty() && d.order_by.is_empty() => f = g,
+                _ => return false,
+            }
+        }
+    }
+    let call = match stmt.items.as_slice() {
+        [
+            SelectItem::Expr(
+                Expr::Func {
+                    name, star, clause, ..
+                },
+                ..,
+            ),
+        ] => *star && clause.is_none() && handle_bytes(arena, *name).eq_ignore_ascii_case(b"count"),
+        _ => false,
+    };
+    match stmt.from.as_slice() {
+        [f] if call
+            && stmt.filter.is_none()
+            && stmt.having.is_none()
+            && stmt.group_by.is_empty()
+            && stmt.order_by.is_empty() =>
+        {
+            deep(f, depth)
+        }
+        _ => false,
+    }
+}
+
 /// Resolve a compound SELECT's ORDER BY terms (v0.9) to
 /// output-column indices. The pin's rule
 /// (`resolveCompoundOrderBy`): a term is an output ordinal, or
@@ -14728,7 +15166,28 @@ fn resolve_compound_order<E>(
     head: &CompKeys,
     tails: &[CompKeys],
     width: usize,
+    enclosing: &[crate::query::ScopeGroup],
+    stmt: &SelectStmt,
 ) -> Result<AVec<(usize, crate::sql::SortOrder)>, E> {
+    // The merge key (an operator other than UNION ALL: every column)
+    // and the ORDER BY's terms look their collations up (v0.17: an
+    // unknown one fails there; `query::key_coll`).
+    #[cfg(feature = "sql")]
+    if stmt
+        .compound
+        .iter()
+        .any(|(op, _)| *op != crate::sql::CompoundOp::UnionAll)
+    {
+        for i in 0..width {
+            crate::query::key_coll::<E>(
+                compound_col_coll(
+                    core::iter::once(head).chain(tails.iter()).map(|k| &k.colls),
+                    i,
+                ),
+                enclosing,
+            )?;
+        }
+    }
     let mut out = AVec::new();
     for (e, desc) in order_by.iter() {
         // v0.16: `<term> COLLATE name` sorts the matched column
@@ -14765,6 +15224,8 @@ fn resolve_compound_order<E>(
                         i,
                     )
                 });
+                #[cfg(feature = "sql")]
+                crate::query::key_coll::<E>(o.coll, enclosing)?;
                 out.push((i, o));
             }
             None => {
@@ -14857,25 +15318,6 @@ fn compound_rows_equal(a: &[OwnedValue], b: &[OwnedValue], colls: &[crate::recor
         && a.iter().zip(b.iter()).enumerate().all(|(i, (x, y))| {
             crate::query::values_equal_coll(x, y, colls.get(i).copied().unwrap_or_default())
         })
-}
-
-/// Remove duplicate rows, keeping first occurrences (v0.9;
-/// under the columns' collations since v0.16).
-#[cfg(feature = "sql")]
-fn dedup_compound_rows(
-    rows: AVec<AVec<OwnedValue>>,
-    colls: &[crate::record::Coll],
-) -> AVec<AVec<OwnedValue>> {
-    let mut kept: AVec<AVec<OwnedValue>> = AVec::new();
-    for r in rows.iter() {
-        if !kept
-            .iter()
-            .any(|k| compound_rows_equal(k.as_slice(), r.as_slice(), colls))
-        {
-            kept.push(r.clone());
-        }
-    }
-    kept
 }
 
 /// Compare two compound rows ascending by every column under
@@ -14990,15 +15432,12 @@ fn merge_compound(
 /// `core_colls`); `order` is the compound ORDER BY with each
 /// term's collation resolved.
 ///
-/// Operators up to the last non-ALL one — or every operator,
-/// when an ORDER BY whose collations agree with the columns'
-/// is merged straight in — run as `merge_compound` with one
-/// merge key: the column collations over the cores up to that
-/// point (the key the pin pushes down). Trailing UNION ALLs
-/// past it append in order. An ORDER BY naming a collation
-/// other than its column's makes the pin evaluate the compound
-/// without it and sort the result afterwards; the final stable
-/// sort by `order` below covers both shapes.
+/// Operators up to the last non-ALL one run as `merge_compound`
+/// with one merge key: the column collations over the cores up to
+/// that point (the key the pin pushes down). Trailing UNION ALLs
+/// past it append in order; the final stable sort by `order` below
+/// is the pin's merge by the ORDER BY (and its sort afterwards for
+/// an ORDER BY naming a collation other than its column's).
 #[cfg(feature = "sql")]
 pub(crate) fn run_compound(
     head: AVec<AVec<OwnedValue>>,
@@ -15016,17 +15455,14 @@ pub(crate) fn run_compound(
         }
         v
     };
-    let full = prefix(tails.len());
-    let direct = !order.is_empty()
-        && order
-            .iter()
-            .all(|(i, o)| full.as_slice().get(*i).is_some_and(|c| *c == o.coll));
-    // The last operator that merges (index into `tails`).
-    let last = if direct {
-        tails.len().checked_sub(1)
-    } else {
-        tails.iter().rposition(|(op, _)| *op != UnionAll)
-    };
+    // The last operator that merges (index into `tails`); the UNION
+    // ALLs past it append. Under an ORDER BY the pin merges them too,
+    // by its terms alone (`multiSelectOrderBy` appends no columns for
+    // TK_ALL), so equal rows keep the left core's first, each core in
+    // its own order: the final stable sort below (v0.17 fix: they were
+    // merged by the full-row key, which ordered ties by their other
+    // columns).
+    let last = tails.iter().rposition(|(op, _)| *op != UnionAll);
     let key = last.map(|h| prefix(h + 1)).unwrap_or_default();
     let mut rows = head;
     for (k, (op, right)) in tails.iter().enumerate() {
@@ -15422,22 +15858,241 @@ pub(crate) fn groups_sorted(
 /// (v0.16, ungated): with a LIMIT, the groups emitted in ORDER BY
 /// order (`groups_sorted`; v0.17 review fix: an ORDER BY in another
 /// NULLs placement, or one an index walk does not deliver, sorts
-/// the groups again, so capping them kept the wrong ones), and no
-/// DISTINCT, the pin emits groups as it finalizes them and stops
-/// at OFFSET + LIMIT — later groups are never finalized, so their
-/// aggregates cannot error. None: every group is needed.
+/// the groups again, so capping them kept the wrong ones), the pin
+/// emits groups as it finalizes them and stops at OFFSET + LIMIT —
+/// later groups are never finalized, so their aggregates cannot
+/// error (a DISTINCT one's distinct groups: the projections drop
+/// duplicates as they come under a cap; v0.17 review fix). None:
+/// every group is needed.
 #[cfg(feature = "query")]
 fn group_cap(
     group_by: &[RExpr],
     order_by: &[(RExpr, crate::sql::SortOrder)],
     sources: &[SourcePlan],
-    distinct: bool,
     (skip, take): (usize, usize),
 ) -> Option<usize> {
-    if group_by.is_empty() || distinct || take == usize::MAX {
+    if group_by.is_empty() || take == usize::MAX {
         return None;
     }
     groups_sorted(group_by, order_by, sources).then(|| skip.saturating_add(take))
+}
+
+/// How many of a core's first result rows its OFFSET skips before
+/// their columns are computed, and the row count past which none is
+/// computed, from its row window `(skip, skip + take)` (v0.17,
+/// ungated): the pin's
+/// `selectInnerLoop` codes the OFFSET ahead of the result columns
+/// when no sorter and no DISTINCT handle the rows — no ORDER BY, or
+/// one the loop or the grouping delivers — so `SELECT
+/// abs(-9223372036854775808) LIMIT 1 OFFSET 1` is no row there. The
+/// projections leave those rows as empty placeholders (aggregates
+/// still stepped), which the row window then drops; a window query
+/// stops at the second bound (the other paths' LIMIT caps already
+/// do; a DISTINCT one counts distinct rows, all computed). `(0,
+/// usize::MAX)` when a sorter sees every row.
+#[cfg(feature = "sql")]
+#[inline(never)]
+fn pre_skip(
+    items: &[RExpr],
+    group_by: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    sources: &[SourcePlan],
+    (distinct, has_agg): (bool, bool),
+    band: (usize, usize),
+    (skip, end): (usize, usize),
+) -> (usize, usize) {
+    #[cfg(feature = "window")]
+    let wins = !crate::window::calls(items, order_by).is_empty();
+    #[cfg(not(feature = "window"))]
+    let wins = {
+        let _ = items;
+        false
+    };
+    // An aggregate without GROUP BY is one row: its ORDER BY and
+    // DISTINCT are no-ops the pin drops (v0.17 review fix: `SELECT
+    // DISTINCT abs(-9223372036854775808)+count(*) FROM t LIMIT 1
+    // OFFSET 1` is no row). A window query keeps them.
+    let one = has_agg && group_by.is_empty() && !wins;
+    let delivered = order_by.is_empty()
+        || one
+        || (!wins
+            && if group_by.is_empty() {
+                matches!(sources, [s] if order_delivered(s, band, order_by))
+            } else {
+                groups_sorted(group_by, order_by, sources)
+            });
+    if !delivered {
+        (0, usize::MAX)
+    } else if distinct && !one {
+        (0, end)
+    } else {
+        (skip, end)
+    }
+}
+
+/// Whether lone source `sp` (its columns from slot `base`, its rowid
+/// source `src`) delivers ORDER BY `order` whole (v0.17, ungated; a
+/// COLLATE on its terms aside): its index or rowid loop says so
+/// (`IdxAccess::sorted`, after the pin's `isOrderDistinct` rule), or
+/// it is a table read in rowid order and the ORDER BY starts with
+/// the rowid, every later term reading the table or constant (the
+/// pin's rows are distinct past the rowid, `orderDistinctMask`).
+#[cfg(feature = "query")]
+#[inline(never)]
+fn order_delivered(
+    sp: &SourcePlan,
+    (base, src): (usize, usize),
+    order: &[(RExpr, crate::sql::SortOrder)],
+) -> bool {
+    #[cfg(feature = "expr_index")]
+    if let Some(a) = sp.access.as_deref() {
+        return !a.lateral && a.sorted >= order.len();
+    }
+    let band = crate::query::RefRange {
+        w: (base, base.saturating_add(sp.ncols)),
+        s: (src, src.saturating_add(1)),
+    };
+    let rowid = match order.first().map(|(e, _)| skip_coll(e)) {
+        Some(RExpr::Rowid(x)) => *x == src,
+        Some(RExpr::Column(slot, ..)) => sp
+            .rowid_alias
+            .is_some_and(|a| base.checked_add(a) == Some(*slot)),
+        _ => false,
+    };
+    #[cfg(feature = "sql")]
+    let plain = !sp.temp;
+    #[cfg(not(feature = "sql"))]
+    let plain = true;
+    plain
+        && sp.derived.is_none()
+        && sp.root != 0
+        && rowid
+        && order.first().is_some_and(|(_, o)| !o.desc)
+        && order
+            .iter()
+            .skip(1)
+            .all(|(e, _)| crate::query::expr_refs_range(e, &band) || crate::query::factorable(e))
+}
+
+/// `e` without its COLLATE operators.
+#[cfg(feature = "query")]
+fn skip_coll(e: &RExpr) -> &RExpr {
+    match e {
+        RExpr::Collate(x, _) => skip_coll(x),
+        _ => e,
+    }
+}
+
+/// Whether the rows of FROM subquery `d` (a lone co-routine or
+/// materialization at `offsets[0]`) come in its reader's ORDER BY
+/// `order` (v0.17 fix, ungated; the pin's `SQLITE_OrderBySubq`,
+/// `wherePathMatchSubqueryOB` in where.c): the subquery's own ORDER
+/// BY — written, or the merge key a compound other than UNION ALL
+/// sorts by (`multiSelectOrderBy`: its terms, then every other
+/// column ascending) — matches each term by result column number
+/// alone, in the same direction and NULLS placement; the reader's
+/// term must be a bare column (no COLLATE), and its collation is
+/// never compared, so the rows keep the subquery's order (`WITH q(x)
+/// AS (SELECT 2.5 UNION SELECT c FROM t) SELECT x FROM q ORDER BY 1`
+/// over a NOCASE `c` is in the merge's NOCASE order on the pin). A
+/// co-routine is never read backwards.
+#[cfg(feature = "sql")]
+#[inline(never)]
+fn sub_delivers(
+    d: &crate::query::SubPlan,
+    offsets: &[usize],
+    order: &[(RExpr, crate::sql::SortOrder)],
+) -> bool {
+    use crate::query::same_expr;
+    if order.is_empty() || d.rec.is_some() || !d.values.is_empty() {
+        return false;
+    }
+    let mut spec: AVec<(Option<usize>, crate::sql::SortOrder)> = AVec::new();
+    if d.compound.is_empty() {
+        for (e, o) in d.order_by.iter() {
+            spec.push((d.items.iter().position(|it| same_expr(it, e)), *o));
+        }
+    } else {
+        for (c, o) in d.comp_order.iter() {
+            spec.push((Some(*c), *o));
+        }
+        if d.compound
+            .iter()
+            .any(|(op, _)| *op != crate::sql::CompoundOp::UnionAll)
+        {
+            for j in 0..d.width() {
+                if !d.comp_order.iter().any(|(c, _)| *c == j) {
+                    spec.push((
+                        Some(j),
+                        crate::sql::SortOrder {
+                            desc: false,
+                            nulls_first: true,
+                            coll: Default::default(),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    let base = offsets.first().copied().unwrap_or(0);
+    order.len() <= spec.len()
+        && order.iter().zip(spec.iter()).all(|((e, o), (c, so))| {
+            matches!(e, RExpr::Column(slot, ..) if c.is_some_and(|c| base.checked_add(c) == Some(*slot)))
+                && o.desc == so.desc
+                && (o.nulls_first == o.desc) == (so.nulls_first == so.desc)
+        })
+}
+
+/// A compound core's row bounds after `seen` rows of the cores before
+/// it (v0.17): `(cap, pre)` — in a UNION ALL chain (`chain`: no
+/// other operator, no ORDER BY) a plain core stops at the rows the
+/// LIMIT still takes (a core past them, `Some(0)`, never runs: the
+/// pin's loop ends there), and the OFFSET skips rows before their
+/// columns are computed (`pre_skip`).
+#[cfg(feature = "sql")]
+#[inline(never)]
+fn arm_bounds(
+    items: &[RExpr],
+    group_by: &[RExpr],
+    order_by: &[(RExpr, crate::sql::SortOrder)],
+    sources: &[SourcePlan],
+    (distinct, has_agg, chain): (bool, bool, bool),
+    (skip, take): (usize, usize),
+    (band, seen): ((usize, usize), usize),
+) -> (Option<usize>, (usize, usize)) {
+    if !chain {
+        return (None, (0, usize::MAX));
+    }
+    let lim = skip.saturating_add(take);
+    // (A DISTINCT core counts its distinct rows: the projections drop
+    // duplicates as they come under a cap.)
+    let cap = (take != usize::MAX && !has_agg && group_by.is_empty() && order_by.is_empty())
+        .then(|| lim.saturating_sub(seen));
+    let cap = if take != usize::MAX && seen >= lim {
+        Some(0)
+    } else {
+        cap
+    };
+    let pre = pre_skip(
+        items,
+        group_by,
+        order_by,
+        sources,
+        (distinct, has_agg),
+        band,
+        (skip.saturating_sub(seen), lim.saturating_sub(seen)),
+    );
+    (cap, pre)
+}
+
+/// A row whose columns the OFFSET skips (`pre_skip`).
+#[cfg(feature = "sql")]
+fn skipped_row() -> Produced {
+    Produced {
+        out: AVec::new(),
+        keys: AVec::new(),
+        rowid: None,
+    }
 }
 
 /// How many rows a query needs from its FROM clause when that
@@ -15662,15 +16317,19 @@ pub(crate) fn groups_arrive_ordered(sources: &[SourcePlan]) -> bool {
 fn dedup_produced(produced: AVec<Produced>, colls: &[crate::record::Coll]) -> AVec<Produced> {
     let mut kept: AVec<Produced> = AVec::new();
     for p in produced.iter() {
-        let dup = kept.iter().any(|k: &Produced| {
-            k.out.len() == p.out.len()
-                && compound_rows_equal(k.out.as_slice(), p.out.as_slice(), colls)
-        });
-        if !dup {
+        if !dup_row(kept.as_slice(), p.out.as_slice(), colls) {
             kept.push(p.clone());
         }
     }
     kept
+}
+
+/// Whether `vals` repeats a row of `kept` under DISTINCT collations
+/// `colls`.
+#[cfg(feature = "query")]
+fn dup_row(kept: &[Produced], vals: &[OwnedValue], colls: &[crate::record::Coll]) -> bool {
+    kept.iter()
+        .any(|k| compound_rows_equal(k.out.as_slice(), vals, colls))
 }
 
 /// The nested-loop join's per-execution state (`join_step`): the

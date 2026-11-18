@@ -1001,6 +1001,7 @@ pub fn natural_access(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -> O
         skip: 0,
     };
     let (sat, rev, _) = order_sat(q, s, tab, ts, &l, false);
+    let sat = crate::xplan::delivered(sat);
     if sat == 0 || rev {
         return None;
     }

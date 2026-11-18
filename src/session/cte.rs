@@ -92,6 +92,15 @@ struct Outer {
     /// flattener's restriction 25; v0.17, `planner`).
     #[cfg(feature = "planner")]
     win: bool,
+    /// It drops the ORDER BY of its FROM subqueries without a LIMIT
+    /// (v0.17 fix, ungated; the pin's `SQLITE_OmitOrderBy` in
+    /// `sqlite3Select`): it has an ORDER BY of its own (a compound's,
+    /// or the merge key of a compound that is not all UNION ALL) or
+    /// more than one source, and needs no input order — no aggregate
+    /// but count(), min() and max() (`SF_OrderByReqd`), no window
+    /// function (whose rewrite moves the FROM clause into a subquery
+    /// of its own).
+    omit: bool,
 }
 
 /// The expansion walk (see the module docs).
@@ -290,6 +299,27 @@ impl<S: Storage> Connection<S> {
 
     /// `view_columns` with the planner's error kept (PRAGMA
     /// table_info reports it, as the pin does).
+    /// `plan_subquery` of a SELECT the pin resolves but never codes
+    /// (v0.17 review fix): a view read for its column names, a view or
+    /// trigger ALTER TABLE edits. Its code-generation errors (an
+    /// unknown collation in a comparison or sort key, a row value
+    /// misused, ...) wait in an enclosing scope that is never coded
+    /// (`query::late`); under `deep` (ALTER TABLE's), so do its FROM
+    /// subqueries' column collations (`Connection::uncoded`).
+    pub(super) fn plan_uncoded(
+        &self,
+        s: &SelectStmt,
+        arena: &Arena,
+        deep: bool,
+    ) -> Result<crate::query::SubPlan, S::Error> {
+        let g = crate::query::ScopeGroup::new(AVec::new(), AVec::new(), 0);
+        g.late.set(Some(None));
+        let was = self.uncoded.replace(deep || self.uncoded.get());
+        let r = self.plan_subquery(s, arena, core::slice::from_ref(&g));
+        self.uncoded.set(was);
+        r
+    }
+
     pub(super) fn view_names(
         &self,
         arena: &Arena,
@@ -298,7 +328,11 @@ impl<S: Storage> Connection<S> {
         let ckpt = arena.checkpoint();
         let r = (|| -> Result<AVec<AVec<u8>>, S::Error> {
             let (select, cols) = self.expand_view(arena, v)?;
-            let plan = self.plan_subquery(&select, arena, &[])?;
+            // The pin's `sqlite3ViewGetColumnNames`: the SELECT is
+            // resolved, not coded, and its columns take their types
+            // (v0.17 review fix: only those collations are looked up).
+            let plan = self.plan_uncoded(&select, arena, false)?;
+            crate::query::lead_colls::<S::Error>(&plan)?;
             // A column list names the columns whatever the SELECT's
             // width (the pin checks that only when the view is read).
             let mut names = if cols.is_empty() {
@@ -513,10 +547,18 @@ impl Expander<'_> {
         let n = s.compound.len();
         let mut head = outer_of(s, n == 0, n > 0, self.arena);
         head.limit |= implicit && n == 0;
+        // A compound's cores run under its ORDER BY, or the merge key
+        // of an operator other than UNION ALL (`multiSelectOrderBy`).
+        let merged = !s.order_by.is_empty()
+            || s.compound
+                .iter()
+                .any(|(op, _)| *op != crate::sql::CompoundOp::UnionAll);
+        head.omit |= n > 0 && merged && !core_win(s) && !order_reqd(s, self.arena);
         self.core::<E>(s, &head)?;
         let (order, limit) = (!s.order_by.is_empty(), s.limit.is_some() || implicit);
         for (k, (_, c)) in s.compound.as_mut_slice().iter_mut().enumerate() {
             let mut o = outer_of(c, false, true, self.arena);
+            o.omit |= merged && !core_win(c) && !order_reqd(c, self.arena);
             // The compound's ORDER BY / LIMIT belong to its last
             // SELECT, as in the pin's parse tree.
             if k + 1 == n {
@@ -623,7 +665,21 @@ impl Expander<'_> {
             // The next source's join (the pin's co-routine test).
             let next = from.get(i + 1).map(|f| f.kind);
             if let Some(f) = from.get_mut(i) {
+                // (Before the subquery is walked, as the pin's loop runs
+                // before its subqueries are coded; a view's or CTE's
+                // body once it is expanded.)
+                let omit = o.omit && !self.fixing;
+                omit_order(f, omit);
                 self.source::<E>(f, o, i, next)?;
+                // (A MATERIALIZED CTE keeps it: its body is coded once,
+                // apart from the reader.)
+                let mat = f.cte.as_ref().map_or(0, |c| c.mat as usize);
+                let kept = self
+                    .mats
+                    .as_slice()
+                    .get(mat.wrapping_sub(1))
+                    .is_some_and(|m| m.0 == M10d::Yes);
+                omit_order(f, omit && !kept);
                 if let Some(on) = &mut f.on {
                     self.expr::<E>(on)?;
                 }
@@ -1338,12 +1394,49 @@ fn outer_of(s: &SelectStmt, tail: bool, compound: bool, arena: &Arena) -> Outer 
         }),
         #[cfg(feature = "planner")]
         win: core_win(s),
+        omit: (tail && !s.order_by.is_empty() || s.from.len() > 1)
+            && !core_win(s)
+            && !order_reqd(s, arena),
     }
+}
+
+/// Drop FROM source `f`'s ORDER BY when its reader omits it
+/// (`Outer::omit`): a subquery without a LIMIT, not a recursive CTE.
+fn omit_order(f: &mut FromSource, omit: bool) {
+    if omit
+        && f.cte
+            .as_ref()
+            .is_none_or(|c| matches!(c.rec, RecMark::None))
+        && let Some(d) = f.derived.as_deref_mut()
+        && d.limit.is_none()
+    {
+        d.order_by = AVec::new();
+    }
+}
+
+/// Whether core `s` calls an aggregate that reads its rows in order
+/// (the pin's `SF_OrderByReqd`: any but count(), min() and max(),
+/// which carry `SQLITE_FUNC_ANYORDER`).
+fn order_reqd(s: &SelectStmt, arena: &Arena) -> bool {
+    let f = |e: &Expr| {
+        crate::rules::expr_any(e, &mut |x| match x {
+            Expr::Func { name, .. } => {
+                let n = handle_bytes(arena, *name);
+                !(eq_ci(n, b"count") || eq_ci(n, b"min") || eq_ci(n, b"max"))
+                    && (crate::query::agg_kind(n).is_some() || json_agg_name(n))
+            }
+            _ => false,
+        })
+    };
+    s.items.iter().any(|it| match it {
+        SelectItem::Expr(e, ..) => f(e),
+        _ => false,
+    }) || s.having.as_ref().is_some_and(f)
+        || s.order_by.iter().any(|(e, _)| f(e))
 }
 
 /// Whether core `s`'s result list or ORDER BY calls a window
 /// function (v0.16, `window`).
-#[cfg(feature = "planner")]
 fn core_win(s: &SelectStmt) -> bool {
     #[cfg(feature = "window")]
     {
@@ -1447,7 +1540,8 @@ fn flattens(
     // first; one that stays blocks flattening under an ordered or
     // aggregate reader, or a first source read as a co-routine by
     // a reader with a complex result.
-    let order = !d.order_by.is_empty() && (lim || !(o.order || o.nsrc > 1));
+    // (One the pin drops, `Outer::omit`, is gone already.)
+    let order = !d.order_by.is_empty();
     if order
         && (o.order
             || o.agg
@@ -1554,8 +1648,13 @@ fn count_selects(s: &SelectStmt) -> usize {
 
 fn count_into(s: &SelectStmt, n: &mut usize) {
     count_core(s, n);
+    // (The rows of a VALUES chain are one SELECT here, as before the
+    // chain was read row by row: v0.17 review fix, the pin reads a CTE
+    // of 3,000 chained rows.)
     for (_, c) in s.compound.iter() {
-        count_core(c, n);
+        if c.values.is_empty() {
+            count_core(c, n);
+        }
     }
     for (e, _) in s.order_by.iter() {
         count_expr(e, n);
@@ -1711,6 +1810,8 @@ impl<S: Storage> Connection<S> {
             &head_keys,
             keys.as_slice(),
             width,
+            scope,
+            d,
         )?;
         plan.limit = self.plan_limit(d.limit.as_deref(), arena)?;
         plan.offset = self.plan_limit(d.offset.as_deref(), arena)?;
@@ -2068,7 +2169,10 @@ impl<S: Storage> Statement<'_, S> {
             self.rec_rows.push((rec.id, row));
             let mut r = Ok(());
             for step in steps.iter() {
-                match self.exec_subplan_core(step, outer, None, None).await {
+                match self
+                    .exec_subplan_core(step, outer, None, None, (0, usize::MAX))
+                    .await
+                {
                     Ok(produced) => {
                         for p in produced.iter() {
                             if admit(&p.out, &mut seen) {

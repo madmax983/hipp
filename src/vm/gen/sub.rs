@@ -134,9 +134,7 @@ impl G<'_, '_> {
         let mut found: AVec<RExpr> = AVec::new();
         let base = self.b.preset.len();
         let _ = crate::query::walk_aggs_mut(&mut e2, 0, &mut |a, d| {
-            if let RExpr::Agg {
-                lvl, inert: false, ..
-            } = a
+            if let RExpr::Agg { lvl, .. } = a
                 && *lvl == d
                 && d > 0
             {

@@ -149,6 +149,12 @@ struct Parser<'a> {
     /// read as a chain of selects (`SelectStmt::vchain`).
     #[cfg(feature = "sql")]
     with_seen: bool,
+    /// The VALUES list just parsed ended in a co-routine that began
+    /// after chained rows (v0.17 review fix, `sql`): the pin's reader
+    /// then has `SF_Values`, which exempts the compound from the
+    /// 500-SELECT limit.
+    #[cfg(feature = "sql")]
+    vtail: bool,
     /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
     /// a view's tree in its reduced form, whose leaves lose their
     /// height, so a leaf the pin resolves on its own (`SELECT a`,
@@ -160,6 +166,10 @@ struct Parser<'a> {
     /// The tallest result column of the select core just parsed.
     #[cfg(feature = "query")]
     core_h: usize,
+    /// The select number each row of the VALUES list just read took
+    /// as a select of its own (v0.17, `explain`; `values_rows`).
+    #[cfg(feature = "explain")]
+    row_ids: AVec<u32>,
     /// Parsing a trigger program (v0.16, `triggers`): `RAISE()` is
     /// legal only here.
     #[cfg(feature = "triggers")]
@@ -759,6 +769,8 @@ impl<'a> Parser<'a> {
     fn core_sel(&self, core: &SelectStmt) -> u32 {
         if core.values.is_empty() {
             self.next_sel()
+        } else if core.sel != 0 {
+            core.sel
         } else {
             self.nsel.get()
         }
@@ -810,10 +822,14 @@ impl<'a> Parser<'a> {
             r_false: false,
             #[cfg(feature = "sql")]
             with_seen: false,
+            #[cfg(feature = "sql")]
+            vtail: false,
             #[cfg(feature = "query")]
             reduced: false,
             #[cfg(feature = "query")]
             core_h: 0,
+            #[cfg(feature = "explain")]
+            row_ids: AVec::new(),
             #[cfg(feature = "triggers")]
             in_trig: false,
             #[cfg(feature = "attach")]
@@ -1618,6 +1634,13 @@ impl<'a> Parser<'a> {
             let e = self.item::<E>(IDX_HELD)?;
             let end = self.cur().offset;
             let (inner, coll) = match &e {
+                // (An index key's collation is always looked up.)
+                #[cfg(feature = "sql")]
+                Expr::Collate(_, Coll::Unknown) => {
+                    return Err(Error::Schema {
+                        kind: crate::error::SchemaKind::UnknownCollation,
+                    });
+                }
                 Expr::Collate(x, c) => (x.as_ref(), Some(*c)),
                 x => (x, None),
             };
@@ -2440,9 +2463,13 @@ impl<'a> Parser<'a> {
     /// and an INSERT's rows when there are several (`insert`; one
     /// row is not a select there — `INSERT INTO t(a, a, ...)` takes
     /// any number).
+    /// Each row's select number as a select of its own is left in
+    /// `row_ids` (`explain`; `values_core` numbers the pin's).
     fn values_rows<E>(&mut self, base: usize, insert: bool) -> Result<AVec<AVec<Expr>>, E> {
         self.expect_kw::<E>(b"VALUES")?;
         let mut rows = AVec::new();
+        #[cfg(feature = "explain")]
+        let mut ids: AVec<u32> = AVec::new();
         #[cfg(feature = "query")]
         let mut core_h = 1usize;
         // The pin's select numbers (v0.16, `explain`): each row is a
@@ -2478,7 +2505,7 @@ impl<'a> Parser<'a> {
             {
                 let k = self.nsel.get();
                 subs |= k != sel0.saturating_add(rows.len() as u32 - 1);
-                self.next_sel();
+                ids.push(self.next_sel());
             }
             if self.eat(Tok::Comma) {
                 continue;
@@ -2488,6 +2515,10 @@ impl<'a> Parser<'a> {
         #[cfg(feature = "explain")]
         if !subs && rows.len() > 1 {
             self.nsel.set(sel0.saturating_add(2));
+        }
+        #[cfg(feature = "explain")]
+        {
+            self.row_ids = ids;
         }
         #[cfg(feature = "query")]
         {
@@ -3322,7 +3353,14 @@ impl<'a> Parser<'a> {
         #[cfg(feature = "sql")]
         if bp == BP_COLLATE {
             self.pos += 1;
-            let c = self.coll_at::<E>(self.pos)?;
+            // (An unknown name is looked up only where the pin uses
+            // it: `Coll::Unknown`, v0.17.)
+            let c = match self.coll_at::<E>(self.pos) {
+                Err(Error::Schema {
+                    kind: crate::error::SchemaKind::UnknownCollation,
+                }) => Coll::Unknown,
+                c => c?,
+            };
             self.pos += 1;
             // `expr COLLATE ids`.
             self.need::<E>(3)?;
@@ -4596,8 +4634,12 @@ impl<'a> Parser<'a> {
         #[cfg_attr(not(feature = "sql"), allow(unused_mut))]
         let mut last = base;
         #[cfg(feature = "sql")]
+        let mut last_values;
+        #[cfg(feature = "sql")]
         {
-            let mut compound: AVec<(CompoundOp, SelectStmt)> = AVec::new();
+            // (A VALUES chain at the head brings its rows as cores.)
+            let mut compound: AVec<(CompoundOp, SelectStmt)> = core::mem::take(&mut head.compound);
+            last_values = !head.values.is_empty();
             loop {
                 let op = if self.eat_kw(b"UNION") {
                     if self.eat_kw(b"ALL") {
@@ -4619,10 +4661,13 @@ impl<'a> Parser<'a> {
                     Some((_, c)) => c.sel = self.core_sel(c),
                     None => head.sel = self.core_sel(&head),
                 }
-                #[allow(unused_mut)]
                 let mut core = self.select_core::<E>(last)?;
-                #[cfg(feature = "sql")]
-                chain_reals(self.arena, &mut core);
+                last_values = !core.values.is_empty();
+                // A later VALUES chain is the pin's `SELECT * FROM
+                // (chain)` (`parserDoubleLinkSelect`, v0.17).
+                if !core.compound.is_empty() {
+                    core = self.chain_wrap(core);
+                }
                 if op == CompoundOp::UnionAll {
                     pending = pending.max(self.core_h);
                 } else {
@@ -4635,11 +4680,7 @@ impl<'a> Parser<'a> {
             // a syntax error when the LAST core is a VALUES core
             // (`VALUES (1) LIMIT 1`, `... UNION VALUES (2)
             // ORDER BY 1` both fail there) — reproduce it.
-            let last_is_values = match compound.as_slice().last() {
-                Some((_, c)) => !c.values.is_empty(),
-                None => !head.values.is_empty(),
-            };
-            if last_is_values
+            if last_values
                 && (self.cur_is_kw(b"ORDER")
                     || self.cur_is_kw(b"LIMIT")
                     || self.cur_is_kw(b"OFFSET"))
@@ -4665,9 +4706,11 @@ impl<'a> Parser<'a> {
         // one), unless the last member is a one-row VALUES (its
         // `SF_Values` exemption; v0.16 review fix — probed: 600
         // SELECTs then `VALUES(1)` read, then `VALUES(1),(2)` do
-        // not).
+        // not) or a VALUES co-routine begun after chained rows
+        // (v0.17 review fix).
         #[cfg(feature = "sql")]
         if head.compound.len() >= MAX_COMPOUND_SELECT
+            && !(last_values && self.vtail)
             && head
                 .compound
                 .as_slice()
@@ -4704,15 +4747,56 @@ impl<'a> Parser<'a> {
     }
 
     /// A `VALUES (row), (row), ...` core (v0.9): values are
-    /// full expressions, as in the INSERT grammar.
+    /// full expressions, as in the INSERT grammar. The rows are what
+    /// the pin's `sqlite3MultiValues` makes of them as each comes
+    /// (v0.17): one VALUES co-routine (a multi-row core), or, row by
+    /// row, a one-row select chained to the previous ones by UNION
+    /// ALL — after a WITH clause began (`bHasWith`), in a stored
+    /// view's or trigger's text (read with `db->init.busy`), for a
+    /// row that is not constant, or after a one-row select that is
+    /// not constant or has an item with an affinity. A later
+    /// constant row after such a select starts a co-routine with it.
+    /// A chain comes back as a compound of its cores (UNION ALL); its
+    /// cores are `vchain` when it is one-row selects throughout (the
+    /// pin's `SF_MultiValue`).
     #[cfg(feature = "sql")]
     fn values_core<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
+        #[cfg(feature = "explain")]
+        let sel0 = self.nsel.get();
         let values = self.values_rows::<E>(base, false)?;
-        // The pin's `sqlite3MultiValues` conditions for the UNION ALL
-        // chain (v0.17 review fix): a WITH clause began, the text is a
-        // stored view's (read with `db->init.busy`), the first row has
-        // an item with an affinity, or a later row one that is not
-        // constant as the parser sees it.
+        #[cfg(feature = "explain")]
+        let ids = core::mem::take(&mut self.row_ids);
+        // `sqlite3ExprIsConstant` with a parse context: no column,
+        // subquery, aggregate or window call, and a function only if
+        // it is deterministic.
+        fn constant(r: &[Expr], arena: &Arena) -> bool {
+            !r.iter().any(|e| {
+                crate::rules::expr_any(e, &mut |x| match x {
+                    Expr::Func { name, clause, .. } => {
+                        let n = handle_bytes(arena, *name);
+                        clause.is_some()
+                            || [
+                                &b"random"[..],
+                                b"randomblob",
+                                b"changes",
+                                b"total_changes",
+                                b"last_insert_rowid",
+                            ]
+                            .iter()
+                            .any(|w| n.eq_ignore_ascii_case(w))
+                    }
+                    _ => matches!(
+                        x,
+                        Expr::Column { .. }
+                            | Expr::ScalarSubquery(_)
+                            | Expr::ExistsSubquery(_)
+                            | Expr::InSubquery(..)
+                    ),
+                })
+            })
+        }
+        // `sqlite3ExprAffinity` of an item (a CAST, through COLLATE
+        // and a one-item subquery).
         fn aff(e: &Expr) -> bool {
             match e {
                 Expr::Cast(..) => true,
@@ -4727,23 +4811,86 @@ impl<'a> Parser<'a> {
                 _ => false,
             }
         }
-        let vchain = self.with_seen
-            || self.view_use
-            || values.as_slice().first().is_some_and(|r| r.iter().any(aff))
-            || values.iter().skip(1).flat_map(|r| r.iter()).any(|e| {
-                crate::rules::expr_any(e, &mut |x| {
-                    matches!(
-                        x,
-                        Expr::Column { .. }
-                            | Expr::Func { .. }
-                            | Expr::Like(..)
-                            | Expr::ScalarSubquery(_)
-                            | Expr::ExistsSubquery(_)
-                            | Expr::InSubquery(..)
-                    )
-                })
-            });
-        Ok(SelectStmt {
+        #[cfg(feature = "triggers")]
+        let trig = self.in_trig;
+        #[cfg(not(feature = "triggers"))]
+        let trig = false;
+        let always = self.with_seen || self.view_use || trig;
+        // The segments: (first row, rows), a co-routine when it has
+        // more than one row.
+        let mut segs: AVec<AVec<AVec<Expr>>> = AVec::new();
+        for row in values.into_iter() {
+            let chain = match segs.as_slice().last() {
+                None => true,
+                Some(l) => {
+                    always
+                        || !constant(row.as_slice(), self.arena)
+                        || (l.len() == 1
+                            && l.as_slice().first().is_some_and(|f| {
+                                !constant(f.as_slice(), self.arena) || f.iter().any(aff)
+                            }))
+                }
+            };
+            match segs.as_mut_slice().last_mut() {
+                Some(l) if !chain => l.push(row),
+                _ => {
+                    let mut seg = AVec::new();
+                    seg.push(row);
+                    segs.push(seg);
+                }
+            }
+        }
+        // (One-row selects throughout: `SF_MultiValue`.)
+        let multi = segs.len() > 1 && segs.iter().all(|g| g.len() == 1);
+        self.vtail = segs.len() > 1 && segs.as_slice().last().is_some_and(|g| g.len() > 1);
+        // The pin's select numbers: a one-row select takes one after
+        // its subqueries; a co-routine its first row's and, at its
+        // second row, its reader's.
+        #[cfg(feature = "explain")]
+        let mut sel = sel0;
+        #[cfg(feature = "explain")]
+        let mut at = 0usize;
+        let mut cores: AVec<SelectStmt> = AVec::new();
+        for seg in segs.into_iter() {
+            #[cfg(feature = "explain")]
+            {
+                let n = seg.len();
+                let mut prev = if at == 0 {
+                    sel0
+                } else {
+                    ids.as_slice().get(at - 1).copied().unwrap_or(sel)
+                };
+                for k in 0..n.min(2) {
+                    let id = ids.as_slice().get(at + k).copied().unwrap_or(prev);
+                    sel = sel.saturating_add(id.saturating_sub(prev));
+                    prev = id;
+                }
+                at += n;
+            }
+            let mut c = self.values_select(seg);
+            c.vchain = multi;
+            #[cfg(feature = "explain")]
+            {
+                c.sel = sel;
+            }
+            cores.push(c);
+        }
+        #[cfg(feature = "explain")]
+        self.nsel.set(sel);
+        let mut it = cores.into_iter();
+        let Some(mut head) = it.next() else {
+            return Err(perr(self.cur().offset, ParseKind::UnexpectedToken));
+        };
+        for c in it {
+            head.compound.push((CompoundOp::UnionAll, c));
+        }
+        Ok(head)
+    }
+
+    /// A VALUES core of `rows` (no clauses of its own).
+    #[cfg(feature = "sql")]
+    fn values_select(&self, values: AVec<AVec<Expr>>) -> SelectStmt {
+        SelectStmt {
             distinct: false,
             items: AVec::new(),
             from: AVec::new(),
@@ -4767,8 +4914,39 @@ impl<'a> Parser<'a> {
             sel: 0,
             #[cfg(feature = "expr_index")]
             first_row: false,
-            vchain,
-        })
+            vchain: false,
+        }
+    }
+
+    /// A VALUES chain that is a later compound member: the pin's
+    /// `SELECT * FROM (chain)` (`parserDoubleLinkSelect`, v0.17), so
+    /// its columns keep the chain's names (a first-row column
+    /// reference's included), a reader's WHERE term can be pushed into
+    /// it, and its column's affinity is the chain's own (a REAL one
+    /// reads the chain's integers as reals: `SubPlan::real_cols`).
+    #[cfg(feature = "sql")]
+    fn chain_wrap(&self, chain: SelectStmt) -> SelectStmt {
+        let mut s = self.values_select(AVec::new());
+        s.items.push(SelectItem::Star);
+        s.from.push(FromSource {
+            table: ABytes::EMPTY,
+            alias: None,
+            kind: JoinKind::Inner,
+            on: None,
+            derived: Some(Box::new(chain)),
+            natural: false,
+            using: AVec::new(),
+            args: None,
+            qualified: false,
+            in_temp: false,
+            #[cfg(feature = "attach")]
+            schema: None,
+            cte: None,
+            indexed: None,
+            #[cfg(feature = "planner")]
+            flat: false,
+        });
+        s
     }
 
     fn select_core_select<E>(&mut self, base: usize) -> Result<SelectStmt, E> {
@@ -6496,69 +6674,6 @@ UPDATE USING VALUES WHEN WHERE",
             });
         }
         Ok(false)
-    }
-}
-
-/// A later compound arm that is a chain of VALUES rows
-/// (`SelectStmt::vchain`) is, on the pin, the subquery `SELECT * FROM
-/// (chain)` (`parserDoubleLinkSelect` wraps it), whose column of REAL
-/// affinity reads its integers as reals (v0.17 review fix): its
-/// integer literals become reals here. Only a column of literals and
-/// CASTs is typed (another item leaves it as it is).
-#[cfg(feature = "sql")]
-fn chain_reals(arena: &Arena, c: &mut SelectStmt) {
-    use crate::record::Affinity;
-    if !c.vchain || c.values.len() < 2 {
-        return;
-    }
-    let w = c.values.as_slice().first().map_or(0, |r| r.len());
-    for i in 0..w {
-        let mut found: Option<Affinity> = None;
-        let mut m = 0u8;
-        let mut known = true;
-        for r in c.values.iter() {
-            let (a, d) = match r.as_slice().get(i) {
-                Some(Expr::Literal(Literal::Null)) => (None, 0),
-                Some(Expr::Literal(Literal::Integer(_) | Literal::Real(_))) => (None, 1),
-                Some(Expr::Literal(Literal::Text(_))) => (None, 2),
-                Some(Expr::Literal(Literal::Blob(_))) => (None, 4),
-                Some(Expr::Cast(_, ty)) => {
-                    let a = crate::record::affinity_of(handle_bytes(arena, *ty));
-                    let d = match a {
-                        Affinity::Text => 6,
-                        Affinity::Blob => 7,
-                        _ => 5,
-                    };
-                    (Some(a), d)
-                }
-                _ => {
-                    known = false;
-                    break;
-                }
-            };
-            if found.is_none() {
-                found = a;
-            }
-            m |= d;
-        }
-        // (A CAST leftmost makes the column the pin's FLEXNUM.)
-        let head_cast = matches!(
-            c.values
-                .as_slice()
-                .first()
-                .and_then(|r| r.as_slice().get(i)),
-            Some(Expr::Cast(..))
-        );
-        if !known || found != Some(Affinity::Real) || m & 0x02 != 0 || head_cast {
-            continue;
-        }
-        for r in c.values.as_mut_slice() {
-            if let Some(e) = r.as_mut_slice().get_mut(i)
-                && let Expr::Literal(Literal::Integer(v)) = *e
-            {
-                *e = Expr::Literal(Literal::Real(v as f64));
-            }
-        }
     }
 }
 

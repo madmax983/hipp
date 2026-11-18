@@ -166,6 +166,9 @@ pub(crate) struct JPlan {
     pub loops: AVec<JLoop>,
     pub rev: u64,
     pub ob_sat: usize,
+    /// The ORDER BY terms delivered only because the rows were
+    /// distinct by then (`path_order`'s `od`), when `ob_sat` is all.
+    pub ob_od: u64,
     /// The path delivers a GROUP BY and the ORDER BY that repeats it
     /// (`JQuery::obgrp`; v0.17 review fix).
     pub ob_grp: bool,
@@ -731,7 +734,9 @@ fn ob_col(js: &JSrc<'_>, e: &RExpr) -> Option<Option<usize>> {
 /// The pin's `wherePathSatisfiesOrderBy` over `path` + `last`: how
 /// many ORDER BY terms the rows come in (`n` when all), or -1 when
 /// that is not known until more loops are added; the loops to scan
-/// backwards go into `rev`.
+/// backwards go into `rev`, and into `od` the terms delivered only
+/// because the rows were already distinct (`orderDistinctMask`: the
+/// pin never computes them).
 #[allow(clippy::too_many_arguments)]
 fn path_order(
     srcs: &[JSrc<'_>],
@@ -741,6 +746,7 @@ fn path_order(
     last: usize,
     group: bool,
     rev: &mut u64,
+    mut od: Option<&mut u64>,
 ) -> i8 {
     let n = jq.order.len();
     if n == 0 || n > 63 {
@@ -960,6 +966,9 @@ fn path_order(
                 }
                 if m & !od_mask == 0 {
                     ob_sat |= 1u64 << i;
+                    if let Some(o) = od.as_deref_mut() {
+                        *o |= 1u64 << i;
+                    }
                 }
             }
         }
@@ -1131,8 +1140,16 @@ fn solve(
                 let rev;
                 if ordered < 0 {
                     let mut r = 0u64;
-                    ordered =
-                        path_order(srcs, jq, loops, pf.loops.as_slice(), wi, jq.group, &mut r);
+                    ordered = path_order(
+                        srcs,
+                        jq,
+                        loops,
+                        pf.loops.as_slice(),
+                        wi,
+                        jq.group,
+                        &mut r,
+                        None,
+                    );
                     rev = r;
                 } else {
                     rev = pf.rev;
@@ -1294,10 +1311,29 @@ pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
     }
     let mut distinct_ordered = false;
     let mut ob_sat = 0usize;
+    let mut ob_od = 0u64;
     if !jq.order.is_empty() {
         ob_sat = best.ordered.max(0) as usize;
         if jq.distinct_by && ob_sat >= jq.order.len() {
             distinct_ordered = true;
+        }
+        // The terms the path delivers only because its rows are
+        // distinct by then (v0.17): never computed on the pin.
+        if !jq.group
+            && ob_sat >= jq.order.len()
+            && let Some((last, path)) = best.loops.as_slice().split_last()
+        {
+            let mut r = 0u64;
+            path_order(
+                srcs,
+                jq,
+                loops.as_slice(),
+                path,
+                *last,
+                false,
+                &mut r,
+                Some(&mut ob_od),
+            );
         }
     }
     let mut rev = if jq.group { 0 } else { best.rev };
@@ -1315,7 +1351,7 @@ pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
             ..*jq
         };
         let mut r = 0u64;
-        let k = path_order(srcs, &o, loops.as_slice(), path, *last, false, &mut r);
+        let k = path_order(srcs, &o, loops.as_slice(), path, *last, false, &mut r, None);
         if usize::try_from(k).is_ok_and(|k| k >= jq.order.len()) {
             rev = r;
             ob_grp = true;
@@ -1327,6 +1363,7 @@ pub(crate) fn plan(srcs: &[JSrc<'_>], jq: &JQuery<'_>) -> Option<JPlan> {
         loops: out,
         rev,
         ob_sat,
+        ob_od,
         ob_grp,
         distinct_ordered,
     })

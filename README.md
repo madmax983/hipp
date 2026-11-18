@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 481,048 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 968,448 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,066,700 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 490,396 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 976,692 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,077,632 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,52 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **VALUES chains, lazy collations, inert aggregates** (unit
+  `values_chain`, ungated fixes). A multi-row VALUES is the pin's
+  `sqlite3MultiValues` row by row — a co-routine, or one-row selects
+  chained by UNION ALL after a WITH clause, in a view's or trigger's
+  text, for a non-constant row or after a typed one — so a reader's
+  WHERE term filters each chained row with its own affinity, a later
+  chain through its wrapper's column affinity (a REAL one reads every
+  integer as a real), and a chain of one-row selects throughout not
+  at all; EXPLAIN QUERY PLAN shows `SCAN CONSTANT ROW` per row, `SCAN
+  n CONSTANT ROWS`, `0-ROW VALUES CLAUSE`. A VALUES column a
+  first-row column reference fills is named by that column. An
+  unknown collation is looked up only where the pin does (a
+  comparison, a sort / group / DISTINCT / merge key, min / max /
+  nullif, a subquery's columns), so `SELECT 1 COLLATE bogus` runs;
+  an enclosing query's aggregate in a dropped ORDER BY or an EXISTS
+  result list steps in its owner (its overflow fails, as on the pin);
+  a nested window ORDER BY inside a dropped term raises nothing; a
+  view column read through a compound subquery takes the pin's type
+  name; a result alias in a WHERE term is pushed down as its item.
+  Review fixes: a WHERE term reaches a compound through a merged
+  subquery or view and through a `SELECT * FROM (...)` arm; a
+  correlated chain arm keeps its column names; long VALUES lists and
+  `count(*)` over 1,000+ arms behave as on the pin; a CHECK under an
+  unknown collation fails only the statements that code it (ADD
+  COLUMN's verification, an UPDATE of a column it reads, FK actions,
+  `integrity_check`), and PRAGMA table_info / ALTER TABLE resolve
+  views without coding them; CREATE TABLE ... AS keeps a REAL in a
+  FLEXNUM column.
+- **ORDER BY / OFFSET parity** (unit `order_offset`, ungated fixes).
+  With no sorter or DISTINCT in the way, the OFFSET skips a row before
+  its result columns are computed (FROM-less cores, subqueries,
+  views, CTEs, UNION ALL chains, windows, aggregates — one-row ones
+  under DISTINCT / ORDER BY too — and ORDER BYs the loop delivers,
+  under a COLLATE or with later plain columns), so `SELECT
+  abs(-9223372036854775808) LIMIT 1 OFFSET 1` is no row, and windows,
+  DISTINCT cores and groups stop at their LIMIT; an ORDER BY past the
+  rowid, a UNIQUE NOT NULL key (IN equalities included) or a WITHOUT
+  ROWID key read through an access path never computes its later
+  terms (the pin's `isOrderDistinct`); a FROM subquery's ORDER BY the
+  pin omits (`SQLITE_OmitOrderBy`) is dropped, and a co-routine's own
+  order delivers its reader's ORDER BY by column number
+  (`SQLITE_OrderBySubq`), whatever the reader's collation; a UNION ALL
+  ORDER BY keeps equal rows in core order. Still open: a sorter under
+  a LIMIT computes every row's columns (the pin's top-N sorter skips
+  rows past it first), and a WITHOUT ROWID natural scan's ORDER BY
+  tail (STATUS.md).
 - **Planner and CLI parity** (unit `gaps_plan_cli`, ungated fixes).
   `INDEXED BY` names an index of the source's own table on every path
   (a plain scan accepted another table's index); WHERE / ON terms are
