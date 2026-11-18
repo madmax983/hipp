@@ -470,3 +470,61 @@ reservation brings n=1000 to 428,109,167 Ir (a further -1.68%;
 
 Size gates: tiny +24 B, full +16 B, max +16 B, xl +16 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## prepare lexes every statement three times (baseline at 53303df)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every
+`Connection::prepare` lexes the statement text once in
+`route_attach` (attached-database routing), once in `route` (TEMP
+routing), and once more in `parse_params` (the parse itself): 3
+`lex_inner` calls per prepare (7,230 at n=1000 for 2,410 prepares).
+The two routing lexes only read the tokens to decide the statement
+stays on main; the parse lexes the same bytes again.
+
+| n    | total Ir      | prepare inclusive Ir   | lex_inner inclusive Ir |
+|------|---------------|------------------------|------------------------|
+| 500  | 183,768,300   | 47,175,161 (25.67%)    | 12,882,265 (7.01%)     |
+| 1000 | 435,845,467   | 94,235,444 (21.62%)    | 25,921,167 (5.95%)     |
+| 2000 | 1,100,189,123 | 191,555,872 (17.41%)   | 54,504,500 (4.95%)     |
+
+n=1000: `lex_inner` called from `route_attach` 8,887,954, `route`
+8,526,274, `parse_params` 8,327,492 (2,410 calls each). dhat
+(n=1000): 427,368 blocks, 106,515,485 bytes; t-gmax 852,164 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'prepare::\{closure#0\} \[|lex_inner'`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: lex once in prepare
+
+`prepare` lexes the statement once (`parser::lex_statement`: the
+tokens and the parameter table `parse_params` would build), hands
+the tokens to `route_attach` and `route` (which now take
+`Option<&[Token]>`; `None` is the old "the lex failed" path), and,
+when the statement stays on main as written (no `MainAs` rewrite),
+hands the same tokens to `parse_params_lexed` — the length check,
+then the lex error if there was one, then the parse, in the order
+`parse_params` reports them. Routers that rewrite the text
+(TEMP / attached statements) still lex the rewrite themselves.
+Workload checksums identical (176089 / 657610 / 4083309). Test
+pass/fail set identical before/after (1165 tests; the 1027
+failures are the absent `sqlite3` oracle, same on the baseline
+commit); 61 TEMP / ATTACH / parameter / lex-error / parse-error
+statements give byte-identical `hipp` CLI output on both commits.
+
+| n    | total before  | total after   | Δ total | prepare before | prepare after | Δ prepare |
+|------|---------------|---------------|---------|----------------|---------------|-----------|
+| 500  | 183,768,300   | 174,965,156   | -4.79%  | 47,175,161     | 38,558,319    | -18.27%   |
+| 1000 | 435,845,467   | 417,555,413   | -4.20%  | 94,235,444     | 76,553,223    | -18.76%   |
+| 2000 | 1,100,189,123 | 1,063,193,605 | -3.36%  | 191,555,872    | 154,355,839   | -19.42%   |
+
+`lex_inner` inclusive: 12,882,265 -> 4,677,398 / 25,921,167 ->
+9,136,892 / 54,504,500 -> 18,551,678 (-64% to -66%; one call per
+prepare instead of three). dhat (n=1000): 427,368 -> 408,906 blocks
+(-4.32%), 106,515,485 -> 103,243,613 bytes (-3.07%); t-gmax
+unchanged at 852,164 B. The gate cleared is the prepare path (21.6%
+of the workload at n=1000) at -18.8%; the whole-workload delta is
+below 5% and not claimed as the win.
+
+Size gates: tiny unchanged; full +640 B, max +448 B, xl +600 B;
+ratchets raised by those amounts (each well under `justify_over`).

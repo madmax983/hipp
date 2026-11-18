@@ -481,10 +481,24 @@ impl<S: Storage> Connection<S> {
         if self.is_temp {
             return Ok(Route::Main);
         }
-        let Ok(toks) = crate::sql::parser::tokens::<S::Error>(sql, arena) else {
+        let toks = crate::sql::parser::tokens::<S::Error>(sql, arena);
+        self.route_lexed(sql, toks.as_ref().ok().map(|t| t.as_slice()), arena)
+    }
+
+    /// `route` over `sql`'s tokens, lexed by the caller (`None`: they
+    /// did not lex).
+    pub(super) fn route_lexed(
+        &self,
+        sql: &[u8],
+        toks: Option<&[Token]>,
+        arena: &Arena,
+    ) -> Result<Route, S::Error> {
+        if self.is_temp {
+            return Ok(Route::Main);
+        }
+        let Some(t) = toks else {
             return Ok(Route::Main);
         };
-        let t = toks.as_slice();
         let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
         let temp_kw = word(0, b"CREATE") && (word(1, b"TEMP") || word(1, b"TEMPORARY"));
         // The pin's grammar has no TEMP INDEX: a syntax error at

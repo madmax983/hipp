@@ -1777,9 +1777,25 @@ impl<S: Storage> Connection<S> {
         if self.alias.is_none() {
             self.ext.borrow_mut().clear();
         }
+        // The statement is lexed once: the routers read its tokens
+        // and, when it stays on main as written, the parse takes them.
+        #[cfg(all(feature = "sql", feature = "params"))]
+        let mut lexed = Some(crate::sql::parser::lex_statement::<S::Error>(
+            sql.as_bytes(),
+            &arena,
+        ));
+        #[cfg(all(feature = "sql", feature = "params"))]
+        let pre_toks = lexed
+            .as_ref()
+            .and_then(|l| l.as_ref().ok())
+            .map(|l| l.toks.as_slice());
+        #[cfg(all(feature = "sql", not(feature = "params")))]
+        let pre = crate::sql::parser::tokens::<S::Error>(sql.as_bytes(), &arena);
+        #[cfg(all(feature = "sql", not(feature = "params")))]
+        let pre_toks = pre.as_ref().ok().map(|t| t.as_slice());
         #[cfg(feature = "attach")]
-        let (att_plan, temp_route) = match self.route_attach(sql.as_bytes(), &arena)? {
-            None => (None, self.route(sql.as_bytes(), &arena)?),
+        let (att_plan, temp_route) = match self.route_attach(sql.as_bytes(), pre_toks, &arena)? {
+            None => (None, self.route_lexed(sql.as_bytes(), pre_toks, &arena)?),
             Some(attach::AttRoute::Main) => (None, temp::Route::Main),
             Some(attach::AttRoute::Temp(r)) => (None, r),
             Some(attach::AttRoute::On(on)) => {
@@ -1790,7 +1806,7 @@ impl<S: Storage> Connection<S> {
             }
         };
         #[cfg(all(feature = "sql", not(feature = "attach")))]
-        let temp_route = self.route(sql.as_bytes(), &arena)?;
+        let temp_route = self.route_lexed(sql.as_bytes(), pre_toks, &arena)?;
         #[cfg(feature = "sql")]
         let routed = match temp_route {
             #[cfg(feature = "attach")]
@@ -1847,7 +1863,18 @@ impl<S: Storage> Connection<S> {
                 };
                 (Ast::Begin, p, binds)
             }
-            _ => self.prepare_params(main_text, &arena)?,
+            _ => {
+                // The tokens lexed above, when they are `main_text`'s.
+                #[cfg(feature = "sql")]
+                let lexed = if main_as.is_none() {
+                    lexed.take()
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "sql"))]
+                let lexed = None;
+                self.prepare_params(main_text, lexed, &arena)?
+            }
         };
         let row_ckpt = arena.checkpoint();
         Ok(Statement {
@@ -2016,8 +2043,21 @@ impl<S: Storage> Connection<S> {
     /// the pin's prepare reports it (`binding_dependent`).
     #[cfg(feature = "params")]
     #[inline(never)]
-    fn prepare_params(&self, sql: &[u8], arena: &Arena) -> Result<(Ast, Plan, Binds), S::Error> {
-        let (ast, table) = crate::sql::parse_params::<S::Error>(sql, arena, self.cfg.limits())?;
+    fn prepare_params(
+        &self,
+        sql: &[u8],
+        lexed: Option<Result<crate::sql::parser::Lexed, S::Error>>,
+        arena: &Arena,
+    ) -> Result<(Ast, Plan, Binds), S::Error> {
+        let (ast, table) = match lexed {
+            Some(l) => crate::sql::parser::parse_params_lexed::<S::Error>(
+                sql,
+                l,
+                arena,
+                self.cfg.limits(),
+            )?,
+            None => crate::sql::parse_params::<S::Error>(sql, arena, self.cfg.limits())?,
+        };
         let plan_ckpt = arena.checkpoint();
         let mut binds = Binds {
             values: AVec::new(),
