@@ -161,7 +161,6 @@ fn dump_of_virtual_tables() {
         "", " t", " r", " r_node", " u", " 'r%'", " f", " g", " nosuch", " t u",
     ] {
         let pin = run_stdin(&oracle(), &base, &format!(".dump{args}\n"));
-        let pin = pin.trim_start_matches("PRAGMA foreign_keys=OFF;\n");
         let ours = run_stdin(&hipp_bin(), &base, &format!(".dump{args}\n"));
         assert_eq!(ours, pin, ".dump{args}");
     }

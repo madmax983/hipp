@@ -154,7 +154,10 @@ fn dot_dump_reimports_into_oracle() {
     let dump = run(hipp_bin(), &[hdb.to_str().unwrap(), ".dump"]);
     assert!(dump.status.success());
     let dump_sql = String::from_utf8_lossy(&dump.stdout).into_owned();
-    assert!(dump_sql.starts_with("BEGIN TRANSACTION;\n"), "{dump_sql}");
+    assert!(
+        dump_sql.starts_with("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n"),
+        "{dump_sql}"
+    );
     assert!(dump_sql.ends_with("COMMIT;\n"), "{dump_sql}");
 
     // Feed hipp's dump to the oracle on a fresh file; the oracle's

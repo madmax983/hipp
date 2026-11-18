@@ -5,6 +5,103 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Planner and CLI parity (wave 17, unit `gaps_plan_cli`)
+
+- Fixes (ungated): `INDEXED BY` an index of another table (or of a
+  TEMP / attached table, or no index) is "no such index" on the plain
+  single-table scan path too (it was accepted when the table had no
+  index); WHERE and inner-join ON terms are simplified as the pin's
+  `whereClauseInsert` does (`x OR 1` constrains nothing and keeps the
+  FROM join order; `x OR 0` is `x`, which an index serves); a merged
+  compound member is planned for the merge key's collation, so `x
+  COLLATE NOCASE UNION x` keeps the pin's row of a NOCASE-equal group
+  (a silent wrong answer); compound column types read through COLLATE
+  and unary plus; `x IS NULL` on a never-NULL column is a constant in a
+  lone table's planning, an ORDER BY constant must be a column, `x IS
+  NOT NULL` is a range only on a bare column, and a merged aggregate
+  member without GROUP BY shows no sort.
+- `planner`: WHERE push-down into compound FROM subqueries whose arms
+  differ in affinity (each arm compares with its own: the v0.16 honest
+  gap) and into UNION / INTERSECT / EXCEPT arms with BINARY columns; a
+  term constant propagation rewrites is left in the reader; the pushed
+  copy carries the leftmost arm's collation where the pin adds one.
+- hipp-cli: the pin shell's command line — `-help` / `--help` (usage on
+  stderr), `-version` / `--version`, the pin's "unknown option" error
+  (exit 1), `--` / `-`, every argument after the database an SQL text,
+  `:memory:` when none is named; the database is opened only when
+  input needs it (`--help` made a file named `--help`). `.dump` is the
+  pin's byte for byte: `PRAGMA foreign_keys=OFF;` first, reals as
+  `%.16g`, text with control characters as `unistr('...')`, names
+  quoted as the pin's `quoteChar` (a table named `"we ird"` failed the
+  dump), `sqlite_sequence` re-created, `sqlite_stat1` as `ANALYZE
+  sqlite_schema;`.
+- Tests: `tests/plan_gaps_v17.rs`, `hipp-cli/tests/cli_v17_plan_cli.rs`.
+- Size: tiny 0, full +32 B, max +772 B, xl +1,328 B (ratchets raised).
+- Review fixes (ungated unless named): a compound's column type reads
+  a multi-row VALUES arm as the pin does (an untyped co-routine; after
+  a WITH clause, in a view or with a CAST first a chain of one-row
+  selects) and a window or LIKE arm as a function, so `WITH q(x) AS
+  (VALUES (3), (4) UNION ALL SELECT s FROM t) ... WHERE x = 2` no
+  longer matches `'2'` and a REAL column's VALUES / window rows stay
+  integers; `planner` push-down reaches the other arms of a compound
+  with VALUES arms (a one-row VALUES arm takes the term too); `x OR 0`
+  is simplified after constant propagation, sources after a CROSS JOIN
+  keep its prerequisites and a LEFT JOIN's constant ON term counts
+  against its table (join order and unordered row order as the pin's);
+  `x AND 0` is the literal 0 as the pin's parser writes it (`SELECT
+  nosuch AND 0` reads; `GROUP BY y AND 0` is out of range). hipp-cli:
+  `.quit` / `.exit` open no database (no file, a non-database file not
+  read), `.exit N` exits N, a one-shot `.` argument is one command, a
+  dot-command must start the line (`  .tables` is SQL), `#` lines are
+  skipped, an unknown command and `-help` print the pin's texts.
+  Review-fix sizes: tiny 0, full +820 B, max +912 B, xl +2,100 B
+  (ratchets raised; `compound_affinity` out of line as the offset).
+
+### Evaluator and statement-level parity (wave 17, unit `gaps_eval`)
+
+- Fixes (ungated, every profile with the evaluator): `hex(NULL)` is
+  `''`; `substr` of an empty BLOB is NULL; a FROM-less core never
+  computes its ORDER BY terms (`SELECT 1 ORDER BY
+  abs(-9223372036854775808)` is 1, DISTINCT and nested cores too, an
+  aggregate there is no misuse); LIMIT 0 computes nothing else (its
+  OFFSET, the result columns, WHERE, compound cores, subqueries); the
+  WHERE clause's constant propagation covers the rowid and its
+  INTEGER PRIMARY KEY alias, constants other than literals, one-item
+  IN lists and IN / BETWEEN / LIKE / CASE / COLLATE operands (`WHERE
+  a = 5 AND a < 5 AND <failing constant>` is no row); AND / OR drop a
+  neutral operand as the pin does (`x AND (0 OR 0)` is 0 without
+  computing `x`).
+- Empty statements (`sql`): `;`, `;;`, blanks and comments prepare to
+  a statement that does nothing, a statement may end in several `;`,
+  and the CLI skips empty statements in scripts as the pin's shell
+  does.
+- Sizes: tiny 76,904 (0), full 479,332 (+776), max 965,876 (+680), xl
+  1,062,520 (+656). Tests: `tests/eval_gaps_v17.rs`,
+  `hipp-cli/tests/cli_v17_eval_gaps.rs`.
+- Review fixes (ungated): an enclosing query's aggregate in a dropped
+  ORDER BY still makes that query an aggregate one (`SELECT (SELECT 1
+  ORDER BY sum(t.a)) FROM t` is one row again; no misuse in a WHERE);
+  `5 IN (b)` no longer fixes `b` in the constant propagation, a
+  one-item `x IN (CAST(c AS T))` fixes `x` and `x NOT IN (c)` makes
+  `x` an `=` operand; a group computes every aggregate a result term
+  may skip (an AND / OR, CASE or IN-list operand, a later coalesce /
+  iif / likely argument) before its terms, so `SELECT
+  sum(<overflow>) AND (0 OR 0)` fails as on the pin (the VM too); a
+  dropped ORDER BY raises none of the pin's code-generation errors
+  (`SELECT 1 ORDER BY (1,2)`, `ORDER BY raise(ignore)`, `SELECT
+  count(*) FROM t ORDER BY (SELECT 1, 2)` answer). Sizes: tiny 0,
+  full +864 B, max +888 B, xl +752 B (ratchets raised).
+
+### The bytecode VM migration stopped (owner decision, 2026-11-15)
+
+- ADR 0005 Stages 2-4 are not adopted and ADR 0007 is rejected: the
+  VM was measured three times (the Stage 2 flip, the combined Stage
+  2 + 3 flip, a redesigned smaller VM) and never fitted the size
+  ratchets. The tree-walking executors stay. The Stage 2 VM stays
+  frozen behind the hidden `vm` feature, which no profile enables;
+  new SQL shapes fall back to today's executor under it. No code,
+  behaviour or size change.
+
 ### A smaller VM: measured design, verdict stop (wave 16, unit `slim_design`)
 
 - ADR 0007 "A smaller VM" (proposed): the four levers of a smaller

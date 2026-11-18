@@ -1445,6 +1445,15 @@ impl<S: Storage> Connection<S> {
                 }
                 Some(expr_refs_range(e, &earlier))
             };
+            // (A lone source's never-NULL columns: `never_null_terms`.)
+            if n == 1 {
+                never_null_terms(
+                    &mut conj,
+                    self.not_null_cols(t).as_slice(),
+                    base,
+                    &NULL_TRUTH,
+                );
+            }
             let ts = terms(conj.as_slice(), truth.as_slice(), &s, &avail);
             // The ORDER BY (or GROUP BY / DISTINCT) the loop may
             // deliver: a lone source only.
@@ -1868,6 +1877,11 @@ impl<S: Storage> Connection<S> {
         };
         let mut conj: AVec<&RExpr> = AVec::new();
         conjuncts(f, &mut conj);
+        // `x IS [NOT] NULL` on a column that is never NULL is the
+        // constant 0 / 1 (the pin's resolver, `sqlite3ExprCanBeNull`;
+        // v0.17 fix, as `plan_join` does: `k IS NULL ORDER BY k` read
+        // a covering index, its ORDER BY taken as satisfied).
+        never_null_terms(&mut conj, self.not_null_cols(t).as_slice(), 0, &NULL_TRUTH);
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
         let mut truth: AVec<i32> = AVec::new();
         #[cfg(feature = "planner")]
@@ -2083,5 +2097,40 @@ impl<S: Storage> Connection<S> {
                 && m.is_some_and(|m| !m.covers_all && m.covers(needed.as_slice()));
         }
         Ok(Some(Box::new(acc)))
+    }
+}
+
+/// The constants `x IS NULL` / `x IS NOT NULL` become.
+static NULL_TRUTH: [RExpr; 2] = [
+    RExpr::Literal(OwnedValue::Integer(0)),
+    RExpr::Literal(OwnedValue::Integer(1)),
+];
+
+/// `x IS [NOT] NULL` on a column that is never NULL (`nn`, columns
+/// from slot `base`; the rowid) is the constant 0 / 1 (the pin's
+/// resolver, `sqlite3ExprCanBeNull`; v0.17 fix, as `plan_join` does:
+/// `k IS NULL ORDER BY k` read a covering index, its ORDER BY taken
+/// as satisfied by the IS NULL "equality").
+fn never_null_terms<'x>(
+    conj: &mut AVec<&'x RExpr>,
+    nn: &[bool],
+    base: usize,
+    lits: &'x [RExpr; 2],
+) {
+    for c in conj.as_mut_slice().iter_mut() {
+        if let RExpr::IsNull(x, not) = *c
+            && match &**x {
+                RExpr::Rowid(_) => true,
+                RExpr::Column(i, ..) => i
+                    .checked_sub(base)
+                    .and_then(|i| nn.get(i))
+                    .copied()
+                    .unwrap_or(false),
+                _ => false,
+            }
+            && let Some(l) = lits.get(usize::from(*not))
+        {
+            *c = l;
+        }
     }
 }

@@ -1440,9 +1440,12 @@ fn select_is_simple(stmt: &SelectStmt) -> bool {
         return false;
     }
     // v0.16: `name(args)` is a table-valued function (or the
-    // pin's "not a function"), for the general planner.
+    // pin's "not a function"), for the general planner. So is an
+    // INDEXED BY / NOT INDEXED source (v0.17 fix: this path never
+    // looked the index up, so an index of another table, or none,
+    // was accepted where the pin says "no such index").
     #[cfg(feature = "sql")]
-    if stmt.from.as_slice()[0].args.is_some() {
+    if stmt.from.as_slice()[0].args.is_some() || stmt.from.as_slice()[0].indexed.is_some() {
         return false;
     }
     let mut stars = 0usize;
@@ -1968,6 +1971,13 @@ impl<S: Storage> Connection<S> {
             },
             e => e,
         })?;
+        // Of an empty statement, a syntax error (v0.17).
+        if matches!(st.ast, Ast::Empty) {
+            return Err(Error::Parse {
+                offset: sql.len(),
+                kind: crate::error::ParseKind::UnexpectedEof,
+            });
+        }
         #[allow(unused_mut)]
         let mut rows = st.eqp_rows().await?;
         if let Plan::Temp { .. } = &st.plan {
@@ -2289,6 +2299,8 @@ impl<S: Storage> Connection<S> {
             Ast::AlterRename { .. }
             | Ast::AlterRenameColumn { .. }
             | Ast::AlterDropColumn { .. } => self.plan_alter16(arena, ast),
+            #[cfg(feature = "sql")]
+            Ast::Empty => Ok(Plan::Maint(maint::Maint::Nothing)),
             #[cfg(feature = "sql")]
             Ast::Savepoint { .. }
             | Ast::Release { .. }
@@ -3252,8 +3264,8 @@ impl<S: Storage> Connection<S> {
             // pin's FLEXNUM, declared ` NUM`.
             let aff = crate::rules::compound_affinity(
                 item.and_then(crate::query::item_result_affinity),
-                item,
-                plan.compound.iter().map(|(_, t)| &**t),
+                &plan,
+                plan.compound.as_slice(),
                 i,
             )
             .unwrap_or(Affinity::Blob);
@@ -3751,7 +3763,15 @@ impl<S: Storage> Connection<S> {
             let (compound, comp_order) = if stmt.compound.is_empty() {
                 (AVec::new(), AVec::new())
             } else {
-                self.plan_sub_compound(stmt, arena, enclosing, &keys, width)?
+                self.plan_sub_compound(
+                    stmt,
+                    arena,
+                    enclosing,
+                    &keys,
+                    width,
+                    #[cfg(feature = "expr_index")]
+                    core_colls(&[], values.as_slice()),
+                )?
             };
             let mut result_names: AVec<AVec<u8>> = AVec::new();
             let mut result_affs: AVec<Option<crate::record::Affinity>> = AVec::new();
@@ -3784,6 +3804,7 @@ impl<S: Storage> Connection<S> {
                 rec: None,
                 mat: 0,
                 real_cols: AVec::new(),
+                vchain: stmt.vchain,
                 #[cfg(feature = "explain")]
                 sel: stmt.sel,
                 #[cfg(feature = "planner")]
@@ -3807,7 +3828,15 @@ impl<S: Storage> Connection<S> {
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_sub_compound(stmt, arena, enclosing, &core.keys, core.items.len())?
+            self.plan_sub_compound(
+                stmt,
+                arena,
+                enclosing,
+                &core.keys,
+                core.items.len(),
+                #[cfg(feature = "expr_index")]
+                core_colls(core.items.as_slice(), &[]),
+            )?
         };
         #[cfg(not(feature = "sql"))]
         let (compound, comp_order): SubCompoundParts = (AVec::new(), AVec::new());
@@ -3837,6 +3866,8 @@ impl<S: Storage> Connection<S> {
             mat: 0,
             #[cfg(feature = "sql")]
             real_cols: AVec::new(),
+            #[cfg(feature = "sql")]
+            vchain: false,
             #[cfg(feature = "explain")]
             sel: stmt.sel,
             #[cfg(feature = "planner")]
@@ -3967,16 +3998,20 @@ impl<S: Storage> Connection<S> {
         enclosing: &[crate::query::ScopeGroup],
         head: &CompKeys,
         width: usize,
+        #[cfg(feature = "expr_index")] mut seen: AVec<Option<crate::record::Coll>>,
     ) -> Result<SubCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<crate::query::SubPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
         for (i, (op, core)) in stmt.compound.iter().enumerate() {
             #[cfg(feature = "expr_index")]
             if core.values.is_empty() {
-                self.merge_core.set(merge_member(stmt, i + 1));
+                self.merge_core
+                    .set(merge_member(stmt, i + 1).map(|(t, r, _)| (t, r, seen.clone())));
             }
             let _ = i;
             let (p, k) = self.plan_subquery_keyed(core, arena, enclosing)?;
+            #[cfg(feature = "expr_index")]
+            seen_colls(&mut seen, p.items.as_slice(), p.values.as_slice());
             if p.width() != width {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
@@ -4004,16 +4039,20 @@ impl<S: Storage> Connection<S> {
         arena: &Arena,
         head: &CompKeys,
         width: usize,
+        #[cfg(feature = "expr_index")] mut seen: AVec<Option<crate::record::Coll>>,
     ) -> Result<QueryCompoundParts, S::Error> {
         let mut tails: AVec<(crate::sql::CompoundOp, Box<QueryPlan>)> = AVec::new();
         let mut keys: AVec<CompKeys> = AVec::new();
         for (i, (op, core)) in stmt.compound.iter().enumerate() {
             #[cfg(feature = "expr_index")]
             if core.values.is_empty() {
-                self.merge_core.set(merge_member(stmt, i + 1));
+                self.merge_core
+                    .set(merge_member(stmt, i + 1).map(|(t, r, _)| (t, r, seen.clone())));
             }
             let _ = i;
             let (p, k) = self.plan_query_keyed(core, arena)?;
+            #[cfg(feature = "expr_index")]
+            seen_colls(&mut seen, p.items.as_slice(), p.values.as_slice());
             if p.width != width {
                 return Err(Error::Schema {
                     kind: SchemaKind::ColumnCountMismatch,
@@ -4976,7 +5015,14 @@ impl<S: Storage> Connection<S> {
             let (compound, comp_order) = if stmt.compound.is_empty() {
                 (AVec::new(), AVec::new())
             } else {
-                self.plan_query_compound(stmt, arena, &keys, width)?
+                self.plan_query_compound(
+                    stmt,
+                    arena,
+                    &keys,
+                    width,
+                    #[cfg(feature = "expr_index")]
+                    core_colls(&[], values.as_slice()),
+                )?
             };
             let qp = QueryPlan {
                 sources: AVec::new(),
@@ -5008,7 +5054,14 @@ impl<S: Storage> Connection<S> {
         let (compound, comp_order) = if stmt.compound.is_empty() {
             (AVec::new(), AVec::new())
         } else {
-            self.plan_query_compound(stmt, arena, &core.keys, width)?
+            self.plan_query_compound(
+                stmt,
+                arena,
+                &core.keys,
+                width,
+                #[cfg(feature = "expr_index")]
+                core_colls(core.items.as_slice(), &[]),
+            )?
         };
         #[cfg(not(feature = "sql"))]
         let (compound, comp_order): QueryCompoundParts = (AVec::new(), AVec::new());
@@ -5333,6 +5386,15 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::MisusedWindow,
             });
         }
+        // Only GROUP BY or an aggregate in the result list makes
+        // the query an aggregate one (v0.16 fix, ungated: an
+        // aggregate in ORDER BY alone is the pin's "misuse of
+        // aggregate" — hipp aggregated the query to one row).
+        // HAVING needs one of them already (checked above).
+        // (An EXISTS's inert aggregate counts here: the pin
+        // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
+        // t` to one row.)
+        let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
         // A compound head's ORDER BY resolves against the
         // combined result (comp_order), not this core's rows,
         // so the term loop is skipped for it.
@@ -5345,6 +5407,14 @@ impl<S: Storage> Connection<S> {
             // Window calls are allowed in ORDER BY terms too.
             #[cfg(feature = "window")]
             cur.win.ok.set(true);
+            // An ORDER BY the pin never codes (a FROM-less core's, an
+            // aggregate one's without GROUP BY: see below) raises none
+            // of its code-generation errors (v0.17 review fix:
+            // `SELECT 1 ORDER BY (1,2)` is 1 there; `query::late`).
+            #[cfg(feature = "sql")]
+            if group_by.is_empty() && (sources.is_empty() || has_agg) {
+                cur.late.set(Some(None));
+            }
             for (e, dir) in stmt.order_by.iter() {
                 let r = self.resolve_term(
                     e,
@@ -5372,6 +5442,8 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "window")]
             cur.win.ok.set(false);
         }
+        #[cfg(feature = "sql")]
+        let late = cur.late.take().flatten();
         #[cfg(feature = "fts5")]
         if rank_order {
             order_by.clear();
@@ -5399,15 +5471,6 @@ impl<S: Storage> Connection<S> {
         {
             return Err(Error::Unsupported);
         }
-        // Only GROUP BY or an aggregate in the result list makes
-        // the query an aggregate one (v0.16 fix, ungated: an
-        // aggregate in ORDER BY alone is the pin's "misuse of
-        // aggregate" — hipp aggregated the query to one row).
-        // HAVING needs one of them already (checked above).
-        // (An EXISTS's inert aggregate counts here: the pin
-        // aggregates `SELECT EXISTS(SELECT max(t.a) FROM u) FROM
-        // t` to one row.)
-        let has_agg = !group_by.is_empty() || items.iter().any(crate::query::has_result_agg);
         // An auxiliary function in an aggregate query over a
         // full-text table: the pin's columns there are aggregate
         // columns, which xFindFunction does not overload ("unable to
@@ -5428,7 +5491,13 @@ impl<S: Storage> Connection<S> {
                 kind: SchemaKind::Fts5Context,
             });
         }
-        if !has_agg && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
+        // A core over no table makes one row, which satisfies its
+        // ORDER BY: the pin's loop over no table never computes the
+        // terms (`nOBSat`; DISTINCT likewise), so an aggregate there
+        // is no misuse either (v0.17 fix: hipp sorted the one row,
+        // and failed on a term that errors or aggregates).
+        let free = sources.is_empty() && !has_agg && stmt.compound.is_empty();
+        if !has_agg && !free && order_by.iter().any(|(e, _)| crate::query::has_agg(e)) {
             return Err(Error::Schema {
                 kind: SchemaKind::MisusedAggregate,
             });
@@ -5455,16 +5524,30 @@ impl<S: Storage> Connection<S> {
         let plain = crate::window::calls(items.as_slice(), order_by.as_slice()).is_empty();
         #[cfg(not(feature = "window"))]
         let plain = true;
-        if has_agg && group_by.is_empty() && plain && !order_by.is_empty() {
+        // A core over no table keeps only the enclosing queries'
+        // aggregates of its ORDER BY (v0.17 review fix: `SELECT
+        // (SELECT 1 ORDER BY sum(t.a)) FROM t` is one row; see
+        // `query::dropped_term_aggs`, which lifts one inside a
+        // subquery of the term too). A window query keeps it (see
+        // above).
+        let dropped = plain && group_by.is_empty() && (has_agg || free);
+        if dropped && !order_by.is_empty() {
             let mut kept: AVec<(RExpr, crate::sql::SortOrder)> = AVec::new();
             for (e, o) in order_by.iter() {
                 let mut aggs = AVec::new();
-                crate::query::collect_outer_aggs(e, &mut aggs);
+                crate::query::dropped_term_aggs(e, has_agg, &mut aggs);
                 for a in aggs {
-                    kept.push((a.clone(), *o));
+                    kept.push((a, *o));
                 }
             }
             order_by = kept;
+        }
+        // A code-generation error of a term the pin codes after all.
+        #[cfg(feature = "sql")]
+        if let Some(kind) = late
+            && !dropped
+        {
+            return Err(Error::Schema { kind });
         }
         cur.aliases.clear();
         #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
@@ -5499,7 +5582,7 @@ impl<S: Storage> Connection<S> {
         // it can (`merge_core`).
         #[cfg(feature = "expr_index")]
         let merge_key: AVec<(RExpr, crate::sql::SortOrder)> = match merge {
-            Some((terms, rest)) if order_by.is_empty() && !has_agg => {
+            Some((terms, rest, colls)) if order_by.is_empty() && !has_agg => {
                 let key = |j: usize, desc: bool, nulls_first: bool| {
                     items.as_slice().get(j).map(|e| {
                         (
@@ -5507,7 +5590,13 @@ impl<S: Storage> Connection<S> {
                             crate::sql::SortOrder {
                                 desc,
                                 nulls_first,
-                                coll: crate::query::expr_coll(e).unwrap_or_default(),
+                                coll: colls
+                                    .as_slice()
+                                    .get(j)
+                                    .copied()
+                                    .flatten()
+                                    .or_else(|| crate::query::expr_coll(e))
+                                    .unwrap_or_default(),
                             },
                         )
                     })
@@ -12297,7 +12386,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         offset: &Option<RExpr>,
     ) -> Result<(usize, usize), S::Error> {
         let mut vals = [None, None];
-        for (slot, e) in vals.iter_mut().zip([limit, offset]) {
+        for (i, (slot, e)) in vals.iter_mut().zip([limit, offset]).enumerate() {
             let Some(e) = e else { continue };
             #[cfg(feature = "sql")]
             let v = self.eval_row_sub(e, &RowData::empty()).await?;
@@ -12306,7 +12395,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 e,
                 &Ctx::of(&RowData::empty()).with(&self.conn.env),
             )?;
-            *slot = Some(crate::query::limit_int::<S::Error>(v)?);
+            let n = crate::query::limit_int::<S::Error>(v)?;
+            // LIMIT 0 ends the statement before its OFFSET is
+            // computed (the pin's `OP_IfNot` on the limit register;
+            // v0.17 fix: `LIMIT 0 OFFSET <failing>` failed).
+            if n == 0 && i == 0 {
+                return Ok((0, 0));
+            }
+            *slot = Some(n);
         }
         let [lim, off] = vals;
         let take = match lim {
@@ -12476,12 +12572,29 @@ impl<'c, S: Storage> Statement<'c, S> {
         Ok(src_rows)
     }
 
+    /// LIMIT 0 (`window`'s take): the query computes nothing and
+    /// returns no row, as the pin jumps past its whole loop (v0.17
+    /// fix: a FROM-less, compound or window query computed its
+    /// terms and could fail).
+    #[cfg(feature = "sql")]
+    fn limit_zero(&mut self, window: (usize, usize)) -> bool {
+        let z = window.1 == 0;
+        if z {
+            self.query_rows.clear();
+            self.query_rowids.clear();
+        }
+        z
+    }
+
     /// Execute a compound / VALUES-core top-level query (v0.9):
     /// each core's rows through the async core path, combined
     /// left to right, then the compound ORDER BY / LIMIT.
     #[cfg(feature = "sql")]
     async fn run_query_compound(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        if self.limit_zero(window) {
+            return Ok(());
+        }
         let head = self.exec_qp_core_values(qp).await?;
         let mut tails = AVec::new();
         let mut cores = AVec::new();
@@ -12606,6 +12719,9 @@ impl<'c, S: Storage> Statement<'c, S> {
     #[cfg(feature = "sql")]
     async fn run_query_sub(&mut self, qp: &QueryPlan) -> Result<(), S::Error> {
         let window = self.limit_window(&qp.limit, &qp.offset).await?;
+        if self.limit_zero(window) {
+            return Ok(());
+        }
         // Window calls (v0.16, `window`) read every input row: no
         // bound passes into the sources.
         #[cfg(feature = "window")]
@@ -13225,6 +13341,10 @@ impl<'c, S: Storage> Statement<'c, S> {
             return self.exec_recursive(plan, rec, outer, need).await;
         }
         let window = self.limit_window(&plan.limit, &plan.offset).await?;
+        // LIMIT 0: nothing is computed (`limit_zero`).
+        if window.1 == 0 {
+            return Ok(AVec::new());
+        }
         // The rows its reader takes bound the rows it must make.
         let (skip, take) = window;
         let streamed = (skip, need.map_or(take, |n| take.min(n)));
@@ -13827,6 +13947,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 );
             }
         }
+        let lazy = lazy_aggs(qp.items.as_slice(), qp.order_by.as_slice());
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
@@ -13852,17 +13973,24 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
-                // Every aggregate of the group finalizes before its
-                // HAVING runs, the HAVING's own included (its AND / OR
-                // then stop early over the values).
+            }
+            // Every aggregate of the group finalizes before its HAVING
+            // runs, the HAVING's own included (its AND / OR then stop
+            // early over the values), or before result terms that may
+            // skip one (`lazy_aggs`).
+            if qp.having.is_some() || lazy {
                 let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
-                crate::query::collect_outer_aggs(h, &mut aggs);
+                if let Some(h) = &qp.having {
+                    crate::query::collect_outer_aggs(h, &mut aggs);
+                }
                 for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
-                    continue;
-                }
+            }
+            if let Some(h) = &qp.having
+                && !self.cond_group_sub(h, grows.as_slice(), &rep).await?
+            {
+                continue;
             }
             #[cfg(feature = "window")]
             if !wins.is_empty() {
@@ -14061,6 +14189,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 );
             }
         }
+        let lazy = lazy_aggs(plan.items.as_slice(), plan.order_by.as_slice());
         #[cfg(feature = "window")]
         let mut group_at = usize::MAX;
         for (_, grows) in groups.iter() {
@@ -14086,14 +14215,20 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if !pass {
                     continue;
                 }
+            }
+            if plan.having.is_some() || lazy {
                 let mut aggs = group_aggs(plan.items.as_slice(), plan.order_by.as_slice());
-                crate::query::collect_outer_aggs(h, &mut aggs);
+                if let Some(h) = &plan.having {
+                    crate::query::collect_outer_aggs(h, &mut aggs);
+                }
                 for a in aggs.iter() {
                     self.eval_group_sub(a, grows.as_slice(), &rep).await?;
                 }
-                if !self.cond_group_sub(h, grows.as_slice(), &rep).await? {
-                    continue;
-                }
+            }
+            if let Some(h) = &plan.having
+                && !self.cond_group_sub(h, grows.as_slice(), &rep).await?
+            {
+                continue;
             }
             #[cfg(feature = "window")]
             if !wins.is_empty() {
@@ -14719,6 +14854,23 @@ pub(crate) fn core_colls(
     out
 }
 
+/// Fill the columns no earlier core gave a collation with the next
+/// core's (`MergeSpec`; v0.17).
+#[cfg(feature = "expr_index")]
+fn seen_colls(
+    seen: &mut AVec<Option<crate::record::Coll>>,
+    items: &[RExpr],
+    values: &[AVec<RExpr>],
+) {
+    for (i, c) in core_colls(items, values).into_iter().enumerate() {
+        match seen.as_mut_slice().get_mut(i) {
+            Some(s) if s.is_none() => *s = c,
+            Some(_) => {}
+            None => seen.push(c),
+        }
+    }
+}
+
 /// A compound result column's collation (v0.16, the pin's
 /// `multiSelectCollSeq`): the leftmost core whose item `i` has
 /// one decides; BINARY when none does.
@@ -14942,9 +15094,16 @@ pub(crate) fn run_compound(
 /// The merge key a compound member is read for (v0.16,
 /// `expr_index`; `Connection::merge_core`): `(result column, DESC,
 /// NULLS FIRST)` terms, then (when the flag says so) every other
-/// column ascending.
+/// column ascending; per column, the collation an earlier core gave
+/// it (the merge key's, the pin's `multiSelectCollSeq`; v0.17 fix:
+/// the member's own was used, so a BINARY index was read for a
+/// NOCASE key and UNION kept another row of a NOCASE-equal group).
 #[cfg(feature = "expr_index")]
-type MergeSpec = (AVec<(usize, bool, bool)>, bool);
+type MergeSpec = (
+    AVec<(usize, bool, bool)>,
+    bool,
+    AVec<Option<crate::record::Coll>>,
+);
 
 /// The merge key core `k` (0: the head) of compound `stmt` is merged
 /// by (see `run_compound`), as the pin's `multiSelectOrderBy` keys
@@ -14974,7 +15133,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
             .iter()
             .rposition(|(op, _)| *op != UnionAll)
             .filter(|l| k <= l + 1)
-            .map(|_| (AVec::new(), true));
+            .map(|_| (AVec::new(), true, AVec::new()));
     }
     let mut terms = AVec::new();
     for (e, o) in stmt.order_by.iter() {
@@ -14990,7 +15149,7 @@ fn merge_member(stmt: &SelectStmt, k: usize) -> Option<MergeSpec> {
         .as_slice()
         .last()
         .is_some_and(|(op, _)| *op != UnionAll);
-    Some((terms, rest))
+    Some((terms, rest, AVec::new()))
 }
 
 /// The pin's UNION-with-LIMIT-1 shortcut (3.54.0: "UNION queries
@@ -15245,6 +15404,20 @@ pub(crate) fn group_aggs<'x>(
         crate::query::collect_outer_aggs(e, &mut aggs);
     }
     aggs
+}
+
+/// Whether a group computes its aggregates before its result terms
+/// even without HAVING (v0.17 review fix, ungated): a term holds one
+/// that evaluation may skip (`query::agg_skippable`). The pin steps
+/// every aggregate for every row, so `SELECT sum(<overflow>) AND (0
+/// OR 0)` fails there; hipp computed only what the term read, and
+/// answered 0.
+#[cfg(feature = "query")]
+pub(crate) fn lazy_aggs(items: &[RExpr], order_by: &[(RExpr, crate::sql::SortOrder)]) -> bool {
+    items
+        .iter()
+        .chain(order_by.iter().map(|(e, _)| e))
+        .any(crate::query::agg_skippable)
 }
 
 /// Whether a grouped query's ORDER BY is its GROUP BY (the pin's
@@ -15982,6 +16155,7 @@ fn project_rows<E>(
             );
         }
     }
+    let lazy = lazy_aggs(qp.items.as_slice(), qp.order_by.as_slice());
     for (_, grows) in groups.iter() {
         if cap.is_some_and(|c| out.len() >= c) {
             break;
@@ -15998,16 +16172,23 @@ fn project_rows<E>(
             if !pass {
                 continue;
             }
-            // Every aggregate of the group, the HAVING's included,
-            // finalizes before the HAVING runs.
+        }
+        // Every aggregate of the group, the HAVING's included,
+        // finalizes before the HAVING runs (or before result terms
+        // that may skip one: `lazy_aggs`).
+        if qp.having.is_some() || lazy {
             let mut aggs = group_aggs(qp.items.as_slice(), qp.order_by.as_slice());
-            crate::query::collect_outer_aggs(h, &mut aggs);
+            if let Some(h) = &qp.having {
+                crate::query::collect_outer_aggs(h, &mut aggs);
+            }
             for a in aggs.iter() {
                 crate::query::eval::<E>(a, &ctx)?;
             }
-            if !crate::query::cond::<E>(h, &ctx)? {
-                continue;
-            }
+        }
+        if let Some(h) = &qp.having
+            && !crate::query::cond::<E>(h, &ctx)?
+        {
+            continue;
         }
         let mut vals = AVec::new();
         for it in qp.items.iter() {
@@ -16280,11 +16461,6 @@ fn derived_col_affinity(
     i: usize,
     aff: Option<crate::record::Affinity>,
 ) -> crate::record::Affinity {
-    crate::rules::compound_affinity(
-        aff,
-        plan.items.as_slice().get(i),
-        plan.compound.iter().map(|(_, t)| &**t),
-        i,
-    )
-    .unwrap_or(crate::record::Affinity::Blob)
+    crate::rules::compound_affinity(aff, plan, plan.compound.as_slice(), i)
+        .unwrap_or(crate::record::Affinity::Blob)
 }

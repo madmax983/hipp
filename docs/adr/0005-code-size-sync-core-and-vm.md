@@ -6,6 +6,19 @@
   says. Stages 2-3 supersede SPEC §5.7's "tree-walk now" decision and
   implement SPEC §5.1.1's "the state machines are inside" design;
   Stage 1 changed no architecture.
+- **Stages 2-4 not adopted (2026-11-15, owner).** Measured three
+  times and never fitted: the Stage 2 flip ("Stage 2 flip: measured,
+  not taken", then `vm_shrink`), the combined Stage 2 + 3 flip
+  (`s3_probe`), and a redesigned smaller VM (ADR 0007, rejected). The
+  bytecode layer costs more than the executor code it would delete
+  in every profile, so the tree-walking executors stay and SPEC
+  §5.7's "tree-walk now" stands. Stage 1's results remain. The
+  Stage 2 VM stays in the tree, frozen, behind the hidden `vm`
+  feature that no profile enables (no shipped cost); its CI job keeps
+  it compiling and its suites green. New SQL shapes need no VM
+  codegen: under `vm` they fall back to today's executor, as the
+  migration rule below provides. Deleting the `vm` code is a separate
+  decision.
 - **Migration rule (added with the acceptance):** the VM is built
   behind a hidden `vm` feature that no profile enables, so every
   intermediate commit leaves the four size ratchets untouched. Under

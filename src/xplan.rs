@@ -407,11 +407,46 @@ pub fn skip_collate_likely(e: &RExpr) -> &RExpr {
     }
 }
 
+/// The pin's `sqlite3ExprSimplifiedAndOr` (v0.17): an AND / OR one
+/// of whose (simplified) operands is an integer literal reduces to
+/// the operand that decides it (`x OR 1` is `1`, `x AND 1` and `x OR
+/// 0` are `x`); otherwise `e` itself, its operands as written. Only
+/// a plain integer literal counts (`ExprAlwaysTrue`: not `-1`, `+1`,
+/// `1.0` or `1 COLLATE c`).
+pub fn and_or_simplified(e: &RExpr) -> &RExpr {
+    let RExpr::Binary(op @ (BinOp::And | BinOp::Or), l, r) = e else {
+        return e;
+    };
+    let (l, r) = (and_or_simplified(l), and_or_simplified(r));
+    let lit = |x: &RExpr, v: bool| matches!(x, RExpr::Literal(crate::record::OwnedValue::Integer(i)) if (*i != 0) == v);
+    let and = *op == BinOp::And;
+    if lit(l, true) || lit(r, false) {
+        if and { r } else { l }
+    } else if lit(r, true) || lit(l, false) {
+        if and { l } else { r }
+    } else {
+        e
+    }
+}
+
 /// Split a condition into its AND terms, each with its top-level
 /// COLLATE / likely() wrappers removed, as the pin's
 /// `sqlite3WhereSplit` and `whereClauseInsert` do (v0.17 review fix:
 /// `likely(b.x = a.y)` is still a join constraint).
+///
+/// Each term is then simplified as the pin's `whereClauseInsert`
+/// does (`sqlite3ExprSimplifiedAndOr`, v0.17 fix): `x OR 1` is the
+/// term `1` (it constrains nothing, so it no longer moves the join
+/// order) and `x OR 0` is `x` (an index may serve it); a term that
+/// simplifies to an AND stays one term.
 pub fn conjuncts<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
+    conjuncts_as(e, out, true);
+}
+
+/// `conjuncts`, simplifying each term only when `simp` (a LEFT
+/// JOIN's ON clause keeps its literals: the pin's `ExprAlwaysTrue`
+/// is false for an `EP_OuterON` node).
+pub fn conjuncts_as<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>, simp: bool) {
     let mut stack: AVec<&'x RExpr> = AVec::new();
     stack.push(e);
     while let Some(x) = stack.pop() {
@@ -422,7 +457,7 @@ pub fn conjuncts<'x>(e: &'x RExpr, out: &mut AVec<&'x RExpr>) {
                 stack.push(b);
                 stack.push(a);
             }
-            x => out.push(x),
+            x => out.push(if simp { and_or_simplified(x) } else { x }),
         }
     }
 }
@@ -747,9 +782,10 @@ fn add_terms(
             });
         }
         // `x IS NOT NULL` on a column (not the rowid): the pin adds
-        // a virtual `x > NULL` range term.
+        // a virtual `x > NULL` range term (not under a COLLATE: its
+        // `TK_COLUMN` test; v0.17 fix).
         RExpr::IsNull(x, true) => {
-            let key = strip(x);
+            let key = &**x;
             if !matches!(key, RExpr::Column(..)) || !s.reads(key) || s.is_rowid(key) {
                 return;
             }
@@ -1588,13 +1624,16 @@ pub(crate) fn order_sat(
     // ORDER BY term's collation: the pin's `wherePathSatisfiesOrderBy`
     // compares them; v0.17 review fix: `a = 'y' COLLATE NOCASE ORDER BY
     // a` left `Y` and `y` in rowid order.)
+    // (Only a column or the rowid: the pin's TK_COLUMN test; v0.17
+    // fix, `upper(x) = 1.0 ORDER BY upper(x)` sorts there.)
     let constant = |e: &RExpr, o: &SortOrder| {
-        ts.iter().any(|t| {
-            matches!(t.op, TOp::Eq | TOp::Is)
-                && !t.lateral
-                && same_expr(&t.key, e)
-                && (t.isnull || s.is_rowid(e) || t.coll == o.coll)
-        })
+        matches!(e, RExpr::Column(..) | RExpr::Rowid(_))
+            && ts.iter().any(|t| {
+                matches!(t.op, TOp::Eq | TOp::Is)
+                    && !t.lateral
+                    && same_expr(&t.key, e)
+                    && (t.isnull || s.is_rowid(e) || t.coll == o.coll)
+            })
     };
     // A GROUP BY or DISTINCT takes its terms in any order: each key
     // column the loop delivers may satisfy any term not yet
