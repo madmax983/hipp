@@ -470,3 +470,37 @@ reservation brings n=1000 to 428,109,167 Ir (a further -1.68%;
 
 Size gates: tiny +24 B, full +16 B, max +16 B, xl +16 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## btree_insert rebuilds the whole leaf for every row (baseline at 1b49982)
+
+`bolt_insert` (new: the table-INSERT phase of `bolt_workload` on its
+own: n prepared `INSERT INTO t VALUES (...)` in one transaction, no
+indexes) and `bolt_workload` (callgrind, release + debuginfo; dhat).
+Every table INSERT whose leaf still fits goes through
+`build_leaf_image_inserted`: a zeroed page-size allocation (calloc +
+a 4 KiB memset), one copy per existing cell into it, then
+`set_page_image` copies the whole image into the frame. For an
+append to a ~124-cell leaf that is O(page) work for an O(cell)
+change, although the leaf is already exactly what a rebuild would
+produce (every leaf hipp writes is packed in pointer order).
+
+| workload           | total Ir      |
+|--------------------|---------------|
+| bolt_insert 1000   | 82,143,348    |
+| bolt_insert 2000   | 166,373,392   |
+| bolt_insert 4000   | 337,087,756   |
+| bolt_workload 500  | 184,165,766   |
+| bolt_workload 1000 | 437,170,122   |
+| bolt_workload 2000 | 1,102,760,526 |
+
+bolt_insert 2000 profile: `exec_insert` inclusive 73,822,948
+(44.37%), `btree_insert` 53,257,446 (32.01%), of which
+`build_leaf_image_inserted` 16,698,931 (10.04%; 1,988 calls, ~8,400
+Ir each) and `set_page_image` 1,159,196 (0.70%); memset is the top
+self-cost entry (16,797,251, 10.10%). bolt_workload 1000:
+`build_leaf_image_inserted` 22,032,785 (5.04%). dhat: bolt_insert
+2000 55,143,766 bytes in 178,235 blocks; bolt_workload 1000
+106,557,541 bytes in 429,777 blocks.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_insert 2000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_insert 2000`
