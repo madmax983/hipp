@@ -330,6 +330,76 @@ fn build_leaf_image_inserted(
     img
 }
 
+/// Whether the leaf image `snap` (not page 1) is byte for byte what
+/// `build_leaf_image_inserted` would build from its own `metas`: no
+/// freeblocks or fragments, cells packed down from the page end in
+/// pointer order, and a zeroed gap. Every leaf hipp wrote is.
+fn leaf_is_packed(snap: &[u8], page_size: usize, metas: &[CellMeta]) -> bool {
+    let mut content = page_size;
+    for m in metas {
+        match content.checked_sub(m.cell_len) {
+            Some(c) if c == m.cell_off => content = c,
+            _ => return false,
+        }
+    }
+    let ptrs_end = 8 + 2 * metas.len();
+    snap.len() == page_size
+        && be_u16(snap, 1) == 0
+        && snap[7] == 0
+        && be_u16(snap, 5) == content_code(content)
+        && ptrs_end <= content
+        && snap[ptrs_end..content].iter().fold(0u8, |acc, &b| acc | b) == 0
+}
+
+/// `build_leaf_image_inserted` for a page `leaf_is_packed` accepted,
+/// edited in place in `out` (which holds `snap`): the cells after
+/// `pos` move down by the new cell's length as one block and their
+/// pointers shift one slot; nothing before `pos` is touched.
+fn leaf_insert_packed(
+    out: &mut [u8],
+    page_size: usize,
+    metas: &[CellMeta],
+    pos: usize,
+    new_cell: &[u8],
+) {
+    let n = metas.len();
+    let len = new_cell.len();
+    let content = metas.last().map_or(page_size, |m| m.cell_off);
+    let end = if pos == 0 {
+        page_size
+    } else {
+        metas[pos - 1].cell_off
+    };
+    out.copy_within(content..end, content - len);
+    out[end - len..end].copy_from_slice(new_cell);
+    for i in (pos..n).rev() {
+        put_be_u16(out, 8 + 2 * (i + 1), (metas[i].cell_off - len) as u16);
+    }
+    put_be_u16(out, 8 + 2 * pos, (end - len) as u16);
+    put_be_u16(out, 3, (n + 1) as u16);
+    put_be_u16(out, 5, content_code(content - len));
+}
+
+/// `leaf_insert_packed` into the frame `out` when `snap` (its
+/// image) passes `leaf_is_packed`; false, `out` untouched, otherwise.
+/// One sync call out of `btree_insert`, so the fast path adds
+/// nothing to that future or its poll frame.
+fn insert_packed(
+    out: &mut [u8],
+    snap: &AVec<u8>,
+    metas: &AVec<CellMeta>,
+    pos: usize,
+    new_cell: &AVec<u8>,
+) -> bool {
+    let page_size = out.len();
+    if !leaf_is_packed(snap.as_slice(), page_size, metas.as_slice()) {
+        return false;
+    }
+    out.copy_from_slice(snap.as_slice());
+    leaf_insert_packed(out, page_size, metas.as_slice(), pos, new_cell.as_slice());
+    true
+}
+
 fn build_interior_image(
     page: u32,
     page_size: usize,
@@ -1142,7 +1212,23 @@ pub async fn btree_insert<S: Storage>(
         let hdr = if leaf_page == 1 { 100 } else { 0 };
         let content: usize = metas.iter().map(|m| m.cell_len).sum::<usize>() + new_cell.bytes.len();
         if hdr + 8 + 2 * (metas.len() + 1) + content <= usable {
+            // One await and one call for both paths: this future and
+            // its poll frame sit in every statement's (debug-build)
+            // stack, so the fast path adds no suspend point or locals.
             let idx = pager.dirty_page(leaf_page).await?;
+            // Same bytes as the rebuild below, without zeroing a page
+            // and copying every cell into it.
+            if leaf_page != 1
+                && insert_packed(
+                    pager.frame_data_mut(idx),
+                    &leaf_snap,
+                    &metas,
+                    insert_pos,
+                    &new_cell.bytes,
+                )
+            {
+                return Ok(());
+            }
             let base = if leaf_page == 1 {
                 copy_bytes(pager.frame_data(idx))
             } else {
@@ -6382,5 +6468,112 @@ mod split_tests {
         // An empty weight list with one group is one empty count.
         assert_eq!(split_counts(&[], 1, 100).as_slice(), &[0]);
         assert!(insert_counts(&[], 1, 100, 1).as_slice() == [0]);
+    }
+}
+
+#[cfg(test)]
+mod packed_leaf_tests {
+    //! The in-place packed-leaf insert against the rebuild it
+    //! short-cuts: byte-identical pages, and the non-packed shapes it
+    //! must refuse.
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn cell(rowid: i64, plen: usize) -> LeafCell {
+        let mut bytes = AVec::new();
+        encode_varint(plen as u64, &mut bytes);
+        encode_varint(rowid as u64, &mut bytes);
+        for k in 0..plen {
+            bytes.push((rowid as usize * 31 + k) as u8 | 1);
+        }
+        LeafCell {
+            rowid,
+            bytes,
+            payload_len: plen,
+            local_len: plen,
+            overflow: 0,
+        }
+    }
+
+    #[test]
+    fn in_place_insert_matches_rebuild() {
+        for &page_size in &[512usize, 4096, 65536] {
+            for &ncell in &[0usize, 1, 2, 7, 20] {
+                let cells: Vec<LeafCell> = (0..ncell)
+                    .map(|i| cell(2 * i as i64 + 1, 3 + (i * 5) % 17))
+                    .collect();
+                let page = build_leaf_image(2, page_size, &cells, &[]);
+                let snap = page.as_slice();
+                let metas = leaf_cells_meta::<()>(snap, 2, page_size).expect("valid leaf");
+                assert!(leaf_is_packed(snap, page_size, metas.as_slice()));
+                for pos in 0..=ncell {
+                    let nc = cell(2 * pos as i64, 1 + pos % 9);
+                    let want = build_leaf_image_inserted(
+                        2,
+                        page_size,
+                        snap,
+                        metas.as_slice(),
+                        pos,
+                        nc.bytes.as_slice(),
+                        &[],
+                    );
+                    let mut got = snap.to_vec();
+                    leaf_insert_packed(
+                        &mut got,
+                        page_size,
+                        metas.as_slice(),
+                        pos,
+                        nc.bytes.as_slice(),
+                    );
+                    assert_eq!(
+                        got.as_slice(),
+                        want.as_slice(),
+                        "page {page_size} ncell {ncell} pos {pos}"
+                    );
+                    // The result is packed again (the next insert stays fast).
+                    let m2 = leaf_cells_meta::<()>(&got, 2, page_size).expect("valid leaf");
+                    assert!(leaf_is_packed(&got, page_size, m2.as_slice()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_packed_leaves_take_the_rebuild() {
+        let page_size = 4096;
+        let cells: Vec<LeafCell> = (0..5).map(|i| cell(i + 1, 10)).collect();
+        let page = build_leaf_image(2, page_size, &cells, &[]);
+        let metas = leaf_cells_meta::<()>(page.as_slice(), 2, page_size).expect("valid leaf");
+        let check = |edit: &dyn Fn(&mut [u8])| {
+            let mut p = page.as_slice().to_vec();
+            edit(&mut p);
+            let m = leaf_cells_meta::<()>(&p, 2, page_size).expect("valid leaf");
+            leaf_is_packed(&p, page_size, m.as_slice())
+        };
+        assert!(check(&|_| {}));
+        // A stray byte in the gap.
+        assert!(!check(&|p| p[2000] = 7));
+        // A freeblock or fragmented bytes recorded in the header.
+        assert!(!check(&|p| put_be_u16(p, 1, 3000)));
+        assert!(!check(&|p| p[7] = 2));
+        // A content-start offset that is not the first cell's.
+        assert!(!check(&|p| put_be_u16(p, 5, 3000)));
+        // Cells out of pointer order (two pointers swapped).
+        assert!(!check(&|p| {
+            let a = be_u16(p, 8);
+            let b = be_u16(p, 10);
+            put_be_u16(p, 8, b);
+            put_be_u16(p, 10, a);
+        }));
+        // Cells packed below the page end (a gap above them).
+        assert!(!check(&|p| {
+            let c = metas.as_slice()[4].cell_off;
+            p.copy_within(c..page_size, c - 16);
+            p[page_size - 16..].fill(0);
+            for i in 0..5 {
+                put_be_u16(p, 8 + 2 * i, (metas.as_slice()[i].cell_off - 16) as u16);
+            }
+            put_be_u16(p, 5, (c - 16) as u16);
+        }));
     }
 }

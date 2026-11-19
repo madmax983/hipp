@@ -470,3 +470,94 @@ reservation brings n=1000 to 428,109,167 Ir (a further -1.68%;
 
 Size gates: tiny +24 B, full +16 B, max +16 B, xl +16 B; ratchets
 raised by those amounts (each well under `justify_over`).
+
+## btree_insert rebuilds the whole leaf for every row (baseline at 1b49982)
+
+`bolt_insert` (new: the table-INSERT phase of `bolt_workload` on its
+own: n prepared `INSERT INTO t VALUES (...)` in one transaction, no
+indexes) and `bolt_workload` (callgrind, release + debuginfo; dhat).
+Every table INSERT whose leaf still fits goes through
+`build_leaf_image_inserted`: a zeroed page-size allocation (calloc +
+a 4 KiB memset), one copy per existing cell into it, then
+`set_page_image` copies the whole image into the frame. For an
+append to a ~124-cell leaf that is O(page) work for an O(cell)
+change, although the leaf is already exactly what a rebuild would
+produce (every leaf hipp writes is packed in pointer order).
+
+| workload           | total Ir      |
+|--------------------|---------------|
+| bolt_insert 1000   | 82,143,348    |
+| bolt_insert 2000   | 166,373,392   |
+| bolt_insert 4000   | 337,087,756   |
+| bolt_workload 500  | 184,165,766   |
+| bolt_workload 1000 | 437,170,122   |
+| bolt_workload 2000 | 1,102,760,526 |
+
+bolt_insert 2000 profile: `exec_insert` inclusive 73,822,948
+(44.37%), `btree_insert` 53,257,446 (32.01%), of which
+`build_leaf_image_inserted` 16,698,931 (10.04%; 1,988 calls, ~8,400
+Ir each) and `set_page_image` 1,159,196 (0.70%); memset is the top
+self-cost entry (16,797,251, 10.10%). bolt_workload 1000:
+`build_leaf_image_inserted` 22,032,785 (5.04%). dhat: bolt_insert
+2000 55,143,766 bytes in 178,235 blocks; bolt_workload 1000
+106,557,541 bytes in 429,777 blocks.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_insert 2000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_insert 2000`
+
+### After: edit a packed leaf in place
+
+`leaf_is_packed` checks, from the cell table `leaf_cells_meta`
+already built, that the leaf (not page 1) is byte for byte what
+`build_leaf_image_inserted` would build: no freeblock, no fragmented
+bytes, cells packed down from the page end in pointer order, the
+header's content start at the last cell, and a zeroed gap. When it
+is, `leaf_insert_packed` edits the frame in place: the cells after
+the insert position move down by the new cell's length as one block,
+their pointers shift one slot, the new cell and pointer are written
+and the header's count and content start updated. The result is the
+same bytes the rebuild writes (and is packed again). Any other leaf
+(page 1, a leaf from another writer with freeblocks or a different
+layout) takes the rebuild as before. Unit tests compare the two
+byte for byte over page sizes 512 / 4096 / 65536, 0..20 cells and
+every insert position, and pin the shapes refused. A 1 KiB-page
+database built by the CLI (3,000 shuffled-rowid inserts, overflow
+rows, deletes, updates, refills, an indexed table) is byte-identical
+(sha256) before/after. Workload checksums identical. Test pass/fail
+set identical before/after (1087 tests; the 954 failures are the
+absent `sqlite3` oracle, same on the baseline commit), plus the 2 new
+tests passing.
+
+| workload           | total before  | total after   | Δ total |
+|--------------------|---------------|---------------|---------|
+| bolt_insert 1000   | 82,143,348    | 74,745,411    | -9.01%  |
+| bolt_insert 2000   | 166,373,392   | 151,370,744   | -9.02%  |
+| bolt_insert 4000   | 337,087,756   | 306,987,459   | -8.93%  |
+| bolt_workload 500  | 184,165,766   | 175,392,715   | -4.76%  |
+| bolt_workload 1000 | 437,170,122   | 418,174,976   | -4.35%  |
+| bolt_workload 2000 | 1,102,760,526 | 1,064,161,693 | -3.50%  |
+
+bolt_insert 2000: `build_leaf_image_inserted` + `set_page_image`
+17,858,127 (10.74%) -> `leaf_is_packed` 2,268,830 (1.50%, the gap
+check folded so it vectorises; a byte-at-a-time `all()` cost ~13,600
+Ir per call and made the change a net loss) with
+`leaf_insert_packed` inlined; memset 16,797,251 -> 8,608,808 Ir.
+dhat bolt_insert 2000: 55,143,766 -> 47,005,014 bytes (**-14.76%**),
+178,235 -> 176,248 blocks (-1.11%); t-gmax unchanged at 176,754 B.
+dhat bolt_workload 1000: 106,557,541 -> 98,398,309 bytes (-7.66%),
+429,777 -> 427,785 blocks (-0.46%); t-gmax unchanged at 852,164 B.
+The gates cleared are bolt_insert instructions (>= 5%; table INSERT
+is 19.8% of bolt_workload) and bolt_insert allocation bytes
+(>= 10%); the bolt_workload instruction delta is below 5% and is not
+claimed as the win.
+
+The fast path is one sync call (`insert_packed`) after the one
+`dirty_page` await both paths share: a separate await and its locals
+grew `btree_insert`'s debug-build poll frame by 192 B, and
+`depth_tiny_v16` (hipp on a 512 KiB thread, debug, `--features vm`)
+has under that to spare on main; it overflowed in CI. Now within 32 B
+of main's depth (gdb `$sp` at the `dirty_page` call). The table above
+is measured on that final shape.
+
+Size gates: tiny +440 B, full +696 B, max +672 B, xl +664 B; ratchets
+raised by those amounts (each well under `justify_over`).
