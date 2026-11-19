@@ -504,3 +504,52 @@ self-cost entry (16,797,251, 10.10%). bolt_workload 1000:
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_insert 2000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_insert 2000`
+
+### After: edit a packed leaf in place
+
+`leaf_is_packed` checks, from the cell table `leaf_cells_meta`
+already built, that the leaf (not page 1) is byte for byte what
+`build_leaf_image_inserted` would build: no freeblock, no fragmented
+bytes, cells packed down from the page end in pointer order, the
+header's content start at the last cell, and a zeroed gap. When it
+is, `leaf_insert_packed` edits the frame in place: the cells after
+the insert position move down by the new cell's length as one block,
+their pointers shift one slot, the new cell and pointer are written
+and the header's count and content start updated. The result is the
+same bytes the rebuild writes (and is packed again). Any other leaf
+(page 1, a leaf from another writer with freeblocks or a different
+layout) takes the rebuild as before. Unit tests compare the two
+byte for byte over page sizes 512 / 4096 / 65536, 0..20 cells and
+every insert position, and pin the shapes refused. A 1 KiB-page
+database built by the CLI (3,000 shuffled-rowid inserts, overflow
+rows, deletes, updates, refills, an indexed table) is byte-identical
+(sha256) before/after. Workload checksums identical. Test pass/fail
+set identical before/after (1087 tests; the 954 failures are the
+absent `sqlite3` oracle, same on the baseline commit), plus the 2 new
+tests passing.
+
+| workload           | total before  | total after   | Δ total |
+|--------------------|---------------|---------------|---------|
+| bolt_insert 1000   | 82,143,348    | 74,749,518    | -9.00%  |
+| bolt_insert 2000   | 166,373,392   | 151,376,897   | -9.01%  |
+| bolt_insert 4000   | 337,087,756   | 306,997,693   | -8.93%  |
+| bolt_workload 500  | 184,165,766   | 175,394,819   | -4.76%  |
+| bolt_workload 1000 | 437,170,122   | 418,133,297   | -4.35%  |
+| bolt_workload 2000 | 1,102,760,526 | 1,064,078,505 | -3.51%  |
+
+bolt_insert 2000: `build_leaf_image_inserted` + `set_page_image`
+17,858,127 (10.74%) -> `leaf_is_packed` 2,268,830 (1.50%, the gap
+check folded so it vectorises; a byte-at-a-time `all()` cost ~13,600
+Ir per call and made the change a net loss) with
+`leaf_insert_packed` inlined; memset 16,797,251 -> 8,608,808 Ir.
+dhat bolt_insert 2000: 55,143,766 -> 47,005,014 bytes (**-14.76%**),
+178,235 -> 176,248 blocks (-1.11%); t-gmax unchanged at 176,754 B.
+dhat bolt_workload 1000: 106,557,541 -> 98,398,309 bytes (-7.66%),
+429,777 -> 427,785 blocks (-0.46%); t-gmax unchanged at 852,164 B.
+The gates cleared are bolt_insert instructions (>= 5%; table INSERT
+is 19.8% of bolt_workload) and bolt_insert allocation bytes
+(>= 10%); the bolt_workload instruction delta is below 5% and is not
+claimed as the win.
+
+Size gates: tiny +472 B, full +632 B, max +472 B, xl +456 B; ratchets
+raised by those amounts (each well under `justify_over`).
