@@ -8025,49 +8025,68 @@ impl<'c, S: Storage> Statement<'c, S> {
         self.open_stmt();
         #[cfg(feature = "foreign_keys")]
         self.fk_stmt_begin();
+        // The rarely run (DDL, maintenance, routed) kinds are boxed in
+        // unoptimized builds, where every arm's future is a temporary of
+        // `step`'s own frame (v0.17: the tiny-stack depth tests overflowed
+        // 512 KiB in debug with `vm`). Optimized builds overlap those
+        // temporaries, so they await inline and keep their size.
+        #[cfg(debug_assertions)]
+        #[allow(unused_macros)]
+        macro_rules! cold_step {
+            ($f:expr) => {
+                alloc::boxed::Box::pin($f).await
+            };
+        }
+        #[cfg(not(debug_assertions))]
+        #[allow(unused_macros)]
+        macro_rules! cold_step {
+            ($f:expr) => {
+                $f.await
+            };
+        }
         let r = match &self.plan {
             #[cfg(feature = "explain")]
-            Plan::Explain(_) => self.step_explain().await,
+            Plan::Explain(_) => cold_step!(self.step_explain()),
             #[cfg(all(feature = "explain", feature = "vm"))]
             Plan::Bytecode(_) => Box::pin(self.step_bytecode()).await,
             #[cfg(feature = "params")]
             Plan::Deferred => Err(Error::Unsupported),
             #[cfg(feature = "sql")]
-            Plan::Maint(_) => self.step_maint().await,
+            Plan::Maint(_) => cold_step!(self.step_maint()),
             #[cfg(feature = "sql")]
-            Plan::Alter16 { .. } => self.step_alter16().await,
+            Plan::Alter16 { .. } => cold_step!(self.step_alter16()),
             #[cfg(feature = "sql")]
-            Plan::Temp { .. } => self.step_temp().await,
+            Plan::Temp { .. } => cold_step!(self.step_temp()),
             #[cfg(feature = "attach")]
-            Plan::Att(_) => self.step_att().await,
+            Plan::Att(_) => cold_step!(self.step_att()),
             #[cfg(feature = "attach")]
-            Plan::Attach(_) => self.step_attach().await,
+            Plan::Attach(_) => cold_step!(self.step_attach()),
             Plan::CreateTable => self.step_create().await,
             #[cfg(feature = "vtab")]
-            Plan::Vtab(_) => self.step_vtab().await,
+            Plan::Vtab(_) => cold_step!(self.step_vtab()),
             #[cfg(feature = "sql")]
-            Plan::CreateTableAs { .. } => self.step_create_as().await,
+            Plan::CreateTableAs { .. } => cold_step!(self.step_create_as()),
             #[cfg(feature = "query")]
             Plan::Query(_) => self.step_query().await,
             #[cfg(feature = "query")]
-            Plan::AlterAdd { .. } => self.step_alter().await,
+            Plan::AlterAdd { .. } => cold_step!(self.step_alter()),
             #[cfg(feature = "query")]
-            Plan::CreateView => self.step_create_view().await,
+            Plan::CreateView => cold_step!(self.step_create_view()),
             #[cfg(feature = "query")]
-            Plan::DropView { .. } => self.step_drop_view().await,
+            Plan::DropView { .. } => cold_step!(self.step_drop_view()),
             #[cfg(feature = "sql")]
-            Plan::Pragma(_) => self.step_pragma().await,
+            Plan::Pragma(_) => cold_step!(self.step_pragma()),
             #[cfg(feature = "indexes")]
-            Plan::CreateIndex { .. } => self.step_create_index().await,
+            Plan::CreateIndex { .. } => cold_step!(self.step_create_index()),
             #[cfg(feature = "indexes")]
-            Plan::DropIndex { .. } => self.step_drop_index().await,
+            Plan::DropIndex { .. } => cold_step!(self.step_drop_index()),
             Plan::Insert { .. } => self.step_insert().await,
             #[cfg(feature = "write")]
             Plan::Update { .. } => self.step_update().await,
             #[cfg(feature = "write")]
             Plan::Delete { .. } => self.step_delete().await,
             #[cfg(feature = "write")]
-            Plan::DropTable { .. } => self.step_drop_table().await,
+            Plan::DropTable { .. } => cold_step!(self.step_drop_table()),
             Plan::Scan { .. } => self.step_scan().await,
             Plan::Begin => self.step_begin().await,
             #[cfg(feature = "sql")]
@@ -8078,11 +8097,11 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             Plan::Commit => self.step_commit().await,
             #[cfg(feature = "triggers")]
-            Plan::CreateTrigger { .. } => self.step_create_trigger().await,
+            Plan::CreateTrigger { .. } => cold_step!(self.step_create_trigger()),
             #[cfg(feature = "triggers")]
-            Plan::DropTrigger { .. } => self.step_drop_trigger().await,
+            Plan::DropTrigger { .. } => cold_step!(self.step_drop_trigger()),
             #[cfg(feature = "triggers")]
-            Plan::Instead(_) => self.step_instead().await,
+            Plan::Instead(_) => cold_step!(self.step_instead()),
             Plan::Rollback => self.step_rollback().await,
         };
         #[cfg(all(feature = "json", not(feature = "vm")))]
