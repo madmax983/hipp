@@ -15,10 +15,10 @@
 # zeroed allocation (-12.2% instructions on bolt_workload): -48 B.
 # +24 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-# +472 B (Bolt): btree_insert edits a packed table leaf in place
+# +440 B (Bolt): btree_insert edits a packed table leaf in place
 # instead of rebuilding it (bolt_insert instructions -9.0%, dhat
 # bytes -14.8%).
-ratchet = 77400
+ratchet = 77368
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -114,10 +114,10 @@ justify_over = 4096
 # uncoded for table_info / ALTER, count(*)-of-view depth refusal, FLEXNUM
 # CTAS columns, trigger rowid affinity, the 500-SELECT exemption after a
 # chain. No offsetting saving found (#[inline(never)] tried: +8 B).
-# +632 B (Bolt): btree_insert edits a packed table leaf in place
+# +696 B (Bolt): btree_insert edits a packed table leaf in place
 # instead of rebuilding it (bolt_insert instructions -9.0%, dhat
 # bytes -14.8%).
-ratchet = 491028
+ratchet = 491092
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -201,10 +201,10 @@ justify_over = 16384
 # 976,508 -> 976,692 (v0.17 values_chain review fixes, ungated correctness;
 # STATUS.md): +184 B, the `full` fixes plus the push-down through merged
 # bodies and `SELECT *` arms (`planner`), net of layout.
-# +472 B (Bolt): btree_insert edits a packed table leaf in place
+# +672 B (Bolt): btree_insert edits a packed table leaf in place
 # instead of rebuilding it (bolt_insert instructions -9.0%, dhat
 # bytes -14.8%).
-ratchet = 977164
+ratchet = 977364
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -281,10 +281,10 @@ justify_over = 32768
 # correctness; STATUS.md): +936 B, the `max` fixes.
 # 1,074,624 -> 1,077,632 (v0.17 values_chain review fixes, ungated
 # correctness; STATUS.md): +3,008 B, the `max` fixes.
-# +456 B (Bolt): btree_insert edits a packed table leaf in place
+# +664 B (Bolt): btree_insert edits a packed table leaf in place
 # instead of rebuilding it (bolt_insert instructions -9.0%, dhat
 # bytes -14.8%).
-ratchet = 1078088
+ratchet = 1078296
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

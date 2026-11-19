@@ -530,12 +530,12 @@ tests passing.
 
 | workload           | total before  | total after   | Δ total |
 |--------------------|---------------|---------------|---------|
-| bolt_insert 1000   | 82,143,348    | 74,749,518    | -9.00%  |
-| bolt_insert 2000   | 166,373,392   | 151,376,897   | -9.01%  |
-| bolt_insert 4000   | 337,087,756   | 306,997,693   | -8.93%  |
-| bolt_workload 500  | 184,165,766   | 175,394,819   | -4.76%  |
-| bolt_workload 1000 | 437,170,122   | 418,133,297   | -4.35%  |
-| bolt_workload 2000 | 1,102,760,526 | 1,064,078,505 | -3.51%  |
+| bolt_insert 1000   | 82,143,348    | 74,745,411    | -9.01%  |
+| bolt_insert 2000   | 166,373,392   | 151,370,744   | -9.02%  |
+| bolt_insert 4000   | 337,087,756   | 306,987,459   | -8.93%  |
+| bolt_workload 500  | 184,165,766   | 175,392,715   | -4.76%  |
+| bolt_workload 1000 | 437,170,122   | 418,174,976   | -4.35%  |
+| bolt_workload 2000 | 1,102,760,526 | 1,064,161,693 | -3.50%  |
 
 bolt_insert 2000: `build_leaf_image_inserted` + `set_page_image`
 17,858,127 (10.74%) -> `leaf_is_packed` 2,268,830 (1.50%, the gap
@@ -551,5 +551,13 @@ is 19.8% of bolt_workload) and bolt_insert allocation bytes
 (>= 10%); the bolt_workload instruction delta is below 5% and is not
 claimed as the win.
 
-Size gates: tiny +472 B, full +632 B, max +472 B, xl +456 B; ratchets
+The fast path is one sync call (`insert_packed`) after the one
+`dirty_page` await both paths share: a separate await and its locals
+grew `btree_insert`'s debug-build poll frame by 192 B, and
+`depth_tiny_v16` (hipp on a 512 KiB thread, debug, `--features vm`)
+has under that to spare on main; it overflowed in CI. Now within 32 B
+of main's depth (gdb `$sp` at the `dirty_page` call). The table above
+is measured on that final shape.
+
+Size gates: tiny +440 B, full +696 B, max +672 B, xl +664 B; ratchets
 raised by those amounts (each well under `justify_over`).
