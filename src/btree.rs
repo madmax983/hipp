@@ -380,6 +380,26 @@ fn leaf_insert_packed(
     put_be_u16(out, 5, content_code(content - len));
 }
 
+/// `leaf_insert_packed` into the frame `out` when `snap` (its
+/// image) passes `leaf_is_packed`; false, `out` untouched, otherwise.
+/// One sync call out of `btree_insert`, so the fast path adds
+/// nothing to that future or its poll frame.
+fn insert_packed(
+    out: &mut [u8],
+    snap: &AVec<u8>,
+    metas: &AVec<CellMeta>,
+    pos: usize,
+    new_cell: &AVec<u8>,
+) -> bool {
+    let page_size = out.len();
+    if !leaf_is_packed(snap.as_slice(), page_size, metas.as_slice()) {
+        return false;
+    }
+    out.copy_from_slice(snap.as_slice());
+    leaf_insert_packed(out, page_size, metas.as_slice(), pos, new_cell.as_slice());
+    true
+}
+
 fn build_interior_image(
     page: u32,
     page_size: usize,
@@ -1192,22 +1212,23 @@ pub async fn btree_insert<S: Storage>(
         let hdr = if leaf_page == 1 { 100 } else { 0 };
         let content: usize = metas.iter().map(|m| m.cell_len).sum::<usize>() + new_cell.bytes.len();
         if hdr + 8 + 2 * (metas.len() + 1) + content <= usable {
-            if leaf_page != 1 && leaf_is_packed(leaf_snap.as_slice(), page_size, metas.as_slice()) {
-                // Same bytes as the rebuild below, without zeroing a
-                // page and copying every cell into it.
-                let idx = pager.dirty_page(leaf_page).await?;
-                let out = pager.frame_data_mut(idx);
-                out.copy_from_slice(leaf_snap.as_slice());
-                leaf_insert_packed(
-                    out,
-                    page_size,
-                    metas.as_slice(),
+            // One await and one call for both paths: this future and
+            // its poll frame sit in every statement's (debug-build)
+            // stack, so the fast path adds no suspend point or locals.
+            let idx = pager.dirty_page(leaf_page).await?;
+            // Same bytes as the rebuild below, without zeroing a page
+            // and copying every cell into it.
+            if leaf_page != 1
+                && insert_packed(
+                    pager.frame_data_mut(idx),
+                    &leaf_snap,
+                    &metas,
                     insert_pos,
-                    new_cell.bytes.as_slice(),
-                );
+                    &new_cell.bytes,
+                )
+            {
                 return Ok(());
             }
-            let idx = pager.dirty_page(leaf_page).await?;
             let base = if leaf_page == 1 {
                 copy_bytes(pager.frame_data(idx))
             } else {
