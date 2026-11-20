@@ -1533,6 +1533,7 @@ impl<S: Storage> Connection<S> {
                 );
                 good.push(o.auto_candidate(t, c));
             }
+            xindex::gen_reads(t, used.as_mut_slice());
             jsrcs.push(JSrc {
                 s,
                 tab: Table {

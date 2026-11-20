@@ -43,6 +43,13 @@ All notable changes to hipp. Versions follow the milestones in
   table was read whole and scanned per outer row in FROM order.
 - A statement of main that reads an attached table locks it against
   DETACH from its first step, even when its seeks read no row.
+- Review fixes (ungated planner fixes, on main tables too): a LEFT
+  JOIN's ON term proves only its own right side's partial index (the
+  pin's `whereUsablePartialIndex`; `FROM aux.t LEFT JOIN m ON t.a = 5`
+  scanned `t` through a `WHERE a IS NOT NULL` index and lost rows);
+  reading a generated column marks every column read (the pin's
+  `sqlite3ExprColUsed`), so EXPLAIN QUERY PLAN says `USING INDEX`, not
+  `COVERING INDEX`, and the planner's covering-scan choices follow.
 - Still open: WITHOUT ROWID tables of another database, writes of an
   attached / TEMP table reading other databases, TEMP triggers across
   databases, views of another database read by such writes,

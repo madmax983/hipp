@@ -179,6 +179,105 @@ Size Δ: none — no library file changed. tiny 0, full 0, max 0, xl 0.
 - `ANALYZE` of several tables writes `sqlite_stat1` rows in another
   order than the pin (library, pre-existing), which `.dump` shows.
 
+### Parity: attach_access — review fixes (2026-11-20)
+
+Two review findings on `attach_access` (91bdf2a), each reproduced
+and probed on the live pin first. Both are planner bugs that were
+already there for main tables; 91bdf2a exposed them on TEMP and
+attached tables when it began planning those tables like main ones.
+Both are fixed for every database, with no new gating: the code lives
+in `planner` (finding 1) and `expr_index` (finding 2), as before.
+
+**Shipped.**
+1. **A LEFT JOIN's ON term proves no other source's partial index**
+   (high, wrong answer). `SELECT t.id FROM aux.t LEFT JOIN m ON t.a
+   = 5` over `ti ON t(id) WHERE a IS NOT NULL` returned 2 for the pin's
+   1, 2, 3, because hipp scanned `t` through `ti` (`SCAN aux.t USING
+   INDEX ti`; the pin says `SCAN aux.t`). The TEMP and all-main forms
+   had the same bug. Root cause: `xplan::candidates` checked a
+   partial index's WHERE (`implies`) against every term of the
+   join's WHERE clause, including other sources' LEFT JOIN ON terms.
+   The pin's `whereUsablePartialIndex` accepts a term only when it is
+   not an outer-join ON term, or is one for this source
+   (`!ExprHasProperty(pExpr, EP_OuterON) || pExpr->w.iJoin==iTab`),
+   and, on a LEFT JOIN's right side, only its own ON terms
+   (`(jointype & JT_OUTER)==0 || ExprHasProperty(pExpr, EP_OuterON)`).
+   The join planner now gives `candidates` exactly those terms
+   (`JMask::pconj`, built with `xjoin::owns`). `owns` is also the test
+   that the partial automatic index already used, so the two now
+   share one function. The same pattern was searched for elsewhere:
+   the non-`planner` join path plans each source only with its own
+   terms (the WHERE, plus its own ON clause), and `hint_solvable`
+   (`INDEXED BY` with a partial index) gets the same per-source list.
+   Both were already right. A MULTI-INDEX OR branch keeps the branch's
+   own terms.
+2. **Reading a generated column marks every column read** (low,
+   EXPLAIN QUERY PLAN, and the planner choices that follow from it).
+   For `g(a INTEGER PRIMARY KEY, b, c AS (b*2), d AS (b||'x') STORED,
+   e)` with index `ge ON g(e, d)`, the query `SELECT a, d FROM g WHERE
+   e = 'dflt'` is `SEARCH g USING INDEX ge (e=?)` on the pin, where
+   hipp said `COVERING INDEX`. Likewise `SELECT count(*) FROM g WHERE
+   d = '1x'` is `SCAN g` on the pin, where hipp scanned `ge` as a
+   covering index. The pin's `sqlite3ExprColUsed` returns
+   `MASKBIT(nCol)-1` (every column) for a reference to a
+   `COLFLAG_GENERATED` column, stored or virtual. Such a statement is
+   covered only by an index holding every column but the INTEGER
+   PRIMARY KEY (`isCovering`, `sqlite3CreateIndex`). hipp now does
+   the same through `xindex::gen_reads`, which sets every column but
+   the rowid alias in the read-column set (`needed`, `JSrc::used`).
+   It is applied in all three places that build that set: lone and
+   non-`planner` sources, the join planner, and UPDATE / DELETE. The
+   rows were already right. Probed on the pin: a stored or virtual
+   column in a WHERE, ORDER BY, GROUP BY or result column, a join, a
+   self-join, UPDATE / DELETE, max(), and a table with only stored
+   generated columns whose index holds every column (still `COVERING`
+   on both).
+
+**Tests.** `tests/attach_access_v17.rs` has 2 new tests:
+- `partial_on_terms_and_generated_cover`: both reductions and their
+  variants (own ON terms, inner joins, WHERE terms, chained LEFT
+  JOINs, stored and virtual generated columns, UPDATE / DELETE), run
+  over main, TEMP and an attached database, with plans.
+- `generated_partial_left_joins`: an xorshift64 corpus of 24 scripts.
+  Each has partial indexes with random predicates in main, temp and
+  aux, and 12 three-way LEFT / inner joins with random ON and WHERE
+  terms, each with its plan. Every script is also run with all
+  tables in main. A statement whose all-main twin already differs is
+  compared as a set of rows: 11 of 1,329, all join-order cost ties of
+  main tables, and a set comparison still catches a lost row.
+
+With the finding 1 fix reverted, both tests fail. `hipp-cli/tests/
+cli_v17_attach_access.rs` adds `partial_on_terms_and_generated_cover`
+(7 queries with plans, byte-identical one-shot and over stdin).
+`HIPP_ACCESS_CORPUS=60` over the original corpus passed (31 of 8,911
+statements compared as sets).
+
+**Gates.** `cargo fmt --all` and a full `ci/local-gates.sh`: all gates
+passed. The first run failed only the max size gate (+104 B), and the
+ratchets were then raised as below. `tests/depth_v16.rs`,
+`tests/depth_tiny_v16.rs` and `tests/triggers_v16.rs` were also run
+with debug info on, with and without `--features vm`, and they pass.
+No recursive or async-nested path was changed.
+
+**Size Δ** (against 91bdf2a's figures). tiny 0 (76,928); full 0 (495,060); max +104
+(989,024 → 989,128: `gen_reads` and its three calls); xl +272
+(1,092,348 → 1,092,620: the `max` growth plus `JMask::pconj` and
+`xjoin::owns`). Ratchets were raised to the measured figures, each
+with a one-line justification in `ci/size-ratchet.toml`. Three
+smaller versions were tried: a `fill` form of `gen_reads` (no
+change), and a plain push loop in place of an iterator `collect` for
+`pconj`, which saved 240 B of the first xl figure of +512 B. No
+other offsetting saving was found. The owner must approve the raises
+before they are pushed.
+
+**Honest gaps.** Unchanged from the unit below. The 11 set-compared
+statements of the new corpus are join orders that hipp's planner
+already picks differently with every table in main (cost ties in
+3-way joins), outside this unit. The pin's `JT_LTORJ` rule (no
+partial index for a source to the left of a RIGHT JOIN) was probed
+(`t RIGHT JOIN m ON t.a = 5`), and it agrees, because hipp does not
+plan RIGHT JOINs through the cost-based join planner.
+
 ### Parity: attach_access — index and rowid access into attached and TEMP tables (2026-11-20)
 
 Wave 20's unit (owner decision 2026-11-20: SQLite 3.54.1 parity

@@ -695,3 +695,176 @@ fn generated_cross_database_plans() {
         "{as_sets} of {compared} statements compared as sets"
     );
 }
+
+/// Review fixes (both also on main tables): (1) a LEFT JOIN's ON term
+/// filters only its own right side, so it never proves another
+/// source's partial index (the pin's `whereUsablePartialIndex`;
+/// hipp scanned `aux.t` through `ti` and lost the rows it leaves
+/// out); (2) reading a generated column marks every column read (the
+/// pin's `sqlite3ExprColUsed`), so an index holding a STORED or
+/// VIRTUAL generated column is no COVERING INDEX for it.
+#[test]
+fn partial_on_terms_and_generated_cover() {
+    for db in ["main", "temp", "aux"] {
+        let q = if db == "main" {
+            String::new()
+        } else {
+            format!("{db}.")
+        };
+        let setup = format!(
+            "
+ATTACH '{{d}}/a.db' AS aux;
+CREATE TABLE {q}t(id, a);
+INSERT INTO {q}t VALUES (1, NULL), (2, 5), (3, NULL);
+CREATE INDEX {q}ti ON t(id) WHERE a IS NOT NULL;
+CREATE TABLE m(k);
+INSERT INTO m VALUES (1);
+CREATE TABLE {q}g(a INTEGER PRIMARY KEY, b, c AS (b * 2), d AS (b || 'x') STORED, e);
+CREATE INDEX {q}ge ON g(e, d);
+CREATE INDEX {q}gc ON g(c);
+INSERT INTO {q}g(b, e) VALUES (1, 'dflt'), (2, 'dflt'), (3, 'z');
+CREATE TABLE {q}s(b, d AS (b || 'x') STORED);
+CREATE INDEX {q}sbd ON s(b, d);
+INSERT INTO {q}s(b) VALUES (3), (1), (2);
+"
+        );
+        let queries = format!(
+            "
+SELECT t.id FROM {q}t LEFT JOIN m ON t.a = 5;
+SELECT count(*) FROM {q}t LEFT JOIN m ON t.a = 5;
+SELECT t.id FROM m JOIN {q}t LEFT JOIN m m2 ON t.a = 5;
+SELECT t.id, m.k FROM m LEFT JOIN {q}t ON t.a = 5;
+SELECT t.id FROM {q}t LEFT JOIN m ON t.a = 5 WHERE t.a = 5;
+SELECT x.id FROM {q}t x LEFT JOIN {q}t y ON x.a = 5 LEFT JOIN m ON y.a = 5;
+SELECT x.id, y.id FROM m LEFT JOIN {q}t x ON x.a = 5 LEFT JOIN {q}t y ON x.a = 5;
+SELECT a, d FROM {q}g WHERE e = 'dflt' ORDER BY d DESC;
+SELECT d FROM {q}g WHERE e = 'dflt';
+SELECT e FROM {q}g WHERE e = 'dflt';
+SELECT count(*) FROM {q}g WHERE d = '1x';
+SELECT c FROM {q}g WHERE c = 2;
+SELECT a, c FROM {q}g WHERE c > 2;
+SELECT d FROM {q}s;
+SELECT rowid, d FROM {q}s WHERE b > 1;
+SELECT x.d, y.d FROM {q}g x JOIN {q}g y ON y.e = x.e AND y.d > x.d;
+SELECT d FROM {q}g GROUP BY d;
+"
+        );
+        let mut s = with_plans(&setup, &queries);
+        s.push(format!("UPDATE {q}g SET b = b + 1 WHERE c = 4"));
+        s.push(format!("DELETE FROM {q}g WHERE e = 'z' AND d = '3x'"));
+        s.push(format!("SELECT * FROM {q}g"));
+        same(&format!("rf-{db}"), &s);
+    }
+}
+
+/// Generated LEFT JOIN shapes over partial indexes in main, TEMP and
+/// an attached database: which ON / WHERE terms may prove which
+/// source's partial index. Rows and plans as the pin's; a statement
+/// whose all-main twin already differs on hipp (a join-order cost tie
+/// of main tables, outside this unit) is compared as a set of rows,
+/// which still catches a row the partial index loses.
+#[test]
+fn generated_partial_left_joins() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let preds = ["a IS NOT NULL", "a > 0", "b = 1", "a > 0 AND b IS NOT NULL"];
+    let terms = [
+        "{x}.a = 5",
+        "{x}.a > 0",
+        "{x}.b = 1",
+        "{x}.a IS NOT NULL",
+        "{x}.a = x.b",
+        "{x}.id = x.id AND {x}.a > 1",
+        "1",
+    ];
+    let (mut compared, mut as_sets) = (0usize, 0usize);
+    for i in 0..24 {
+        let mut s = vec!["ATTACH '{d}/a.db' AS aux".to_string()];
+        let dbs = [0, 1, 2];
+        let mut names = Vec::new();
+        for k in dbs {
+            let n = format!("t{k}");
+            s.push(format!("CREATE TABLE @{k}.{n}(id, a, b)"));
+            for r in 0..(3 + rng.int(8)) {
+                let a = match rng.int(4) {
+                    0 => "NULL".to_string(),
+                    v => format!("{}", v as i64 * 2 - 3),
+                };
+                let b = rng.pick(&["NULL", "1", "2"]);
+                s.push(format!("INSERT INTO @{k}.{n} VALUES ({}, {a}, {b})", r + 1));
+            }
+            s.push(format!(
+                "CREATE INDEX @{k}.{n}i ON {n}(id) WHERE {}",
+                rng.pick(&preds)
+            ));
+            if rng.int(2) == 0 {
+                s.push(format!(
+                    "CREATE INDEX @{k}.{n}j ON {n}(b, id) WHERE {}",
+                    rng.pick(&preds)
+                ));
+            }
+            names.push(format!("@{k}.{n}"));
+        }
+        s.push("CREATE TABLE m(k)".to_string());
+        s.push("INSERT INTO m VALUES (1), (2), (5)".to_string());
+        for _ in 0..12 {
+            let mut order = [0usize, 1, 2];
+            for j in (1..3).rev() {
+                order.swap(j, rng.int(j as u64 + 1) as usize);
+            }
+            let al = ["x", "y", "z"];
+            let term = |rng: &mut Rng, x: &str| rng.pick(&terms).replace("{x}", x);
+            let mut from = format!("{} AS x", names[order[0]]);
+            for (j, o) in order.iter().enumerate().skip(1) {
+                let kind = rng.pick(&["LEFT JOIN", "JOIN", "LEFT JOIN"]);
+                // The ON term reads an earlier source or this one.
+                let who = al[rng.int(j as u64 + 1) as usize];
+                let on = term(&mut rng, who);
+                from.push_str(&format!(" {kind} {} AS {} ON {on}", names[*o], al[j]));
+            }
+            from.push_str(" LEFT JOIN m ON m.k = x.id");
+            let w = match rng.int(3) {
+                0 => String::new(),
+                _ => {
+                    let who = al[rng.int(3) as usize];
+                    format!(" WHERE {}", term(&mut rng, who))
+                }
+            };
+            let q = format!("SELECT x.id, y.id, z.id, m.k FROM {from}{w}");
+            s.push(format!("EXPLAIN QUERY PLAN {q}"));
+            s.push(q);
+        }
+        let fs = layout(&s, true);
+        let (fh, fo) = answers(&format!("rfgen{i}f"), &fs);
+        let (mh, mo) = answers(&format!("rfgen{i}m"), &layout(&s, false));
+        for (j, sql) in fs.iter().enumerate() {
+            let (Some(a), Some(b)) = (fh.get(j), fo.get(j)) else {
+                panic!("rfgen{i}: statement {} lost", j + 1);
+            };
+            compared += 1;
+            if a == b {
+                continue;
+            }
+            if mh.get(j) != mo.get(j) {
+                as_sets += 1;
+                if sql.starts_with("EXPLAIN") {
+                    continue;
+                }
+                let (mut a, mut b) = (a.clone(), b.clone());
+                a.sort();
+                b.sort();
+                if a == b {
+                    continue;
+                }
+            }
+            panic!(
+                "rfgen{i}: statement {} differs: {sql}\nhipp: {a:?}\npin:  {b:?}",
+                j + 1
+            );
+        }
+    }
+    eprintln!("{as_sets} of {compared} statements compared as sets");
+    assert!(
+        as_sets * 10 <= compared,
+        "{as_sets} of {compared} statements compared as sets"
+    );
+}

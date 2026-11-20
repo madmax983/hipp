@@ -1265,6 +1265,23 @@ pub(super) fn mark_xcover(
     }
 }
 
+/// The pin's `sqlite3ExprColUsed` (v0.17 review fix): reading a
+/// generated column of `t` marks every column read, so only an index
+/// holding every column but the rowid alias covers the statement
+/// (the pin's `isCovering`).
+pub(super) fn gen_reads(t: &crate::schema::TableDef, needed: &mut [bool]) {
+    if needed
+        .iter()
+        .zip(t.columns.iter())
+        .any(|(n, c)| *n && c.gen_expr.is_some())
+    {
+        needed.fill(true);
+        if let Some(n) = t.rowid_alias.and_then(|r| needed.get_mut(r)) {
+            *n = false;
+        }
+    }
+}
+
 pub(super) fn core_reads(info: &CoreInfo<'_>, sources: &[SourcePlan], slot: usize) -> bool {
     let r = crate::query::RefRange {
         w: (slot, slot.saturating_add(1)),
@@ -1681,6 +1698,7 @@ impl<S: Storage> Connection<S> {
             for c in 0..sp.ncols {
                 needed.push(core_reads(info, sources, base + c));
             }
+            gen_reads(t, needed.as_mut_slice());
             let limit = match info.limit {
                 Some(RExpr::Literal(OwnedValue::Integer(k))) if *k > 0 => Some(log_est(*k as u64)),
                 _ => None,
@@ -2122,6 +2140,7 @@ impl<S: Storage> Connection<S> {
             };
             needed.push(expr_refs_range(f, &r));
         }
+        gen_reads(t, needed.as_mut_slice());
         let q = Query {
             conj: conj.as_slice(),
             truth: truth.as_slice(),

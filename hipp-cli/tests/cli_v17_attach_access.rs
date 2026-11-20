@@ -151,3 +151,30 @@ fn writes_reading_other_databases_through_indexes() {
         ),
     );
 }
+
+/// Review fixes: a later LEFT JOIN's ON term proves no partial index
+/// of an earlier source (rows were lost), and a generated column read
+/// through an index is no COVERING INDEX, as on the pin.
+#[test]
+fn partial_on_terms_and_generated_cover() {
+    let mut batch = String::from(
+        "ATTACH 'a.db' AS aux; \
+         CREATE TABLE aux.t(id, a); INSERT INTO aux.t VALUES (1, NULL), (2, 5), (3, NULL); \
+         CREATE INDEX aux.ti ON t(id) WHERE a IS NOT NULL; \
+         CREATE TABLE m(k); INSERT INTO m VALUES (1); \
+         CREATE TEMP TABLE g(a INTEGER PRIMARY KEY, b, c AS (b * 2), d AS (b || 'x') STORED, e); \
+         CREATE INDEX temp.ge ON g(e, d); INSERT INTO g(b, e) VALUES (1, 'dflt'), (2, 'dflt'), (3, 'z'); ",
+    );
+    for q in [
+        "SELECT t.id FROM aux.t LEFT JOIN m ON t.a = 5",
+        "SELECT count(*) FROM aux.t LEFT JOIN m ON t.a = 5",
+        "SELECT t.id FROM m JOIN aux.t LEFT JOIN m m2 ON t.a = 5",
+        "SELECT t.id, m.k FROM m LEFT JOIN aux.t ON t.a = 5",
+        "SELECT a, d FROM g WHERE e = 'dflt' ORDER BY d DESC",
+        "SELECT e FROM g WHERE e = 'dflt'",
+        "SELECT count(*) FROM g WHERE d = '1x'",
+    ] {
+        batch.push_str(&format!("EXPLAIN QUERY PLAN {q}; {q}; "));
+    }
+    byte_identical("review", &batch);
+}

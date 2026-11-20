@@ -432,11 +432,18 @@ pub(crate) fn all_loops(srcs: &[JSrc<'_>], jq: &JQuery<'_>, pre: &[u64]) -> AVec
                 insert(&mut out, js.ts.as_slice(), jl);
             }
         }
+        let mut pconj: AVec<&RExpr> = AVec::new();
+        for (ci, c) in jq.conj.iter().enumerate() {
+            if owns(js, jq, i, ci) {
+                pconj.push(*c);
+            }
+        }
         let jm = JMask {
             cmask: jq.cmask,
             tmask: js.tmask.as_slice(),
             me,
             pre: mpre,
+            pconj: pconj.as_slice(),
         };
         let mut needed: AVec<bool> = AVec::new();
         for u in js.used.iter() {
@@ -1420,17 +1427,24 @@ pub fn auto_index(js: &JSrc<'_>, jq: &JQuery<'_>, i: usize, ready: u64) -> crate
     let partial = jq.conj.iter().enumerate().any(|(ci, c)| {
         let m = jq.cmask.get(ci).copied().unwrap_or(0);
         let pure = jq.pure.get(ci).copied().unwrap_or(false);
-        let owner_ok = match jq.on_of.get(ci).copied().flatten() {
-            Some(o) => js.left && o == i,
-            None => !js.left,
-        };
-        m & !me == 0 && pure && owner_ok && !crate::query::has_sub(c)
+        m & !me == 0 && pure && owns(js, jq, i, ci) && !crate::query::has_sub(c)
     });
     crate::xplan::AutoIdx {
         keys,
         extra,
         partial,
         bloom,
+    }
+}
+
+/// Whether WHERE-clause term `ci` filters source `i` itself (the
+/// pin's `whereUsablePartialIndex` / partial automatic index test):
+/// no other source's LEFT JOIN ON term, and only its own ON terms
+/// when it is a LEFT JOIN's right side.
+fn owns(js: &JSrc<'_>, jq: &JQuery<'_>, i: usize, ci: usize) -> bool {
+    match jq.on_of.get(ci).copied().flatten() {
+        Some(o) => js.left && o == i,
+        None => !js.left,
     }
 }
 

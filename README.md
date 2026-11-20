@@ -99,7 +99,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   INDEX tv (v=?)`). A 3,000 x 3,000 correlated lookup into an attached
   table no longer scans it per outer row (15.6 s for two such
   statements in a debug build, 0.8 s now). A statement reading an
-  attached table locks it against DETACH from its first step. Still
+  attached table locks it against DETACH from its first step. Review
+  fixes (also on main tables): a later LEFT JOIN's ON term no longer
+  lets a partial index of an earlier table drop rows, and an index
+  read for a generated column is no COVERING INDEX, as on the pin. Still
   open (STATUS.md): WITHOUT ROWID tables of another database (read
   whole), writes of an attached / TEMP table reading other databases
   (read whole), TEMP triggers across databases, another database's
