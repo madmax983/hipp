@@ -11,6 +11,171 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: shell — review fixes (2026-11-20)
+
+Ten review findings on `shell` (8872cc8), each reproduced and probed
+on the live pin first; the same bug patterns were searched for and
+fixed where found. hipp-cli only (`hipp-cli/src`, `hipp-cli/tests`):
+no library file changes, so no size gate moves.
+
+**Shipped.**
+1. **`.schema` options and patterns** (high; it printed nothing for
+   `--nosys`, `--indent`, `T%`, `sqlite_master`, exit 0, and an index
+   or trigger matched by its own name). Now the pin's `.schema
+   ?--indent? ?--nosys? ?LIKE-PATTERN?`: the pattern is matched
+   against `lower(tbl_name)` with LIKE (`ESCAPE '\'`), or GLOB when it
+   holds `*`, `?` or `[`; a pattern holding `.` is matched against the
+   literal text `%s.%s` (the 3.54.1 shell's query reads
+   `lower(format('%%s.%%s',sname,tbl_name))`, seen with `.schema
+   --debug`), so `main.t` matches nothing and `%.%` everything; a
+   pattern LIKE `sqlite_master` / `sqlite_schema` (else
+   `sqlite_temp_master` / `sqlite_temp_schema`) prints the schema
+   table's declaration first; `--nosys` drops names LIKE `sqlite\_%`;
+   with a pattern the eponymous modules hipp has follow (`/*
+   dbstat(...) */`, `/* generate_series(value) */`); `--indent` is the
+   pin's pretty layout (blanks collapsed, a text of 78 bytes or more
+   broken after `(` and each top-level `,`, the closing `)` on its own
+   line, an index's `WHERE` terms one `AND` per line, a NULL text a
+   blank line; derived from probing and checked over 2,700 generated
+   tables and indexes); a second pattern is `Usage: .schema ?--indent?
+   ?--nosys? ?LIKE-PATTERN?`, another dash word `Unknown option:
+   "..."` (both exit 1, checked before the database opens). The same
+   pattern elsewhere: a text that ends in a comment now ends as the
+   pin's `shell_complete_sql` makes it (`*/;`, `\n;`) in `.schema`,
+   `.fullschema` (which applied a `--` rule) and `.dump`'s views and
+   triggers; `.fullschema --indent` is accepted (it changes nothing on
+   the pin); a `*/` inside a view comment is written `**`; LIKE `_` and
+   GLOB `?` / `[...]` now take one UTF-8 character (`.tables`,
+   `.indexes`, `.help` used the same byte matcher).
+2. **`\r\n` in the columnar modes and line mode's names** (medium).
+   In column, box, table and markdown a `\r\n` breaks the cell's line
+   (the `\r` dropped); any other `\r` is `^M`. The display modes
+   (list, csv, line, ...) write the `\r` of a `\r\n` as is (they wrote
+   `^M`). Line mode's names: the column is as wide as the widest name
+   with control characters and ANSI CSI sequences (`ESC [ 3 1 m`)
+   taking no room; each name is cut to that width counting a control
+   character as one column, written raw (no `^X`), padded on the left
+   (probed: `x\ry` beside `z` prints `x\r`, `\x1b[31m` beside `z` is
+   padded by one). Same pattern in the input loop: a script line lost
+   two `\r`s before its `\n` (`lines()` drops one, the shell another);
+   now one, as the pin's `local_getline`.
+3. **A fresh file and write transactions that change nothing**
+   (medium). The pin writes page 1 when a write transaction commits on
+   an empty file even if it changed nothing; the shell now follows
+   those it can see (`Shell::track_txn`): `BEGIN IMMEDIATE` / `BEGIN
+   EXCLUSIVE` (every file), `PRAGMA [schema.]incremental_vacuum`,
+   `PRAGMA [schema.]schema_version = N` (that schema's file; not
+   `temp`); at the `COMMIT` / `END` / `RELEASE` that ends the
+   transaction (or at once in autocommit) `LazyFile::commit_empty`
+   writes the held page 1 (byte for byte the pin's, UTF-16 and other
+   page sizes included) and the layout is fixed, as after the pin's
+   commit; a `ROLLBACK` or a failed statement writes nothing.
+4. **A file that is not a database** (medium). The pin opens lazily:
+   `.tables` and `.indexes` print nothing (exit 0), `.limit` its table,
+   `.databases` `main: PATH r/w`, `.fullschema` `/* No STAT tables
+   available */` and exits 26 (the NOTADB code; 1 in a script), and
+   `.open` of such a file succeeds; hipp failed each with `Error:
+   BadMagic` / `TruncatedHeader`. The shell now takes those three open
+   errors (`BadMagic`, `TruncatedHeader`, `UnsupportedPageSize`) as the
+   pin's "not a database" and answers these commands as the pin does;
+   other commands still fail (their message text is hipp's).
+5. **`.dump` and `sqlite_sequence` beside a virtual table** (medium):
+   the virtual-table re-sort undid `sqlite_sequence`'s last place (the
+   pin's `ORDER BY tbl_name='sqlite_sequence', rowid`); the sort key is
+   now `(is sqlite_sequence, schema order)` and every virtual table
+   precedes it, with every option.
+6. **A line of only `.`** (low) is nothing, as the pin tokenizes from
+   the second character (`nArg==0`); `. print x` is `.print x` and
+   `..print` is the unknown command `.print`.
+7. **`\0` escapes** (low): a `"..."` argument ends at the first NUL its
+   escapes make (`.print`, `.separator`, `.nullvalue`, `.mode`'s
+   values), as the pin's C strings do.
+8. **`.read` nesting** (low): the limit of 25 counts standard input as
+   a level (24 nested files under stdin, 25 from an argument).
+9. **`.show` after `.mode column`** (low): the modes that write no
+   separator (column, box, markdown, table, json, insert) keep the
+   separators set before, as the pin's `.show` shows them (checked
+   over every pair of modes, before and after `.separator`).
+10. **The command-line forms of the settings** (low): `-ascii`, `-box`,
+    `-column`, `-csv`, `-json`, `-line`, `-list`, `-markdown`,
+    `-quote`, `-table`, `-tabs`, `-header` / `-noheader`, `-separator
+    SEP`, `-newline SEP`, `-nullvalue TEXT` (as written, no escapes),
+    `-cmd COMMAND` (run before the input, its errors at `line 0:`,
+    fatal only under `-bail`), `-bail`, `-echo`, `-batch`, `-noinit`,
+    applied in order; `missing argument to -X`; `-A`, `-zip`,
+    `-insert` are the pin's `unknown option`.
+
+**Probing notes (live pin).** `.schema --debug` prints the 3.54.1
+query: `SELECT shell_complete_sql(sql,1) FROM(SELECT
+shell_format_schema(shell_add_schema(sql,NULL,name),0) AS sql, ...,
+2 AS snum, 'main' as sname FROM "main".sqlite_schema UNION ALL ...
+pragma_module_list) WHERE lower(tbl_name) LIKE 't' ESCAPE '\' AND sql
+IS NOT NULL ORDER BY snum, rowid` (main 2, temp 4, attached 6, ...;
+`--nosys`: `name NOT LIKE 'sqlite__%' ESCAPE '_'`; GLOB for `*?[`;
+`lower(format('%%s.%%s',...))` for a dotted pattern). With a pattern
+the pin's eponymous modules (`completion`, `dbstat`, `fsdir`,
+`fts3tokenize`, `generate_series`, `pragma_module_list`) are listed
+by name after every database. `--indent`: a collapsed text of 78
+bytes is broken, 77 not; nothing inside a string, quoted name or line
+comment counts toward the parentheses; a text the collapse leaves
+ending in a line comment gets `;`, a newline and the open `)`s
+(`CREATE TABLE c(a -- d\n)` prints `CREATE TABLE c(a -- d);` /
+`);`). A fresh file gets 4,096 bytes from `BEGIN IMMEDIATE; COMMIT;`,
+`BEGIN EXCLUSIVE; COMMIT;`, `PRAGMA incremental_vacuum`, `PRAGMA
+schema_version = 0`, `PRAGMA default_cache_size = 10`, and 0 from
+`BEGIN; COMMIT;`, `BEGIN IMMEDIATE; ROLLBACK;`, `BEGIN IMMEDIATE;`
+left open at exit, `PRAGMA temp.schema_version = 0`; an attached
+file under `BEGIN IMMEDIATE` too. The pin's shell resolves `.s` /
+`.sc` to `.scanstats`, `.sh` / `.sy` to `.system`, `.p` to `.prompt`,
+`.l` to `.load`, `.i` to `.import`, `.f` to `.filectrl`, `.c` to
+`.clone` (commands hipp lacks).
+
+**Tests.** `hipp-cli/tests/cli_v17_shell.rs`, eight new tests against
+the live pin: `schema_options_and_patterns_match_pin` (51 argument
+sets in one-shot and script form, attached objects, texts ending in
+comments under `.schema`, `--indent`, `.fullschema`, `.dump`),
+`generated_schema_indent_matches_pin` (120 xorshift-generated tables
+and indexes), `crlf_cells_and_line_names_match_pin` (432 mode × value
+× name runs, 200 generated line-mode names, CRLF script input),
+`fresh_file_write_transactions_match_pin` (28 statement sets, page 1
+byte for byte), `not_a_database_file_matches_pin`,
+`dump_sequence_last_beside_virtual_tables`,
+`dot_line_details_match_pin` (`.` lines, `\0`, `.read` nesting, 144
+mode pairs' `.show`), `command_line_options_match_pin` (38 command
+lines and two scripts).
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` workspace suite included).
+
+Size Δ: none — no library file changed. tiny 0, full 0, max 0, xl 0.
+
+**Honest gaps.**
+- `.schema PATTERN` lists only the eponymous modules hipp has
+  (`dbstat`, `generate_series`), not the pin shell's `completion`,
+  `fsdir`, `fts3tokenize` and `pragma_module_list`, so `.schema %`
+  differs by those lines. `.schema --debug` is refused by name.
+- Write transactions hipp cannot run leave the file as hipp leaves it:
+  `PRAGMA locking_mode` and `default_cache_size` are unsupported in
+  the library (the pin writes page 1 for `default_cache_size = N`).
+  A transaction begun by a statement the shell does not follow (the
+  pin's other no-op writes) writes nothing.
+- Library, pre-existing, not this unit's: a fresh file hipp writes has
+  a change counter one higher than the pin's (the pager writes page 1
+  with counter 1 at open, then increments it at the first commit; the
+  pin's first commit writes 1), so the files' bytes 24-27 and 92-95
+  differ (sizes and contents otherwise match).
+- On a file that is not a database, `.schema`, `.dump`, `.parameter`
+  and SQL still fail with hipp's open error text (the pin's `Error: in
+  prepare, file is not a database (26)` and friends), and `.dump
+  --data-only`, `.parameter list` / `init` and `PRAGMA page_size` (which
+  the pin answers without reading the file) fail where the pin
+  succeeds.
+- A dot-command prefix that the pin resolves to one of its commands
+  hipp lacks (`.s`, `.sh`, `.p`, `.l`, `.i`, `.f`, `.c`) is hipp's
+  unknown-command error, not that command's usage or action.
+- Script input that is not valid UTF-8 is refused (`stream did not
+  contain valid UTF-8`); the pin reads bytes.
+
 ### Parity: shell — hipp-cli dot-commands, output modes and `.dump` options (2026-11-20)
 
 Wave 20's hipp-cli unit (owner decision 2026-11-20: SQLite 3.54.1
@@ -162,8 +327,9 @@ Size Δ: none — no library file changed. tiny 0, full 0, max 0, xl 0.
   (`html`, `tcl`, `qbox`, `psql`, `count`, `off`, ...) and options
   (`.mode -v`, `--reset`, `--quote`, `--align`, `--limits` ...,
   `.output -x` / `-e` / `--bom`, `.open --new` / `--readonly` ...,
-  `.fullschema --indent`, `.schema --indent` / `--nosys`, setting a
-  `.limit`) are refused by name.
+  setting a `.limit`) are refused by name. (`.schema --indent` /
+  `--nosys` and `.fullschema --indent`, which this entry listed but
+  were not refused, closed in v0.17: shell review fixes.)
 - SQL errors still print hipp's own text (`Error: Schema { kind:
   UnknownColumn }`), not the pin's `Parse error near line N: ...`
   with its caret.

@@ -18,8 +18,11 @@
 //! The command line is the pin shell's (v0.17): `[OPTIONS]
 //! [FILENAME [SQL...]]`, the database `:memory:` when none is
 //! named and opened only when the input first needs it; of the
-//! options hipp takes `-help`, `-version` (each also as `--x`) and
-//! `--` / `-`, which end them, and it refuses the pin's others.
+//! options hipp takes `-help`, `-version`, the mode options (`-csv`,
+//! `-box`, ...), `-header` / `-noheader`, `-separator`, `-newline`,
+//! `-nullvalue`, `-cmd`, `-bail`, `-echo`, `-batch`, `-noinit` (each
+//! also as `--x`) and `--` / `-`, which end them, and it refuses the
+//! pin's others.
 //!
 //! Bound parameters (v0.16) work as in the oracle shell: every
 //! parameter of a statement is bound from the `.parameter set`
@@ -147,10 +150,10 @@ fn prefixed_text(sql: &[u8], db: &[u8]) -> Vec<u8> {
     sql.to_vec()
 }
 
-/// `.schema [name]` for one database (`temp`: the TEMP database):
-/// every object with SQL text in schema (rowid) order, as the oracle
-/// shell prints them — `name` matches an object's name or its
-/// table's — each view followed by its `/* name(columns) */` comment.
+/// `.schema` for one database (`temp`: the TEMP database): every
+/// object with SQL text that `sel` keeps, in schema (rowid) order, as
+/// the oracle shell prints them, each view followed by its `/*
+/// name(columns) */` comment.
 /// The column names are the view's planned ones (v0.16: views
 /// execute); a view that cannot be planned — a missing table, a
 /// column list of the wrong length, a cycle — gets no comment, as in
@@ -161,7 +164,7 @@ fn prefixed_text(sql: &[u8], db: &[u8]) -> Vec<u8> {
 /// database's name, quoted as a column name would be.
 async fn print_schema<S: hipp::Storage>(
     db: &mut Connection<S>,
-    arg: &str,
+    sel: &SchemaSel<'_>,
     out: &mut dyn Write,
     temp: bool,
     attached: Option<usize>,
@@ -181,26 +184,39 @@ async fn print_schema<S: hipp::Storage>(
     } else {
         "SELECT type, name, tbl_name, sql FROM main.sqlite_schema"
     };
-    // (type, name, tbl_name, sql) per schema row.
-    type SchemaRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    // (type, name, tbl_name, sql) per schema row (a NULL text, an
+    // automatic index's, as `None`).
+    type SchemaRow = (Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>);
     let mut rows: Vec<SchemaRow> = Vec::new();
     if let Ok(mut st) = db.prepare(sql).await {
         while let Ok(Step::Row) = st.step().await {
             let col = |i| st.column_bytes(i).map(<[u8]>::to_vec);
-            if let (Some(t), Some(n), Some(tb), Some(q)) = (col(0), col(1), col(2), col(3)) {
-                rows.push((t, n, tb, q));
+            if let (Some(t), Some(n), Some(tb)) = (col(0), col(1), col(2)) {
+                rows.push((t, n, tb, col(3)));
             }
         }
     }
     for (ty, name, tbl, sql) in rows.iter() {
-        let a = arg.as_bytes();
-        if !arg.is_empty() && !name.eq_ignore_ascii_case(a) && !tbl.eq_ignore_ascii_case(a) {
+        if !sel.keeps(name, tbl) {
             continue;
         }
+        let Some(sql) = sql else {
+            // (`--indent` formats a NULL text as an empty one: the pin
+            // prints a blank line for it.)
+            if sel.indent {
+                let _ = out.write_all(b"\n");
+            }
+            continue;
+        };
         let shown = match &quoted {
             Some(q) => prefixed_text(sql, q),
             None if temp => temp_text(sql),
             None => sql.clone(),
+        };
+        let shown = if sel.indent {
+            pretty(&shown)
+        } else {
+            complete_sql(&shown)
         };
         let _ = out.write_all(&shown);
         let _ = out.write_all(b";\n");
@@ -245,24 +261,265 @@ async fn print_schema<S: hipp::Storage>(
         let Some(cols): Option<Vec<Vec<u8>>> = cols else {
             continue;
         };
-        let _ = out.write_all(b"/* ");
+        let mut body: Vec<u8> = Vec::new();
         if let Some(q) = &quoted {
-            let _ = out.write_all(q);
-            let _ = out.write_all(b".");
+            body.extend_from_slice(q);
+            body.push(b'.');
         } else if temp {
-            let _ = out.write_all(b"temp.");
+            body.extend_from_slice(b"temp.");
         }
-        let _ = out.write_all(&shell_quote_name(name));
-        let _ = out.write_all(b"(");
+        body.extend_from_slice(&shell_quote_name(name));
+        body.push(b'(');
         for (i, c) in cols.iter().enumerate() {
             if i > 0 {
-                let _ = out.write_all(b",");
+                body.push(b',');
             }
-            let _ = out.write_all(&shell_quote_name(c.as_slice()));
+            body.extend_from_slice(&shell_quote_name(c.as_slice()));
         }
-        let _ = out.write_all(b") */\n");
+        body.push(b')');
+        // (A `*/` inside would end the comment: the pin writes `**`.)
+        for k in 1..body.len() {
+            if body[k - 1] == b'*' && body[k] == b'/' {
+                body[k] = b'*';
+            }
+        }
+        let _ = out.write_all(b"/* ");
+        let _ = out.write_all(&body);
+        let _ = out.write_all(b" */\n");
     }
 }
+
+/// What `.schema` shows (v0.17 review fix: the pin's options and
+/// pattern; it only matched a name exactly).
+pub struct SchemaSel<'a> {
+    /// The LIKE pattern (a GLOB one when it holds `*`, `?` or `[`).
+    pub pat: Option<&'a str>,
+    /// `--nosys`: no object named `sqlite_...`.
+    pub nosys: bool,
+    /// `--indent`: the pin's pretty layout (`pretty`).
+    pub indent: bool,
+}
+
+impl SchemaSel<'_> {
+    /// Whether the object `name` (on table `tbl`) is shown: the pin's
+    /// `lower(tbl_name) LIKE pattern ESCAPE '\'` (GLOB for a glob
+    /// pattern) — a pattern holding `.` is matched against the literal
+    /// text `%s.%s`, as the 3.54.1 shell's `format('%%s.%%s', ...)`
+    /// yields — and `--nosys`'s `name NOT LIKE 'sqlite__%' ESCAPE '_'`.
+    pub fn keeps(&self, name: &[u8], tbl: &[u8]) -> bool {
+        if self.nosys && help::like_esc(b"sqlite\\_%", name, Some(b'\\')) {
+            return false;
+        }
+        let Some(p) = self.pat else {
+            return true;
+        };
+        let target = if p.contains('.') {
+            b"%s.%s".to_vec()
+        } else {
+            tbl.to_ascii_lowercase()
+        };
+        if p.contains(['*', '?', '[']) {
+            help::glob(p.as_bytes(), &target)
+        } else {
+            help::like_esc(p.as_bytes(), &target, Some(b'\\'))
+        }
+    }
+}
+
+/// `sql` with what makes it end its statement once `;` follows: the
+/// pin's `shell_complete_sql` (nothing, `*/` for an open block
+/// comment, a newline after a line comment).
+fn complete_sql(sql: &[u8]) -> Vec<u8> {
+    for term in [&b""[..], b"*/", b"\n"] {
+        let mut t = sql.to_vec();
+        t.extend_from_slice(term);
+        let mut c = t.clone();
+        c.push(b';');
+        if split_script(&String::from_utf8_lossy(&c)).1 {
+            return t;
+        }
+    }
+    sql.to_vec()
+}
+
+/// `--indent`'s last line `t` of the text `whole` (not a view's or
+/// trigger's): a text that ends inside a line comment (the collapse
+/// joined the comment's line with what followed) gets, as on the pin,
+/// `;`, a newline and the `)`s it leaves open outside comments, then
+/// `complete_sql`.
+fn pretty_end(t: &[u8], whole: &[u8]) -> Vec<u8> {
+    let (open, in_comment) = scan_tail(whole);
+    if !in_comment {
+        return complete_sql(t);
+    }
+    let mut v = t.to_vec();
+    v.extend_from_slice(b";\n");
+    v.resize(v.len() + open, b')');
+    complete_sql(&v)
+}
+
+/// The parentheses `sql` leaves open, outside its strings, quoted
+/// names and comments, and whether it ends inside a line comment.
+fn scan_tail(sql: &[u8]) -> (usize, bool) {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < sql.len() {
+        let c = sql[i];
+        let close = match c {
+            b'\'' | b'"' | b'`' => Some(&[c][..]),
+            b'[' => Some(&b"]"[..]),
+            b'-' if sql.get(i + 1) == Some(&b'-') => Some(&b"\n"[..]),
+            b'/' if sql.get(i + 1) == Some(&b'*') => Some(&b"*/"[..]),
+            b'(' => {
+                depth += 1;
+                None
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                None
+            }
+            _ => None,
+        };
+        i += 1;
+        if let Some(end) = close {
+            if c == b'/' || c == b'-' {
+                i += 1;
+            }
+            match sql[i..].windows(end.len()).position(|w| w == end) {
+                Some(k) => i += k + end.len(),
+                None => return (depth, c == b'-'),
+            }
+        }
+    }
+    (depth, false)
+}
+
+/// The pin's `.schema --indent` layout of one schema text (its
+/// `MODE_Pretty`): a view or trigger as is; else blanks collapsed (none
+/// after `(` or before `(` / `)`), and a text of 79 bytes or more
+/// broken after the first `(` and each top-level `,` (indented two),
+/// its closing `)` on a line of its own, an index's `WHERE` terms one
+/// `AND` per line (indented four). Returned without its final `;`.
+fn pretty(sql: &[u8]) -> Vec<u8> {
+    let starts = |p: &[u8]| sql.len() >= p.len() && sql[..p.len()].eq_ignore_ascii_case(p);
+    if starts(b"CREATE VIEW") || starts(b"CREATE TRIG") {
+        return complete_sql(sql);
+    }
+    let is_index = starts(b"CREATE INDEX") || starts(b"CREATE UNIQUE INDEX");
+    let sp = |c: u8| c == b' ' || (9..=13).contains(&c);
+    let mut z: Vec<u8> = Vec::with_capacity(sql.len());
+    for &c in sql.iter().skip_while(|c| sp(**c)) {
+        if sp(c) {
+            if let Some(l) = z.last_mut()
+                && *l == b'\r'
+            {
+                *l = b'\n';
+            }
+            if z.last().is_some_and(|&l| sp(l) || l == b'(') {
+                continue;
+            }
+        } else if (c == b'(' || c == b')') && z.last().is_some_and(|&l| sp(l)) {
+            z.pop();
+        }
+        z.push(c);
+    }
+    while z.last().is_some_and(|&l| sp(l)) {
+        z.pop();
+    }
+    // (Probed on the pin: a collapsed text of 78 bytes is broken, one
+    // of 77 is not.)
+    if z.len() < 78 {
+        return pretty_end(&z, &z);
+    }
+    // (The pin's second pass: nothing inside a string, quoted name or
+    // line comment counts.)
+    let word = |i: usize, w: &[u8]| {
+        z.len() >= i + w.len()
+            && z[i..i + w.len()].eq_ignore_ascii_case(w)
+            && !z
+                .get(i + w.len())
+                .is_some_and(|&d| d.is_ascii_alphanumeric() || d == b'_')
+    };
+    let ws_to_eol = |from: usize| {
+        for k in from..z.len() {
+            match z[k] {
+                b'\n' => return true,
+                c if sp(c) => {}
+                b'-' if z.get(k + 1) == Some(&b'-') => return true,
+                _ => return false,
+            }
+        }
+        true
+    };
+    let mut out = Vec::with_capacity(z.len() + 64);
+    let mut cur: Vec<u8> = Vec::new();
+    let (mut n_paren, mut c_end, mut n_line, mut is_where) = (0i64, 0u8, 0usize, false);
+    let mut i = 0;
+    while i < z.len() {
+        let c = z[i];
+        if c_end != 0 {
+            if c == c_end {
+                c_end = 0;
+            }
+        } else if c == b'"' || c == b'\'' || c == b'`' {
+            c_end = c;
+        } else if c == b'[' {
+            c_end = b']';
+        } else if c == b'-' && z.get(i + 1) == Some(&b'-') {
+            c_end = b'\n';
+        } else if c == b'(' {
+            n_paren += 1;
+        } else if c == b')' {
+            n_paren -= 1;
+            if n_line > 0 && n_paren == 0 && !cur.is_empty() && !is_where {
+                out.append(&mut cur);
+                out.push(b'\n');
+            }
+        } else if (c | 0x20) == b'w' && n_paren == 0 && is_index && word(i, b"WHERE") {
+            is_where = true;
+        } else if is_where && (c | 0x20) == b'a' && n_paren == 0 && word(i, b"AND") {
+            out.append(&mut cur);
+            out.extend_from_slice(b"\n    ");
+        }
+        cur.push(c);
+        if n_paren == 1
+            && c_end == 0
+            && (c == b'(' || c == b'\n' || (c == b',' && !ws_to_eol(i + 1)))
+            && !is_where
+        {
+            if c == b'\n' {
+                cur.pop();
+            }
+            out.append(&mut cur);
+            out.extend_from_slice(b"\n  ");
+            n_line += 1;
+            while z.get(i + 1).is_some_and(|&d| sp(d)) {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out.extend_from_slice(&pretty_end(&cur, &z));
+    out
+}
+
+/// The eponymous virtual tables the pin's `.schema PATTERN` lists that
+/// hipp has (its `pragma_module_list` rows; the pin's own `completion`,
+/// `fsdir`, `fts3tokenize` and `pragma_module_list` hipp lacks), with
+/// the comment line it prints for each.
+/// (The third field: a query that prepares only when hipp has it.)
+const MODULE_SCHEMAS: [(&str, &str, &str); 2] = [
+    (
+        "dbstat",
+        "/* dbstat(name,path,pageno,pagetype,ncell,payload,unused,mx_payload,pgoffset,pgsize) */",
+        "SELECT * FROM dbstat LIMIT 0",
+    ),
+    (
+        "generate_series",
+        "/* generate_series(value) */",
+        "SELECT * FROM generate_series(1, 1)",
+    ),
+];
 
 fn shell_quote_name(c: &[u8]) -> Vec<u8> {
     let plain = c
@@ -984,6 +1241,12 @@ const LIMITS: [(&str, i64); 15] = [
     ("trigger_steps", 65000),
 ];
 
+/// The pin's `optionMatch`: `-NAME` or `--NAME`, as `NAME`.
+fn option_name(t: &str) -> Option<&str> {
+    let o = t.strip_prefix('-')?;
+    Some(o.strip_prefix('-').unwrap_or(o))
+}
+
 /// The argument errors of a database command, reported before the
 /// database is opened (the pin opens it only once they pass).
 fn db_precheck(
@@ -992,17 +1255,38 @@ fn db_precheck(
     caret: &dyn Fn(usize, &str) -> shell::Failed,
 ) -> Result<(), shell::Failed> {
     match cmd {
+        // (`--indent` changes nothing on the 3.54.1 pin's
+        // `.fullschema`.)
         "fullschema" => match args.get(1).map(|a| a.0.as_str()) {
             None => Ok(()),
-            Some("--indent" | "-indent") if args.len() == 2 => {
-                eprintln!("Error: .fullschema --indent is not supported by hipp");
-                Err(shell::Failed)
-            }
+            Some("--indent" | "-indent") if args.len() == 2 => Ok(()),
             Some(_) => {
                 eprintln!("Usage: .fullschema ?--indent?");
                 Err(shell::Failed)
             }
         },
+        "schema" => {
+            let mut pat = false;
+            for (t, _) in &args[1..] {
+                match option_name(t) {
+                    Some("indent" | "nosys") => {}
+                    Some("debug") => {
+                        eprintln!("Error: .schema --debug is not supported by hipp");
+                        return Err(shell::Failed);
+                    }
+                    _ if t.starts_with('-') => {
+                        eprintln!("Unknown option: \"{t}\"");
+                        return Err(shell::Failed);
+                    }
+                    _ if !pat => pat = true,
+                    _ => {
+                        eprintln!("Usage: .schema ?--indent? ?--nosys? ?LIKE-PATTERN?");
+                        return Err(shell::Failed);
+                    }
+                }
+            }
+            Ok(())
+        }
         "indexes" => {
             let mut pat = false;
             for (t, off) in &args[1..] {
@@ -1229,18 +1513,61 @@ where
             Ok(())
         }
         "schema" => {
-            let arg = a.get(1).copied().unwrap_or("");
-            print_schema(db, arg, out, false, None).await;
+            // `.schema ?--indent? ?--nosys? ?LIKE-PATTERN?` (its
+            // arguments checked by `db_precheck`).
+            let mut sel = SchemaSel {
+                pat: None,
+                nosys: false,
+                indent: false,
+            };
+            for t in &a[1..] {
+                match option_name(t) {
+                    Some("indent") => sel.indent = true,
+                    Some("nosys") => sel.nosys = true,
+                    _ => sel.pat = Some(t),
+                }
+            }
+            // A pattern LIKE the schema table's names shows its own
+            // declaration first.
+            if let Some(p) = sel.pat {
+                let like = |n: &str| help::like_esc(p.as_bytes(), n.as_bytes(), Some(b'\\'));
+                let which = if like("sqlite_master") || like("sqlite_schema") {
+                    Some("")
+                } else if like("sqlite_temp_master") || like("sqlite_temp_schema") {
+                    Some("temp.")
+                } else {
+                    None
+                };
+                if let Some(pre) = which {
+                    let _ = write!(
+                        out,
+                        "CREATE TABLE {pre}sqlite_schema (\n  type text,\n  name text,\n  \
+                         tbl_name text,\n  rootpage integer,\n  sql text\n);\n"
+                    );
+                }
+            }
+            print_schema(db, &sel, out, false, None).await;
             // The TEMP database's objects follow, named `temp.`, as
             // the oracle shell prints them.
             if db.temp_db().is_some() {
-                print_schema(db, arg, out, true, None).await;
+                print_schema(db, &sel, out, true, None).await;
             }
             // Then each attached database's (v0.16), `name.`-prefixed.
             let mut i = 0;
             while db.attached_db(i).is_some() {
-                print_schema(db, arg, out, false, Some(i)).await;
+                print_schema(db, &sel, out, false, Some(i)).await;
                 i += 1;
+            }
+            // With a pattern, the eponymous virtual tables it matches,
+            // by name, after every database's objects.
+            if sel.pat.is_some() {
+                for (name, line, probe) in MODULE_SCHEMAS {
+                    if sel.keeps(name.as_bytes(), name.as_bytes())
+                        && db.prepare(probe).await.is_ok()
+                    {
+                        let _ = writeln!(out, "{line}");
+                    }
+                }
             }
             Ok(())
         }
@@ -1274,9 +1601,8 @@ where
             rows.sort_by_key(|r| (r.0, r.1));
             let texts: Vec<Vec<u8>> = rows.into_iter().map(|r| r.2).collect();
             for t in &texts {
-                let _ = out.write_all(t);
-                let comment = t.windows(2).any(|w| w == b"--");
-                let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
+                let _ = out.write_all(&complete_sql(t));
+                let _ = out.write_all(b";\n");
             }
             let stats = db
                 .tables()
@@ -1326,46 +1652,50 @@ where
             }
             Ok(())
         }
-        "limits" => {
-            if a.len() > 3 {
-                eprintln!("Usage: .limit NAME ?NEW-VALUE?");
-                return Err(shell::Failed);
-            }
-            let Some(name) = a.get(1) else {
-                for (n, v) in LIMITS {
-                    let _ = writeln!(out, "{n:>20} {v}");
-                }
-                return Ok(());
-            };
-            let hits: Vec<&(&str, i64)> = LIMITS
-                .iter()
-                .filter(|(n, _)| {
-                    n.len() >= name.len()
-                        && n.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
-                })
-                .collect();
-            let (n, v) = match hits.as_slice() {
-                [one] => **one,
-                [] => {
-                    eprintln!("unknown limit: \"{name}\"");
-                    eprintln!("enter \".limits\" with no arguments for a list.");
-                    return Err(shell::Failed);
-                }
-                _ => {
-                    eprintln!("ambiguous limit: \"{name}\"");
-                    return Err(shell::Failed);
-                }
-            };
-            if a.len() == 3 {
-                eprintln!("Error: .limit cannot change a limit in hipp");
-                return Err(shell::Failed);
-            }
-            let _ = writeln!(out, "{n:>20} {v}");
-            Ok(())
-        }
+        "limits" => limits(&a, out),
         "dump" => dump(db, line, args, out, &caret).await,
         _ => Ok(()),
     }
+}
+
+/// `.limit ?NAME?`: the pin's limits (hipp reads none of them from the
+/// database, so this needs none).
+pub fn limits(a: &[&str], out: &mut dyn Write) -> Result<(), shell::Failed> {
+    if a.len() > 3 {
+        eprintln!("Usage: .limit NAME ?NEW-VALUE?");
+        return Err(shell::Failed);
+    }
+    let Some(name) = a.get(1) else {
+        for (n, v) in LIMITS {
+            let _ = writeln!(out, "{n:>20} {v}");
+        }
+        return Ok(());
+    };
+    let hits: Vec<&(&str, i64)> = LIMITS
+        .iter()
+        .filter(|(n, _)| {
+            n.len() >= name.len()
+                && n.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        })
+        .collect();
+    let (n, v) = match hits.as_slice() {
+        [one] => **one,
+        [] => {
+            eprintln!("unknown limit: \"{name}\"");
+            eprintln!("enter \".limits\" with no arguments for a list.");
+            return Err(shell::Failed);
+        }
+        _ => {
+            eprintln!("ambiguous limit: \"{name}\"");
+            return Err(shell::Failed);
+        }
+    };
+    if a.len() == 3 {
+        eprintln!("Error: .limit cannot change a limit in hipp");
+        return Err(shell::Failed);
+    }
+    let _ = writeln!(out, "{n:>20} {v}");
+    Ok(())
 }
 
 /// How `.dump` writes one table's rows: the column list of its
@@ -1617,7 +1947,14 @@ where
         );
     let mut ordered: Vec<&(Vec<u8>, Vec<u8>, String)> = ordered.collect();
     if !vtabs.is_empty() {
-        ordered.sort_by_key(|t| order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX));
+        // (Schema order among the tables, `sqlite_sequence` still last:
+        // the pin's `ORDER BY tbl_name='sqlite_sequence', rowid`.)
+        ordered.sort_by_key(|t| {
+            (
+                is_seq(&t.0),
+                order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX),
+            )
+        });
     }
     let mut vt_done = 0usize;
     let vtab_line = |vn: &[u8], vq: &[u8]| {
@@ -1630,8 +1967,12 @@ where
         )
     };
     for (name, sql, list) in ordered {
-        // The virtual tables created before this table.
-        let at = order.iter().position(|n| n == name).unwrap_or(usize::MAX);
+        // The virtual tables created before this table (all of them
+        // before `sqlite_sequence`, which comes last).
+        let at = match order.iter().position(|n| n == name) {
+            Some(p) if !is_seq(name) => p,
+            _ => usize::MAX,
+        };
         while let Some((vn, vq)) = vtabs.get(vt_done) {
             if order.iter().position(|n| n == vn).unwrap_or(usize::MAX) > at {
                 break;
@@ -1711,7 +2052,7 @@ where
                 if !t.eq_ignore_ascii_case(ty) {
                     continue;
                 }
-                let _ = out.write_all(sql);
+                let _ = out.write_all(&complete_sql(sql));
                 let comment = sql.windows(2).any(|w| w == b"--");
                 let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
             }
@@ -1804,60 +2145,37 @@ OPTIONS include:
    -vfstrace            enable tracing of all VFS calls
 ";
 /// The pin shell's other options (its `-help` list and the ones it
-/// takes unlisted): hipp takes none of them, and says so rather than
+/// takes unlisted) that hipp does not take: it says so rather than
 /// reading one as a file name.
 const PIN_OPTIONS: &[&str] = &[
-    "-A",
     "-append",
-    "-ascii",
-    "-bail",
-    "-batch",
-    "-box",
-    "-cmd",
     "-cmdline-edit",
-    "-column",
-    "-csv",
     "-deserialize",
-    "-echo",
     "-escape",
-    "-header",
     "-heap",
     "-html",
     "-ifexists",
     "-init",
     "-interactive",
-    "-json",
-    "-line",
-    "-list",
     "-lookaside",
-    "-markdown",
     "-maxsize",
     "-memtrace",
     "-mmap",
     "-multiplex",
-    "-newline",
     "-no-rowid-in-view",
     "-nofollow",
-    "-noheader",
-    "-noinit",
     "-nonce",
-    "-nullvalue",
     "-pagecache",
     "-pcachetrace",
-    "-quote",
     "-readonly",
     "-safe",
     "-screenwidth",
-    "-separator",
     "-sorterref",
     "-stats",
-    "-table",
-    "-tabs",
     "-unsafe-testing",
     "-utf8",
     "-vfs",
     "-vfstrace",
-    "-zip",
 ];
 
 /// The command line as the pin's shell reads it (v0.17): options
@@ -1867,18 +2185,20 @@ const PIN_OPTIONS: &[&str] = &[
 /// command line (the `argv[N]: ` of an error). `Err`: the exit status
 /// `-help`, `-version` or a bad option ends with, having printed
 /// what the pin prints (no database is opened, so no file made).
-fn parse_args(
-    argv0: &str,
-    args: impl Iterator<Item = String>,
-) -> Result<(String, Vec<(usize, String)>), ExitCode> {
+fn parse_args(argv0: &str, args: impl Iterator<Item = String>) -> Result<Args, ExitCode> {
     let mut file: Option<String> = None;
     let mut cmds: Vec<(usize, String)> = Vec::new();
+    let mut pre: Vec<Pre> = Vec::new();
     let mut opts = true;
-    for (k, a) in args.enumerate() {
+    let args: Vec<String> = args.collect();
+    let mut k = 0;
+    while k < args.len() {
+        let a = &args[k];
+        k += 1;
         if !opts || !a.starts_with('-') {
             match file {
-                None => file = Some(a),
-                Some(_) => cmds.push((k + 1, a)),
+                None => file = Some(a.clone()),
+                Some(_) => cmds.push((k, a.clone())),
             }
             continue;
         }
@@ -1887,7 +2207,38 @@ fn parse_args(
         } else {
             a.as_str()
         };
+        // The options that take a value: the next argument, the pin's
+        // `missing argument` error when there is none.
+        if matches!(z, "-separator" | "-newline" | "-nullvalue" | "-cmd") {
+            let Some(v) = args.get(k) else {
+                eprintln!("{argv0}: Error: missing argument to {z}");
+                return Err(ExitCode::FAILURE);
+            };
+            k += 1;
+            pre.push(match z {
+                "-separator" => Pre::Sep(v.clone().into_bytes()),
+                "-newline" => Pre::Newline(v.clone().into_bytes()),
+                "-nullvalue" => Pre::Null(v.clone().into_bytes()),
+                _ => Pre::Cmd(v.clone()),
+            });
+            continue;
+        }
+        if let Some(m) = z
+            .strip_prefix('-')
+            .filter(|m| *m != "insert")
+            .and_then(render::Mode::named)
+        {
+            pre.push(Pre::Mode(m));
+            continue;
+        }
         match z {
+            "-header" => pre.push(Pre::Titles(render::Titles::On)),
+            "-noheader" => pre.push(Pre::Titles(render::Titles::Off)),
+            "-bail" => pre.push(Pre::Bail),
+            "-echo" => pre.push(Pre::Echo),
+            "-batch" => pre.push(Pre::Batch),
+            // (hipp reads no `~/.sqliterc`.)
+            "-noinit" => {}
             "-" => opts = false,
             "-help" => {
                 usage(argv0);
@@ -1910,7 +2261,37 @@ fn parse_args(
             }
         }
     }
-    Ok((file.unwrap_or_else(|| String::from(":memory:")), cmds))
+    Ok((file.unwrap_or_else(|| String::from(":memory:")), cmds, pre))
+}
+
+/// The command line read: the database, the SQL / dot-command texts
+/// (each with its index in the command line) and the options that set
+/// the session up.
+type Args = (String, Vec<(usize, String)>, Vec<Pre>);
+
+/// A command-line option that sets the session up, applied in order
+/// before the input (v0.17 review fix: the pin's `-csv`, `-header`,
+/// `-separator`, `-cmd`, ...).
+pub enum Pre {
+    /// `-list`, `-csv`, `-box`, ...: `.mode`.
+    Mode(render::Mode),
+    /// `-header` / `-noheader`.
+    Titles(render::Titles),
+    /// `-separator SEP` (as written: no backslash escapes).
+    Sep(Vec<u8>),
+    /// `-newline SEP`.
+    Newline(Vec<u8>),
+    /// `-nullvalue TEXT`.
+    Null(Vec<u8>),
+    /// `-bail`.
+    Bail,
+    /// `-echo`.
+    Echo,
+    /// `-batch`: no prompts even on a terminal.
+    Batch,
+    /// `-cmd COMMAND`: a dot-command or SQL run before the input; a
+    /// failure ends the program only under `-bail`.
+    Cmd(String),
 }
 
 /// `-version` (v0.17): the pin's `VERSION DATE TIME SOURCE-ID
@@ -1940,12 +2321,53 @@ fn main() -> ExitCode {
 fn run() -> ExitCode {
     let mut argv = std::env::args();
     let argv0 = argv.next().unwrap_or_else(|| String::from("hipp"));
-    let (file, cmds) = match parse_args(&argv0, argv) {
+    let (file, cmds, pre) = match parse_args(&argv0, argv) {
         Ok(x) => x,
         Err(code) => return code,
     };
     let mut sh = shell::Shell::new(file);
-    let code = session(&mut sh, &cmds);
+    let mut batch = false;
+    let mut code = None;
+    for p in pre {
+        match p {
+            Pre::Mode(m) => sh.io.set.set_mode(m),
+            Pre::Titles(t) => sh.io.set.titles = t,
+            Pre::Sep(v) => sh.io.set.colsep = v,
+            Pre::Newline(v) => sh.io.set.rowsep = v,
+            Pre::Null(v) => sh.io.set.null = v,
+            Pre::Bail => sh.io.bail = true,
+            Pre::Echo => sh.io.echo = true,
+            Pre::Batch => batch = true,
+            Pre::Cmd(c) => {
+                // (The pin reports a `-cmd` error as at `line 0:`.)
+                sh.ctx = shell::Ctx::Line(None, 0);
+                let r = if c.starts_with('.') {
+                    match sh.meta(c.trim_end()) {
+                        Ok(shell::Flow::Continue) => Ok(()),
+                        Ok(shell::Flow::Quit | shell::Flow::Exit) => {
+                            code = Some(ExitCode::SUCCESS);
+                            break;
+                        }
+                        Ok(shell::Flow::ExitWith(n)) => {
+                            code = Some(ExitCode::from(n));
+                            break;
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    sh.sql(&c)
+                };
+                if r.is_err() && sh.io.bail {
+                    code = Some(ExitCode::from(sh.fail_code.take().unwrap_or(1)));
+                    break;
+                }
+            }
+        }
+    }
+    let code = match code {
+        Some(c) => c,
+        None => session(&mut sh, &cmds, batch),
+    };
     sh.finish();
     // The oracle shell closes the database however the session
     // ended (v0.16: a WAL-mode log is checkpointed and removed).
@@ -1959,7 +2381,7 @@ fn run() -> ExitCode {
 }
 
 /// Run the one-shot arguments, or the interactive / stdin session.
-fn session(sh: &mut shell::Shell, cmds: &[(usize, String)]) -> ExitCode {
+fn session(sh: &mut shell::Shell, cmds: &[(usize, String)], batch: bool) -> ExitCode {
     // One-shot mode: run the arguments in order, stop at the first
     // error. An argument whose first character is `.` is one
     // dot-command; any other is SQL (possibly several statements),
@@ -1980,7 +2402,7 @@ fn session(sh: &mut shell::Shell, cmds: &[(usize, String)]) -> ExitCode {
                 sh.sql(arg)
             };
             if r.is_err() {
-                return ExitCode::FAILURE;
+                return ExitCode::from(sh.fail_code.take().unwrap_or(1));
             }
         }
         return ExitCode::SUCCESS;
@@ -1988,7 +2410,7 @@ fn session(sh: &mut shell::Shell, cmds: &[(usize, String)]) -> ExitCode {
 
     // Interactive / stdin-batch mode.
     let stdin = std::io::stdin();
-    sh.interactive = stdin.is_terminal();
+    sh.interactive = !batch && stdin.is_terminal();
     if sh.interactive {
         println!("hipp — reads and writes SQLite database files (format pin: SQLite 3.54.1)");
         println!("Enter SQL or dot-commands (\".help\" lists them)");
@@ -1996,6 +2418,7 @@ fn session(sh: &mut shell::Shell, cmds: &[(usize, String)]) -> ExitCode {
     // A statement or dot-command failed: the script goes on (unless
     // `.bail on`), and the shell exits 1 at its end (or at `.exit`),
     // as the pin's `process_input` returns `errCnt > 0`.
+    sh.base = 1;
     let (errs, flow) = sh.process(stdin.lock(), None);
     match flow {
         shell::Flow::ExitWith(n) => ExitCode::from(n),

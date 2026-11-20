@@ -28,6 +28,24 @@ All notable changes to hipp. Versions follow the milestones in
 - `.parameter` with an unknown subcommand prints its help, as the pin.
 - Tests: `hipp-cli/tests/cli_v17_shell.rs`; `cli_diff.rs` and
   `cli_v04.rs` compare `.tables` with the pin's grid.
+- Review fixes: `.schema --indent` (the pin's pretty layout), `--nosys`,
+  LIKE / GLOB patterns on the table name, the usage and unknown-option
+  errors (they printed nothing); a text ending in a comment completed
+  as the pin does (`.schema`, `.fullschema`, `.dump`), `*/` in a view
+  comment written `**`; `\r\n` breaks a columnar cell's line, stays
+  raw in the display modes, and line mode cuts its names as the pin
+  does (controls, ANSI CSI sequences); a script line loses one `\r`,
+  not two; `BEGIN IMMEDIATE; COMMIT;`, `PRAGMA incremental_vacuum` and
+  `schema_version = N` write a fresh file's page 1; `.tables`,
+  `.indexes`, `.limit`, `.databases`, `.fullschema` and `.open` on a
+  file that is not a database behave as the pin's lazy open; `.dump`
+  keeps `sqlite_sequence` last beside virtual tables; a line of only
+  `.` is nothing; a `\0` escape ends an argument; the `.read` nesting
+  limit counts standard input; `.mode column` (box, table, markdown,
+  json, insert) keeps the separators `.show` shows; the command-line
+  options `-csv`, `-box`, ..., `-header`, `-separator`, `-newline`,
+  `-nullvalue`, `-cmd`, `-bail`, `-echo`, `-batch`, `-noinit`; LIKE
+  `_` and GLOB `?` match one UTF-8 character.
 
 ### Index and rowid access into attached and TEMP tables (wave 20, unit `attach_access`)
 

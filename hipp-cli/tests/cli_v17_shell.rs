@@ -18,7 +18,12 @@
 //! - `.dump` options `--data-only`, `--newlines`, `--nosys`,
 //!   `--preserve-rowids` and LIKE patterns;
 //! - a new database file left at 0 bytes until it is written;
-//! - the `-version` line's layout.
+//! - the `-version` line's layout;
+//! - the review fixes: `.schema` options and patterns (`--indent`
+//!   generated), `\r\n` in cells and line-mode names, write
+//!   transactions on a fresh file, a file that is not a database,
+//!   `sqlite_sequence` in `.dump`, `.` lines, `\0` escapes, `.read`
+//!   nesting, `.show` after `.mode`, the command-line options.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1246,4 +1251,494 @@ fn version_line_has_the_pins_layout() {
     assert_eq!(hw[4], ow[4]);
     assert_eq!(hw[3], concat!("hipp-", env!("CARGO_PKG_VERSION")));
     assert!(h.ends_with("-bit)\n"));
+}
+
+// ---- Review fixes (v0.17 `shell`): each finding's shapes and the
+// same patterns found elsewhere, against the live pin. ----
+
+/// `.schema`'s options and pattern (review fix: hipp matched only a
+/// name exactly, silently): `--indent`, `--nosys`, LIKE patterns on the
+/// lowercased table name (GLOB with `*?[`), the pin's literal `%s.%s`
+/// for a dotted pattern, the schema table's own declaration, the
+/// eponymous modules hipp has, the usage and unknown-option errors;
+/// main, TEMP and attached objects.
+#[test]
+fn schema_options_and_patterns_match_pin() {
+    let s = "CREATE TABLE t(a,b); CREATE INDEX ti ON t(a); \
+        CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END; CREATE TABLE \"T2\"(x); \
+        CREATE TABLE u(a INTEGER PRIMARY KEY, b UNIQUE); CREATE VIEW v AS SELECT a FROM t; \
+        CREATE TABLE w(k INTEGER PRIMARY KEY AUTOINCREMENT, z); ANALYZE; \
+        CREATE TABLE \"é\"(x); CREATE TABLE t_x(y); CREATE TABLE tax(y); \
+        CREATE TEMP TABLE tt(q); CREATE TEMP VIEW tv AS SELECT 1 AS one";
+    let args = [
+        "",
+        "--nosys",
+        "-nosys",
+        "--indent",
+        "--indent --nosys",
+        "--nosys t",
+        "t",
+        "T",
+        "T%",
+        "t%",
+        "t*",
+        "T*",
+        "t?",
+        "[tT]*",
+        "t\\_x",
+        "t_x",
+        "t\\",
+        "ti",
+        "tr",
+        "v",
+        "u",
+        // (`%`, `%.%` and `%s.%s` also list the pin shell's own modules,
+        // which hipp lacks: an honest gap.)
+        "%x",
+        "main.t",
+        "temp.tt",
+        "tt",
+        "tv",
+        "sqlite_master",
+        "SQLITE_MASTER",
+        "sqlite_schema",
+        "sqlite_temp_master",
+        "sqlite_temp_schema",
+        "sqlite_%",
+        "sqlite_s%",
+        "sqlite_stat1",
+        "sqlite_sequence",
+        "--nosys sqlite%",
+        "_",
+        "__",
+        "é",
+        "dbstat",
+        "db%",
+        "--indent db%",
+        "nosuch",
+        "x y",
+        "--indent a b",
+        "--bogus",
+        "-x",
+        "--indent --bogus",
+        "t;",
+        "\"T2\"",
+        "'t'",
+    ];
+    for a in args {
+        let c = format!(".schema {a}");
+        same("schema", &[":memory:", s, &c]);
+        same_stdin(
+            "schemain",
+            &[":memory:"],
+            &format!("{s};\n{c}\n.print after\n"),
+        );
+    }
+    // An attached database's objects, prefixed.
+    let att = "ATTACH 'b.db' AS bb; CREATE TABLE bb.q(y); CREATE VIEW bb.qv AS SELECT y FROM q; \
+        CREATE TABLE m(z)";
+    for a in ["", "q", "bb.q", "q%", "--nosys", "--indent", "Q%"] {
+        same("schemaatt", &["m.db", att, &format!(".schema {a}")]);
+    }
+    // Texts that end in a comment (the pin's `shell_complete_sql`), in
+    // `.schema`, `--indent`, `.fullschema` and `.dump`; a view comment
+    // holding `*/`.
+    let cm = "CREATE TABLE c(a /* c */, b -- d\n); CREATE VIEW v1 AS SELECT 1 -- trailing\n; \
+        CREATE VIEW v2 AS SELECT 1 /* open\n; CREATE VIEW w2 AS SELECT 1 /* c */, 2; \
+        CREATE TABLE t(a); CREATE INDEX i ON t(a -- z\n); \
+        CREATE VIEW w3 AS SELECT '--' AS x; CREATE VIEW w5 AS SELECT 1 -- /*\n; \
+        CREATE TABLE c2(a, b check(a>(1 -- x\n))); CREATE TABLE c3 -- k(,\n(a int)";
+    for c in [
+        ".schema",
+        ".schema --indent",
+        ".fullschema",
+        ".fullschema --indent",
+        ".dump",
+    ] {
+        same("schemacm", &[":memory:", cm, c]);
+    }
+}
+
+/// `.schema --indent` (the pin's pretty layout) over xorshift-generated
+/// tables and indexes: names of every quoting, types, constraints,
+/// strings holding `,` and `(`, comments, blanks of every kind, partial
+/// indexes; texts on both sides of the 78-byte threshold.
+#[test]
+fn generated_schema_indent_matches_pin() {
+    let mut rng = Rng(0x5eed_1de7);
+    let blanks = [
+        " ",
+        " ",
+        " ",
+        "  ",
+        "\n",
+        "\t",
+        " \n ",
+        "\r\n",
+        " -- c(,\n",
+        " /* k, ( */ ",
+        "\n-- z\n",
+    ];
+    let names = ["a#", "bb#", "\"q x#\"", "[w#]", "`t#`", "col_#", "\"p(,#\""];
+    let types = [
+        "",
+        " int",
+        " text not null",
+        " real default 1.5",
+        " varchar(10)",
+        " check(X>0)",
+        " default 'a,(b'",
+        " unique",
+        " references p(x)",
+        " collate nocase",
+    ];
+    for it in 0..120 {
+        let blank = |r: &mut Rng| {
+            if r.chance(30) {
+                (*r.pick(&blanks)).to_string()
+            } else {
+                " ".to_string()
+            }
+        };
+        let n = 1 + rng.below(7);
+        let mut cols: Vec<String> = Vec::new();
+        let mut plain: Vec<String> = Vec::new();
+        for c in 0..n {
+            let nm = rng.pick(&names).replace('#', &c.to_string());
+            let ty = rng.pick(&types).replace('X', &nm);
+            cols.push(format!("{}{nm}{ty}{}", blank(&mut rng), blank(&mut rng)));
+            plain.push(nm);
+        }
+        let sep = *rng.pick(&[",", " ,", ", ", ",\n"]);
+        let table = format!("CREATE TABLE tt{it}{}({})", blank(&mut rng), cols.join(sep));
+        let k = 1 + rng.below(plain.len());
+        let wh = *rng.pick(&["", " where X > 1 and X < 10", " WHERE (X and Y) AND X"]);
+        let wh = wh.replace('X', &plain[0]).replace('Y', &plain[k - 1]);
+        let index = format!(
+            "CREATE {}INDEX ix{it} ON tt{it}({}){wh}",
+            rng.pick(&["", "UNIQUE "]),
+            plain[..k].join(", ")
+        );
+        let sql = format!("{table};\n{index};");
+        same(
+            "indentgen",
+            &[
+                ":memory:",
+                &sql,
+                ".schema --indent",
+                ".schema --indent --nosys tt%",
+            ],
+        );
+    }
+}
+
+/// The columnar modes break a cell's line at `\r\n` (the `\r` dropped)
+/// and line mode's names are cut to the widest name's width, control
+/// characters and ANSI CSI sequences measured as the pin measures them
+/// (review fix); the display modes leave the `\r` of a `\r\n` as is.
+#[test]
+fn crlf_cells_and_line_names_match_pin() {
+    let vals = [
+        "'a'||char(13)||'b'",
+        "'a'||char(13,10)||'b'",
+        "'a'||char(13,13,10)||'b'",
+        "'a'||char(1)||'b'",
+        "char(13,10)",
+        "'a'||char(13)",
+        "'ab'||char(13,10)",
+        "cast('a'||char(13,10)||'b' as blob)",
+        "'a'||char(10,13)||'b'",
+        "'x'||char(9)||'y'||char(13,10)||'z'",
+        "char(13,10,13,10)",
+        "'a'||char(13,10,10)||'b'",
+    ];
+    for m in MODES {
+        for v in vals {
+            for nm in ["v", "\"n\r\nXm\"", "\"n\rm\""] {
+                let q = format!("SELECT {v} AS {nm}, 1 AS w");
+                same(
+                    "crlf",
+                    &[":memory:", &format!(".mode {m}"), ".headers on", &q],
+                );
+            }
+        }
+    }
+    // Line mode's names, generated: controls, CSI sequences, wide and
+    // combining characters, CRLF.
+    let parts = [
+        "a", "b", "Z", "\r", "\n", "\t", "\x01", "\x1b", "[", "3", "1", ";", "m", "H", " ", "日",
+        "é", "\u{301}", "\x7f", "\r\n",
+    ];
+    let mut rng = Rng(0x00c0_ffee);
+    for _ in 0..200 {
+        let ncol = 1 + rng.below(3);
+        let cols: Vec<String> = (0..ncol)
+            .map(|_| {
+                let n: String = (0..rng.below(7)).map(|_| *rng.pick(&parts)).collect();
+                format!("{} AS \"{n}\"", rng.pick(&["1", "'x'", "NULL", "2.5"]))
+            })
+            .collect();
+        let q = format!("SELECT {}", cols.join(", "));
+        let m = *rng.pick(&["line", "line", "column", "box", "list", "json"]);
+        same(
+            "linenames",
+            &[":memory:", &format!(".mode {m}"), ".headers on", &q],
+        );
+    }
+    // Script input: a line's `\r\n` loses only its `\r` (strings that
+    // span lines keep the others).
+    same_stdin(
+        "crlfin",
+        &[":memory:"],
+        "select 'a\r\nb';\nselect 'x\r\r\ny';\n.mode line\nselect 1 as \"ab\r\r\ncd\", 2 as z;\n",
+    );
+}
+
+/// A fresh file gets its page 1 when a write transaction the pin opens
+/// commits, though hipp writes nothing for it (review fix): `BEGIN
+/// IMMEDIATE` / `EXCLUSIVE` then `COMMIT`, `PRAGMA incremental_vacuum`,
+/// `schema_version = N`, an attached file; a rollback writes nothing.
+#[test]
+fn fresh_file_write_transactions_match_pin() {
+    for sql in [
+        "BEGIN IMMEDIATE; COMMIT;",
+        "BEGIN EXCLUSIVE; COMMIT;",
+        "BEGIN IMMEDIATE; ROLLBACK;",
+        "BEGIN; COMMIT;",
+        "PRAGMA incremental_vacuum;",
+        "PRAGMA incremental_vacuum(5);",
+        "PRAGMA schema_version=0;",
+        "PRAGMA main.schema_version=5;",
+        "PRAGMA encoding='UTF-16'; BEGIN IMMEDIATE; COMMIT;",
+        "PRAGMA page_size=1024; BEGIN IMMEDIATE; COMMIT;",
+        "BEGIN IMMEDIATE; SELECT 1; COMMIT;",
+        "BEGIN IMMEDIATE; CREATE TEMP TABLE x(a); COMMIT;",
+        "BEGIN IMMEDIATE; SELECT 1/0; COMMIT;",
+        "ATTACH 'a2.db' AS a2; BEGIN IMMEDIATE; COMMIT;",
+        "ATTACH 'a2.db' AS a2; PRAGMA a2.incremental_vacuum;",
+        "ATTACH 'a2.db' AS a2; BEGIN; PRAGMA a2.schema_version=0; COMMIT;",
+        "BEGIN; PRAGMA incremental_vacuum; COMMIT;",
+        "BEGIN; PRAGMA incremental_vacuum; ROLLBACK;",
+        "BEGIN IMMEDIATE; END;",
+        "BEGIN IMMEDIATE TRANSACTION; COMMIT TRANSACTION;",
+        "BEGIN IMMEDIATE; SAVEPOINT x; RELEASE x; COMMIT;",
+        "SAVEPOINT x; PRAGMA incremental_vacuum; RELEASE x;",
+        "BEGIN IMMEDIATE;",
+        "PRAGMA temp.schema_version=0;",
+        "PRAGMA temp.incremental_vacuum;",
+        "BEGIN IMMEDIATE; ROLLBACK; COMMIT;",
+        "PRAGMA incremental_vacuum; PRAGMA page_size=1024; CREATE TABLE t(x);",
+        "BEGIN IMMEDIATE; COMMIT; PRAGMA page_size=1024; SELECT * FROM sqlite_schema;",
+    ] {
+        check("freshtx", &["n.db", sql], "", &[], Err::Sql);
+        check("freshtxin", &["n.db"], &format!("{sql}\n"), &[], Err::Sql);
+    }
+    // The page the pin writes, byte for byte.
+    for sql in [
+        "BEGIN IMMEDIATE; COMMIT;",
+        "PRAGMA encoding='UTF-16'; BEGIN IMMEDIATE; COMMIT;",
+        "PRAGMA page_size=512; BEGIN EXCLUSIVE; COMMIT;",
+    ] {
+        let (hd, od) = (temp_dir("freshtxb-h"), temp_dir("freshtxb-o"));
+        run_in(&hipp_bin(), &hd, &["n.db", sql], "");
+        run_in(&oracle(), &od, &["n.db", sql], "");
+        let h = std::fs::read(hd.join("n.db")).expect("hipp file");
+        let o = std::fs::read(od.join("n.db")).expect("pin file");
+        assert_eq!(h, o, "{sql}: page 1");
+    }
+}
+
+/// On a file that is not a database the pin reads no page until a
+/// statement needs one (review fix: hipp failed at open): `.tables`,
+/// `.indexes`, `.limit`, `.databases`, `.fullschema` (exit 26), `.open`.
+#[test]
+fn not_a_database_file_matches_pin() {
+    let junk = "garbage garbage garbage garbage garbage garbage garbage garbage garbage \
+        garbage garbage garbage";
+    for (f, body) in [("g.db", junk), ("s.db", "SQLite format 3\0garbage")] {
+        for c in [
+            ".limit",
+            ".limit length",
+            ".limit foo",
+            ".indexes",
+            ".indexes x",
+            ".indexes --bogus",
+            ".tables",
+            ".tables x",
+            ".fullschema",
+            ".fullschema --indent",
+            ".open g.db",
+        ] {
+            check("notdb", &[f, c], "", &[(f, body)], Err::Exact);
+            check(
+                "notdbin",
+                &[f],
+                &format!("{c}\n.print after\n"),
+                &[(f, body)],
+                Err::Exact,
+            );
+        }
+        // `.databases` names the file by its full path: compared with
+        // each run's directory read as such.
+        let (hd, od) = (temp_dir("notdbdb-h"), temp_dir("notdbdb-o"));
+        std::fs::write(hd.join(f), body).expect("setup");
+        std::fs::write(od.join(f), body).expect("setup");
+        let h = run_in(&hipp_bin(), &hd, &[f, ".databases"], "");
+        let o = run_in(&oracle(), &od, &[f, ".databases"], "");
+        let norm = |out: &[u8], d: &Path| {
+            let d = std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
+            String::from_utf8_lossy(out).replace(d.to_string_lossy().as_ref(), "DIR")
+        };
+        assert_eq!(h.status.code(), o.status.code(), "{f}: .databases status");
+        assert_eq!(
+            norm(&h.stdout, &hd),
+            norm(&o.stdout, &od),
+            "{f}: .databases"
+        );
+        assert_eq!(h.stderr, o.stderr, "{f}: .databases stderr");
+    }
+}
+
+/// `.dump` keeps `sqlite_sequence` last when the schema has a virtual
+/// table (review fix: it was re-sorted into schema order), with every
+/// option.
+#[test]
+fn dump_sequence_last_beside_virtual_tables() {
+    let s1 = "CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, v); INSERT INTO ai(v) VALUES(1); \
+        CREATE VIRTUAL TABLE g USING rtree(id, x0, x1); INSERT INTO g VALUES(1,2,3); \
+        CREATE TABLE later(x); INSERT INTO later VALUES(5); \
+        CREATE VIRTUAL TABLE g2 USING rtree(id, x0, x1)";
+    let s2 = "CREATE VIRTUAL TABLE g USING rtree(id, x0, x1); \
+        CREATE TABLE ai(id INTEGER PRIMARY KEY AUTOINCREMENT, v); INSERT INTO ai(v) VALUES(1); \
+        CREATE VIRTUAL TABLE g2 USING rtree(id, x0, x1); INSERT INTO g2 VALUES(1,2,3)";
+    for s in [s1, s2] {
+        for o in [
+            "",
+            "--data-only",
+            "--preserve-rowids",
+            "--nosys",
+            "--data-only --preserve-rowids",
+            "ai",
+            "g%",
+            "sqlite%",
+        ] {
+            same("dumpseq", &[":memory:", s, &format!(".dump {o}")]);
+        }
+    }
+}
+
+/// Argument parsing details (review fixes): a line of only `.` is
+/// nothing and a blank after the `.` is skipped, as the pin tokenizes
+/// from the second character; a `\0` escape ends a quoted argument;
+/// the `.read` nesting limit counts standard input as a level; `.mode`
+/// to a mode that writes no separator keeps the separators `.show`
+/// shows.
+#[test]
+fn dot_line_details_match_pin() {
+    same_stdin(
+        "dot",
+        &[":memory:"],
+        ".\nselect 1;\n. \n. print hi\n.\"print\" x\n..print\n.  ;\n.;\n. ;\nselect 2;\n",
+    );
+    for l in [".", ". print a", ".;", "..x"] {
+        same("dotarg", &[":memory:", l, "select 3"]);
+    }
+    same_stdin(
+        "nul",
+        &[":memory:"],
+        ".print \"a\\0b\" c\n.nullvalue \"N\\0X\"\nselect null;\n\
+         .separator \"\\x41\" \"\\0\"\nselect 1, 2; select 3;\n.print \"\\x00z\" \"q\\000r\"\n.show\n",
+    );
+    // `.read` of a file that reads itself: 24 levels under standard
+    // input, 25 from a command-line argument.
+    let setup = [("self.sql", ".print in\n.read self.sql\n")];
+    check(
+        "nest",
+        &[":memory:"],
+        ".read self.sql\n",
+        &setup,
+        Err::Exact,
+    );
+    check(
+        "nestarg",
+        &[":memory:", ".read self.sql"],
+        "",
+        &setup,
+        Err::Exact,
+    );
+    // Every mode after every mode, then after `.separator`: `.show`.
+    let mut script = String::new();
+    for a in MODES {
+        for b in MODES {
+            script.push_str(&format!(
+                ".mode {a}\n.mode {b}\n.show\n.separator ; X\n.nullvalue NN\n.mode {b}\n.show\n\
+                 .mode\n.mode list\n.separator | \"\\n\"\n.nullvalue \"\"\n"
+            ));
+        }
+    }
+    same_stdin("modeseps", &[":memory:"], &script);
+}
+
+/// The pin's command-line forms of the settings (review fix: refused):
+/// `-csv`, `-box`, ..., `-header` / `-noheader`, `-separator`,
+/// `-newline`, `-nullvalue`, `-cmd`, `-bail`, `-echo`, `-batch`,
+/// `-noinit`; the `missing argument` and `unknown option` errors.
+#[test]
+fn command_line_options_match_pin() {
+    let runs: &[&[&str]] = &[
+        &["-csv", "-header", ":memory:", "select 1 as x, 'a,b' as y"],
+        &["-separator"],
+        &["-newline"],
+        &["-nullvalue"],
+        &["-cmd"],
+        &["-A"],
+        &["-zip"],
+        &["-insert"],
+        &["-separator", ";", "-csv", ":memory:", "select 1,2"],
+        &["-csv", "-separator", ";", ":memory:", "select 1,2"],
+        &["-separator", "\\t", ":memory:", "select 1,2"],
+        &["-newline", "X", ":memory:", "select 1; select 2"],
+        &["-nullvalue", "N", ":memory:", "select null"],
+        &["-header", "-noheader", ":memory:", "select 1 as a"],
+        &[":memory:", "-header", "select 1 as a"],
+        &["--csv", ":memory:", "select 1,2"],
+        &["-box", ":memory:", "select 1 as a"],
+        &["-line", ":memory:", "select 1 as a, 2 as bb"],
+        &["-markdown", "-header", ":memory:", "select 1 as a"],
+        &["-tabs", ":memory:", "select 1, 'a b'"],
+        &["-ascii", ":memory:", "select 1,2"],
+        &["-quote", ":memory:", "select 'x', null"],
+        &["-table", ":memory:", "select 1 as a"],
+        &["-column", ":memory:", "select 1 as a"],
+        &["-json", ":memory:", "select 1 as a"],
+        &["-list", "-header", ":memory:", "select 1 as a"],
+        &["-noinit", ":memory:", "select 1"],
+        &["-batch", ":memory:", "select 1"],
+        &[
+            "-cmd",
+            ".mode csv",
+            "-cmd",
+            "select 5",
+            ":memory:",
+            "select 1,2",
+        ],
+        &["-cmd", ".bogus", ":memory:", "select 1"],
+        &["-bail", "-cmd", ".bogus", ":memory:", "select 1"],
+        &["-cmd", ".mode bogus", ":memory:", "select 1"],
+        &["-cmd", ".headers on", ":memory:", "select 3 as z"],
+        &["-cmd", ".exit 3", ":memory:", "select 1"],
+        &["-cmd", ".quit", ":memory:", "select 1"],
+        &["-echo", ":memory:", "select 1", ".print hi"],
+        &["-echo", "-cmd", ".print a", ":memory:", ".print b"],
+        &["-bail", ":memory:", "select 1", ".bogus", "select 2"],
+    ];
+    for a in runs {
+        same("opts", a);
+    }
+    same_stdin(
+        "optsin",
+        &["-cmd", ".mode csv", "-header", ":memory:"],
+        "select 7 as n, 'a,b';\n",
+    );
+    same_stdin("optsbail", &["-bail", ":memory:"], ".bogus\nselect 1;\n");
 }

@@ -180,12 +180,16 @@ impl Default for Settings {
 
 impl Settings {
     /// `.mode NAME`: the mode's separators and NULL text (titles,
-    /// widths and the insert table stay).
+    /// widths and the insert table stay). The modes that write no
+    /// separator (the columnar ones, json, insert) keep the ones set
+    /// before, as `.show` shows on the pin.
     pub fn set_mode(&mut self, m: Mode) {
         let (c, r, n) = m.defaults();
         self.mode = m;
-        self.colsep = c.to_vec();
-        self.rowsep = r.to_vec();
+        if !m.columnar() && !matches!(m, Mode::Json | Mode::Insert) {
+            self.colsep = c.to_vec();
+            self.rowsep = r.to_vec();
+        }
         self.null = n.to_vec();
     }
 
@@ -303,12 +307,20 @@ pub fn c_string(s: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The pin's display escape: a byte below 0x20 other than tab and
-/// newline in caret notation (`^A`), everything else as is.
+/// The pin's display escape: a byte below 0x20 other than tab,
+/// newline and the `\r` of a `\r\n` in caret notation (`^A`),
+/// everything else as is.
 fn escape(b: &[u8]) -> Vec<u8> {
+    escape_cr(b, true)
+}
+
+/// `escape`, with `keep_crlf` false every `\r` escaped (the columnar
+/// modes, which have already made each `\r\n` a line break).
+fn escape_cr(b: &[u8], keep_crlf: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
-    for &c in b {
-        if c < 0x20 && c != b'\t' && c != b'\n' {
+    for (i, &c) in b.iter().enumerate() {
+        let crlf = keep_crlf && c == b'\r' && b.get(i + 1) == Some(&b'\n');
+        if c < 0x20 && c != b'\t' && c != b'\n' && !crlf {
             out.push(b'^');
             out.push(c + 0x40);
         } else {
@@ -541,20 +553,33 @@ impl<'s> Emit<'s> {
                 b.push(b'}');
             }
             Mode::Line => {
-                let w = self
-                    .names
-                    .iter()
-                    .map(|n| width(&escape(n)))
-                    .max()
-                    .unwrap_or(0);
+                // The names' column: as wide as the widest name with
+                // its control characters taking no room; each name is
+                // then cut to that width, a control character taking
+                // one column (written as is, not as `^X`), and padded
+                // on the left (the pin's line mode, probed: `x\ry`
+                // beside `z` prints `x\r`).
+                let w = self.names.iter().map(|n| width_bare(n)).max().unwrap_or(0);
                 if !first {
                     b.push(b'\n');
                 }
                 let indent = w + width(&s.colsep);
                 for (n, v) in self.names.iter().zip(vals) {
-                    let n = escape(n);
-                    b.resize(b.len() + w.saturating_sub(width(&n)), b' ');
-                    b.extend_from_slice(&n);
+                    let (mut i, mut used) = (0, 0);
+                    while i < n.len() {
+                        let (len, cw) = match next_char(n, i) {
+                            _ if let Some(k) = csi_len(n, i) => (k, 0),
+                            _ if n[i] < 0x20 => (1, 1),
+                            c => c,
+                        };
+                        if used + cw > w {
+                            break;
+                        }
+                        used += cw;
+                        i += len;
+                    }
+                    b.resize(b.len() + (w - used), b' ');
+                    b.extend_from_slice(&n[..i]);
                     b.extend_from_slice(&s.colsep);
                     let d = display(v, &s.null);
                     for (i, l) in lines(&d).iter().enumerate() {
@@ -569,6 +594,59 @@ impl<'s> Emit<'s> {
             _ => {}
         }
     }
+}
+
+/// `\r\n` as `\n`: the columnar modes break a cell's line there (the
+/// `\r` dropped).
+fn crlf(b: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !b.windows(2).any(|w| w == b"\r\n") {
+        return std::borrow::Cow::Borrowed(b);
+    }
+    let mut out = Vec::with_capacity(b.len());
+    for (i, &c) in b.iter().enumerate() {
+        if !(c == b'\r' && b.get(i + 1) == Some(&b'\n')) {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The display width of `b` with its control characters (below 0x20)
+/// and its complete ANSI CSI sequences (`ESC [ 3 1 m`) taking no room.
+fn width_bare(b: &[u8]) -> usize {
+    let mut i = 0;
+    let mut w = 0;
+    while i < b.len() {
+        if let Some(k) = csi_len(b, i) {
+            i += k;
+            continue;
+        }
+        let (n, cw) = next_char(b, i);
+        if b[i] >= 0x20 {
+            w += cw;
+        }
+        i += n;
+    }
+    w
+}
+
+/// The length of the ANSI CSI sequence at `i` (`ESC [`, parameter
+/// bytes 0x30-0x3f, intermediate bytes 0x20-0x2f, a final byte
+/// 0x40-0x7e), if a complete one starts there.
+fn csi_len(b: &[u8], i: usize) -> Option<usize> {
+    if b.get(i..i + 2) != Some(b"\x1b[") {
+        return None;
+    }
+    let mut j = i + 2;
+    while b.get(j).is_some_and(|c| (0x30..=0x3f).contains(c)) {
+        j += 1;
+    }
+    while b.get(j).is_some_and(|c| (0x20..=0x2f).contains(c)) {
+        j += 1;
+    }
+    b.get(j)
+        .is_some_and(|c| (0x40..=0x7e).contains(c))
+        .then_some(j + 1 - i)
 }
 
 /// A cell's lines: split at each newline, a final newline ending the
@@ -816,8 +894,9 @@ fn columnar(set: &Settings, names: &[Vec<u8>], rows: &[Vec<Val>], b: &mut Vec<u8
             w < 0,
         )
     };
+    // (A `\r\n` in a name or a text breaks the line, as a `\n` does.)
     let mut head: Vec<Cell> = (0..ncol)
-        .map(|i| Cell::new(&escape(&names[i]), false))
+        .map(|i| Cell::new(&escape_cr(&crlf(&names[i]), false), false))
         .collect();
     let mut body: Vec<Vec<Cell>> = rows
         .iter()
@@ -825,7 +904,12 @@ fn columnar(set: &Settings, names: &[Vec<u8>], rows: &[Vec<Val>], b: &mut Vec<u8
             (0..ncol)
                 .map(|i| {
                     let v = r.get(i).unwrap_or(&Val::Null);
-                    Cell::new(&display(v, &set.null), fixed(i).1 || v.is_num())
+                    let d = match v {
+                        Val::Text(t) => escape_cr(&crlf(c_text(t)), false),
+                        Val::Blob(t) => escape_cr(&crlf(t), false),
+                        v => display(v, &set.null),
+                    };
+                    Cell::new(&d, fixed(i).1 || v.is_num())
                 })
                 .collect()
         })

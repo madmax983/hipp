@@ -116,6 +116,12 @@ impl Ctx {
     }
 }
 
+/// Whether an open error says the file is not a database (the pin's
+/// `SQLITE_NOTADB`, which it reports only once a page is read).
+fn not_a_database(e: &str) -> bool {
+    matches!(e, "BadMagic" | "TruncatedHeader" | "UnsupportedPageSize")
+}
+
 /// What the input loop does after a dot-command.
 pub enum Flow {
     Continue,
@@ -253,10 +259,14 @@ fn resolve_backslashes(z: &[u8]) -> Vec<u8> {
 }
 
 /// A dot-command line's arguments as the pin's `do_meta_command` splits
-/// them: blank-separated words; a word starting with `'` or `"` runs to
-/// its closing quote (a `"..."` word with its backslash escapes
-/// resolved). Each with the offset of its first character in the line.
-/// A trailing `;` (after trailing blanks) is not part of the command.
+/// them: blank-separated words after the leading `.` (so `. print x`
+/// is `.print x`, and a line of only `.` has none); a word starting
+/// with `'` or `"` runs to its closing quote (a `"..."` word with its
+/// backslash escapes resolved, and cut at the first NUL one makes, as
+/// the pin's C strings are). Each with the offset of its first
+/// character in the line. A trailing `;` (after trailing blanks) is not
+/// part of the command. The first word is the command's name, without
+/// the `.`.
 pub fn tokens(line: &str) -> Vec<(String, usize)> {
     raw_tokens(line)
         .into_iter()
@@ -273,7 +283,7 @@ pub fn raw_tokens(line: &str) -> Vec<(Vec<u8>, usize)> {
     }
     let b = z.as_bytes();
     let mut out = Vec::new();
-    let mut h = 0;
+    let mut h = usize::from(b.first() == Some(&b'.'));
     loop {
         while h < b.len() && b[h].is_ascii_whitespace() {
             h += 1;
@@ -293,7 +303,11 @@ pub fn raw_tokens(line: &str) -> Vec<(Vec<u8>, usize)> {
             }
             let word = &b[start..h.min(b.len())];
             let word = if delim == b'"' {
-                resolve_backslashes(word)
+                let mut w = resolve_backslashes(word);
+                if let Some(nul) = w.iter().position(|c| *c == 0) {
+                    w.truncate(nul);
+                }
+                w
             } else {
                 word.to_vec()
             };
@@ -343,9 +357,9 @@ const COMMANDS: &[(&str, usize)] = &[
     ("width", 2),
 ];
 
-/// The command a dot-command's first word names, if hipp has it.
-pub fn command(word: &str) -> Option<&'static str> {
-    let w = word.strip_prefix('.')?;
+/// The command a dot-command's first word (its name, without the `.`)
+/// names, if hipp has it.
+pub fn command(w: &str) -> Option<&'static str> {
     COMMANDS
         .iter()
         .find(|(name, min)| w.len() >= *min && name.starts_with(w))
@@ -460,8 +474,21 @@ pub struct Shell {
     pub io: Io,
     pub ctx: Ctx,
     depth: usize,
+    /// The input levels below the first `.read`: 1 when the session
+    /// reads standard input (the pin counts that `process_input` toward
+    /// its nesting limit of 25), 0 for the command-line arguments.
+    pub base: usize,
     /// Standard input is a terminal: prompts before each line.
     pub interactive: bool,
+    /// The exit status a failed one-shot argument ends with, when not
+    /// 1 (`.fullschema` on a file that is not a database: 26).
+    pub fail_code: Option<u8>,
+    /// The databases (`main`, attached names) a write transaction the
+    /// pin would hold has touched (`track_txn`).
+    wtx: Vec<String>,
+    /// The line of the input being read (kept under a command-line
+    /// argument too, whose errors are named by the argument).
+    line: usize,
 }
 
 impl Shell {
@@ -482,7 +509,11 @@ impl Shell {
             },
             ctx: Ctx::Line(None, 0),
             depth: 0,
+            base: 0,
             interactive: false,
+            fail_code: None,
+            wtx: Vec::new(),
+            line: 0,
         }
     }
 
@@ -611,6 +642,7 @@ impl Shell {
                 Some(Db::Mem(c)) => block_on(crate::run_statement(c, s.trim_start(), &mut self.io)),
                 None => Ok(()),
             };
+            self.track_txn(s.trim_start(), r.is_ok());
             if let Err(e) = r {
                 eprintln!("Error: {e}");
                 res = Err(Failed);
@@ -644,6 +676,91 @@ impl Shell {
         res
     }
 
+    /// Follow the write transactions the pin opens where hipp writes
+    /// nothing, so a fresh file gets its page 1 as on the pin when one
+    /// commits (`lazy::LazyFile::commit_empty`): `BEGIN IMMEDIATE` /
+    /// `EXCLUSIVE` (every database file), `PRAGMA [schema.]
+    /// incremental_vacuum`, and `schema_version` / `default_cache_size`
+    /// set (that schema's file). Ended by a `ROLLBACK` (or a failed
+    /// statement) they write nothing.
+    fn track_txn(&mut self, stmt: &str, ok: bool) {
+        let Some(Db::File(c)) = self.db.as_mut() else {
+            return;
+        };
+        let word: String = stmt
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if ok && (word == "begin" || word == "pragma") {
+            let arena = hipp::arena::Arena::new(hipp::Scope::Statement, 0, 1 << 20);
+            let ast = hipp::sql::parser::parse::<()>(
+                stmt.as_bytes(),
+                &arena,
+                hipp::sql::parser::Limits::PIN,
+            );
+            match ast {
+                Ok(hipp::sql::ast::Ast::BeginImmediate) => {
+                    self.wtx.push("main".to_string());
+                    let mut i = 0;
+                    while let Some((n, _)) = c.attached_db(i) {
+                        self.wtx
+                            .push(String::from_utf8_lossy(n).to_ascii_lowercase());
+                        i += 1;
+                    }
+                }
+                Ok(hipp::sql::ast::Ast::Pragma {
+                    schema,
+                    name,
+                    value,
+                    ..
+                }) => {
+                    let text = |h: hipp::arena::ABytes| {
+                        arena
+                            .slice_at(h.pos as usize, h.len as usize)
+                            .unwrap_or(&[])
+                            .to_ascii_lowercase()
+                    };
+                    let name = text(name);
+                    let writes = name == b"incremental_vacuum"
+                        || (value.is_some()
+                            && (name == b"schema_version" || name == b"default_cache_size"));
+                    let db = schema.map_or_else(
+                        || "main".to_string(),
+                        |s| String::from_utf8_lossy(&text(s)).into_owned(),
+                    );
+                    if writes && db != "temp" {
+                        self.wtx.push(db);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.wtx.is_empty() || c.in_explicit_transaction() {
+            return;
+        }
+        let dbs = std::mem::take(&mut self.wtx);
+        if !ok || word == "rollback" {
+            return;
+        }
+        for d in dbs {
+            if d == "main" {
+                // (Its page size and encoding are fixed from now on, as
+                // after the pin's commit.)
+                c.pager_mut().fix_layout();
+                c.storage().commit_empty();
+                continue;
+            }
+            let mut i = 0;
+            while let Some((n, a)) = c.attached_db(i) {
+                if n.eq_ignore_ascii_case(d.as_bytes()) {
+                    a.storage().commit_empty();
+                }
+                i += 1;
+            }
+        }
+    }
+
     /// One dot-command line.
     pub fn meta(&mut self, line: &str) -> Result<Flow, Failed> {
         let r = self.meta_inner(line);
@@ -658,8 +775,7 @@ impl Shell {
         };
         let Some(cmd) = command(word) else {
             eprintln!(
-                "Error: unknown command or invalid arguments:  \"{}\". Enter \".help\" for help",
-                word.get(1..).unwrap_or("")
+                "Error: unknown command or invalid arguments:  \"{word}\". Enter \".help\" for help"
             );
             return Err(Failed);
         };
@@ -982,6 +1098,9 @@ impl Shell {
                 self.db = Some(d);
                 Ok(())
             }
+            // (The pin's `.open` reads no page: the file's error comes
+            // with the first command that does, as at start-up.)
+            Err(e) if not_a_database(&e) => Ok(()),
             Err(e) => {
                 // The pin carries on with an in-memory database.
                 self.db = crate::open_db(":memory:").ok();
@@ -999,6 +1118,33 @@ impl Shell {
     fn db_meta(&mut self, cmd: &str, line: &str, args: &[(String, usize)]) -> Result<Flow, Failed> {
         crate::db_precheck(cmd, args, &|off, msg| self.caret(line, off, msg, None))?;
         if let Err(e) = self.db() {
+            // A file that is not a database: the pin opens it without
+            // reading it, so the commands that need no page of it, or
+            // shrug off the error, carry on (v0.17 review fix).
+            if not_a_database(&e) {
+                match cmd {
+                    "tables" | "indexes" => return Ok(Flow::Continue),
+                    "limits" => {
+                        let a: Vec<&str> = args.iter().map(|(s, _)| s.as_str()).collect();
+                        return crate::limits(&a, &mut self.io.out).map(|()| Flow::Continue);
+                    }
+                    "databases" => {
+                        // (The file's full name as `FileStorage` makes it.)
+                        let full = std::fs::canonicalize(&self.path)
+                            .unwrap_or_else(|_| std::path::PathBuf::from(&self.path));
+                        let _ = writeln!(self.io.out, "main: {} r/w", full.display());
+                        return Ok(Flow::Continue);
+                    }
+                    "fullschema" => {
+                        // (Its statistics query fails: SQLITE_NOTADB,
+                        // 26, the one-shot exit status.)
+                        let _ = self.io.out.write_all(b"/* No STAT tables available */\n");
+                        self.fail_code = Some(26);
+                        return Err(Failed);
+                    }
+                    _ => {}
+                }
+            }
             eprintln!("Error: {e}");
             return Err(Failed);
         }
@@ -1033,15 +1179,18 @@ impl Shell {
     }
 
     fn read_from(&mut self, input: impl BufRead, name: &str) -> Result<Flow, Failed> {
-        if self.depth >= 25 {
+        if self.depth + self.base >= 25 {
+            // (The line of the `.read` in the file that holds it, also
+            // under a command-line argument.)
             let at = match &self.ctx {
                 Ctx::Line(_, n) => *n,
-                Ctx::Argv(_) => 1,
+                Ctx::Argv(_) => self.line.max(1),
             };
             eprintln!("{name}: Input nesting limit (25) reached at line {at}. Check recursion.");
             return Err(Failed);
         }
         let saved = self.ctx.clone();
+        let saved_line = self.line;
         self.depth += 1;
         let file_ctx = match &saved {
             Ctx::Argv(_) => None,
@@ -1050,6 +1199,7 @@ impl Shell {
         let (errs, flow) = self.process(input, file_ctx);
         self.depth -= 1;
         self.ctx = saved;
+        self.line = saved_line;
         match flow {
             Flow::Exit | Flow::ExitWith(_) => Ok(flow),
             _ if errs > 0 => Err(Failed),
@@ -1094,10 +1244,12 @@ impl Shell {
                 None => break,
             };
             lineno += 1;
+            self.line = lineno;
             if !argv {
                 self.ctx = Ctx::Line(file.clone(), lineno);
             }
-            let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
+            // (`lines` drops the `\n` and one `\r` before it, as the
+            // pin's `local_getline` does.)
             if sql.is_empty() {
                 let s = Scan::default().line(&line);
                 if s.white() {

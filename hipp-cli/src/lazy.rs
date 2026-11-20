@@ -9,7 +9,9 @@
 //! read from there; it reaches the file, with whatever else has been
 //! written since, at the first write that leaves the image something
 //! other than a fresh empty database (`pager::initial_page1` for its
-//! page size). Everything else — sidecars, locks, the file's name,
+//! page size), or until the shell reports a committed write
+//! transaction the pin would have opened (`commit_empty`). Everything
+//! else — sidecars, locks, the file's name,
 //! attached databases — is the wrapped storage's. The library is not
 //! changed: this is the shell's storage.
 
@@ -23,6 +25,11 @@ pub struct LazyFile {
     /// The file was empty when opened (so the pager's first write may
     /// be held back).
     fresh: bool,
+    /// A write transaction committed over the held image (the pin
+    /// writes page 1 then, even when the transaction changed nothing:
+    /// `BEGIN IMMEDIATE; COMMIT;`, `PRAGMA incremental_vacuum`): the
+    /// image reaches the file however it stands (v0.17 review fix).
+    keep: std::cell::Cell<bool>,
 }
 
 impl LazyFile {
@@ -32,7 +39,15 @@ impl LazyFile {
             fs,
             pending: None,
             fresh,
+            keep: std::cell::Cell::new(false),
         }
+    }
+
+    /// A write transaction the pin would have opened on this file
+    /// committed: a held fresh image is written to the file (when the
+    /// storage is dropped, if nothing writes it before).
+    pub fn commit_empty(&self) {
+        self.keep.set(true);
     }
 
     /// Whether `img` starts with a fresh page 1 for its page size,
@@ -77,7 +92,7 @@ impl Drop for LazyFile {
         if self
             .pending
             .as_deref()
-            .is_some_and(|i| !LazyFile::untouched(i))
+            .is_some_and(|i| self.keep.get() || !LazyFile::untouched(i))
         {
             let _ = hipp::storage::block_on(self.flush());
         }

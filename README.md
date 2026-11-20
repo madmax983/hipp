@@ -81,8 +81,13 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   parsing, command prefixes and error messages; `.dump --data-only`,
   `--nosys`, `--preserve-rowids`, `--newlines`; a new database file
   left at 0 bytes until it is written; `-version` in the pin's layout
-  with hipp's name in the source id's place. Each byte for byte with
-  the live pin's shell (`hipp-cli/tests/cli_v17_shell.rs`). Still
+  with hipp's name in the source id's place. Review fixes: `.schema
+  --indent` / `--nosys` / LIKE and GLOB patterns, `\r\n` in columnar
+  cells and line-mode names, a fresh file written by a write
+  transaction that changes nothing, the pin's lazy open of a file that
+  is not a database, the command-line forms of the settings (`-csv`,
+  `-header`, `-separator`, `-cmd`, `-bail`, ...). Each byte for byte
+  with the live pin's shell (`hipp-cli/tests/cli_v17_shell.rs`). Still
   open (STATUS.md): the pin's other commands, modes and options
   (refused by name), the pin's SQL error texts.
 - **Index and rowid access into attached and TEMP tables** (unit
@@ -1703,8 +1708,11 @@ and `cargo test --workspace`.
 A std binary shell (`hipp-cli/`, decision D4): interactive,
 stdin-batch and one-shot modes with output byte-diffable against the
 pinned oracle CLI, the pin shell's command line (v0.17: `hipp
-[OPTIONS] [FILENAME [SQL...]]`, `-help`, `-version`, `--`; the pin's
-other options are refused), plus `.tables`, `.schema`, `.dump` (v0.17:
+[OPTIONS] [FILENAME [SQL...]]`, `-help`, `-version`, `--`, the mode
+options (`-csv`, `-box`, ...), `-header` / `-noheader`, `-separator`,
+`-newline`, `-nullvalue`, `-cmd`, `-bail`, `-echo`, `-batch`,
+`-noinit`; the pin's other options are refused), plus `.tables`,
+`.schema` (v0.17: `--indent`, `--nosys`, LIKE / GLOB patterns), `.dump` (v0.17:
 `--data-only`, `--nosys`, `--preserve-rowids`, `--newlines`), `.open`,
 `.databases` (v0.16, with attached databases in `.schema` /
 `.tables`), `.parameter` (v0.16: `set`, `unset`, `clear`, `list`,

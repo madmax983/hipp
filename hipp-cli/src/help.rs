@@ -268,27 +268,71 @@ pub fn help(pattern: Option<&str>) -> String {
     out
 }
 
+/// The characters of `b` as SQLite's pattern matcher reads them: a
+/// complete UTF-8 sequence as its code point, any other byte as itself.
+fn chars(b: &[u8]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let need = match c {
+            0xc0..=0xdf => 1,
+            0xe0..=0xef => 2,
+            0xf0..=0xf7 => 3,
+            _ => 0,
+        };
+        let tail = b
+            .get(i + 1..i + 1 + need)
+            .filter(|t| t.iter().all(|x| x & 0xc0 == 0x80));
+        match tail {
+            Some(t) if need > 0 => {
+                let mut cp = u32::from(c) & (0x3f >> need);
+                for x in t {
+                    cp = (cp << 6) | u32::from(x & 0x3f);
+                }
+                out.push(cp);
+                i += need + 1;
+            }
+            _ => {
+                out.push(u32::from(c));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// SQLite's GLOB (`*`, `?`, `[...]` with ranges and `^`), case
-/// sensitive.
+/// sensitive, one character a UTF-8 sequence.
 pub fn glob(p: &[u8], s: &[u8]) -> bool {
+    glob_cp(&chars(p), &chars(s))
+}
+
+fn glob_cp(p: &[u32], s: &[u32]) -> bool {
+    const STAR: u32 = b'*' as u32;
+    const ANY: u32 = b'?' as u32;
+    const OPEN: u32 = b'[' as u32;
+    const CLOSE: u32 = b']' as u32;
     match p.first() {
         None => s.is_empty(),
-        Some(b'*') => (0..=s.len()).any(|i| glob(&p[1..], &s[i..])),
-        Some(b'?') => !s.is_empty() && glob(&p[1..], &s[1..]),
-        Some(b'[') => {
+        Some(&STAR) => (0..=s.len()).any(|i| glob_cp(&p[1..], &s[i..])),
+        Some(&ANY) => !s.is_empty() && glob_cp(&p[1..], &s[1..]),
+        Some(&OPEN) => {
             let Some(&c) = s.first() else {
                 return false;
             };
             let mut i = 1;
-            let neg = p.get(i) == Some(&b'^');
+            let neg = p.get(i) == Some(&u32::from(b'^'));
             if neg {
                 i += 1;
             }
             let mut hit = false;
             let mut first = true;
-            while i < p.len() && (first || p[i] != b']') {
+            while i < p.len() && (first || p[i] != CLOSE) {
                 first = false;
-                if p.get(i + 1) == Some(&b'-') && p.get(i + 2).is_some_and(|e| *e != b']') {
+                if p.get(i + 1) == Some(&u32::from(b'-'))
+                    && p.get(i + 2).is_some_and(|e| *e != CLOSE)
+                {
                     if p[i] <= c && c <= p[i + 2] {
                         hit = true;
                     }
@@ -303,18 +347,42 @@ pub fn glob(p: &[u8], s: &[u8]) -> bool {
             if i >= p.len() {
                 return false;
             }
-            hit != neg && glob(&p[i + 1..], &s[1..])
+            hit != neg && glob_cp(&p[i + 1..], &s[1..])
         }
-        Some(&c) => s.first() == Some(&c) && glob(&p[1..], &s[1..]),
+        Some(&c) => s.first() == Some(&c) && glob_cp(&p[1..], &s[1..]),
     }
 }
 
 /// SQLite's LIKE (`%`, `_`), ASCII case-insensitive, no escape.
 pub fn like(p: &[u8], s: &[u8]) -> bool {
+    like_esc(p, s, None)
+}
+
+/// SQLite's LIKE with an `ESCAPE` character: `%` any run, `_` one
+/// character (a UTF-8 sequence), ASCII letters matching either case,
+/// the escape character making the next one literal (a pattern that
+/// ends on it matches nothing).
+pub fn like_esc(p: &[u8], s: &[u8], esc: Option<u8>) -> bool {
+    like_cp(&chars(p), &chars(s), esc.map(u32::from))
+}
+
+fn like_cp(p: &[u32], s: &[u32], esc: Option<u32>) -> bool {
+    let fold = |c: u32| {
+        if (u32::from(b'A')..=u32::from(b'Z')).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    };
+    let same = |a: u32, b: Option<&u32>| b.is_some_and(|&b| fold(a) == fold(b));
     match p.first() {
         None => s.is_empty(),
-        Some(b'%') => (0..=s.len()).any(|i| like(&p[1..], &s[i..])),
-        Some(b'_') => !s.is_empty() && like(&p[1..], &s[1..]),
-        Some(&c) => s.first().is_some_and(|d| d.eq_ignore_ascii_case(&c)) && like(&p[1..], &s[1..]),
+        Some(&c) if Some(c) == esc => match p.get(1) {
+            None => false,
+            Some(&l) => same(l, s.first()) && like_cp(&p[2..], &s[1..], esc),
+        },
+        Some(&c) if c == u32::from(b'%') => (0..=s.len()).any(|i| like_cp(&p[1..], &s[i..], esc)),
+        Some(&c) if c == u32::from(b'_') => !s.is_empty() && like_cp(&p[1..], &s[1..], esc),
+        Some(&c) => same(c, s.first()) && like_cp(&p[1..], &s[1..], esc),
     }
 }
