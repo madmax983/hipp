@@ -224,7 +224,12 @@ justify_over = 16384
 # special cases), co-routine GROUP BY + ORDER BY order, the partly
 # delivered ORDER BY's LIMIT stop, names as text handles, the CTE
 # limit's cursor count.
-ratchet = 986232
+# 986,232 -> 989,024 (v0.17 attach_access, `attach` leaf; STATUS.md): +2,792 B.
+# Seeks into attached / TEMP tables through their own catalog and pager:
+# the TEMP pager's arm of each access-path B-tree call (~880 B), the owner
+# lookups and plan checks, the attached table's defaults / hint, EQP's
+# per-source catalog. No offsetting saving found.
+ratchet = 989024
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -315,7 +320,9 @@ justify_over = 32768
 # special cases), co-routine GROUP BY + ORDER BY order, the partly
 # delivered ORDER BY's LIMIT stop, names as text handles, the CTE
 # limit's cursor count.
-ratchet = 1089500
+# 1,089,500 -> 1,092,348 (v0.17 attach_access, `attach` leaf; STATUS.md):
+# +2,848 B, the `max` growth plus the join planner's owner lookups.
+ratchet = 1092348
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

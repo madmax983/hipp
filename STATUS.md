@@ -11,6 +11,188 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: attach_access — index and rowid access into attached and TEMP tables (2026-11-20)
+
+Wave 20's unit (owner decision 2026-11-20: SQLite 3.54.1 parity
+continues): the three ATTACH items the `attach` unit left open, each
+probed on the live pin first (notes below). Item 1 is closed; items 2
+and 3 stay open with the design and the blocker recorded. Everything
+new is behind the `attach` leaf (planning behind `expr_index` /
+`planner` as on main); no new leaf, and no path without the leaf
+changes (tiny and full Δ 0).
+
+**Shipped (item 1).** A statement of main that reads a table of an
+attached database or of the TEMP database plans and reads it as it
+plans a main table, through that database's own catalog and pager;
+the table is no longer copied into main and scanned once per outer
+row.
+- *Planning* (`xindex::Own`, `Connection::owner`): the access planner
+  (`plan_accesses_from`, `hint_checks`), the join planner
+  (`plan_join_body`: join order, automatic indexes, Bloom filters,
+  `sqlite_stat1` estimates of that database) and EXISTS-to-join ask
+  the owning connection — this one, an attached one (`Connection<S>`)
+  or the TEMP one (`Connection<MemStorage>`) — for the table's index
+  models, NOT NULL columns, row estimates and automatic-index
+  candidates. `plan_ext_source` now gives an attached rowid table its
+  root page, defaults (columns added by ALTER TABLE), generated
+  columns and `INDEXED BY` / `NOT INDEXED` hint (an unknown index is
+  the pin's "no such index"); `plan_temp_source` keeps the hint it
+  already checked. So rowid seeks, ranges and IN lists, index seeks
+  (multi-column, DESC, partial, expression, collated indexes),
+  covering indexes, index order for ORDER BY, min() / max(),
+  MULTI-INDEX OR, skip-scans and automatic indexes all apply, and a
+  join may be driven from the TEMP or attached table, as on the pin.
+- *Reading* (`on_db!` in `session::xindex`, `Connection::pager_of` /
+  `src_db` / `check_src`): every B-tree call of an access path
+  (`access_rows`, `access_walk`: the rowid tree, index seeks and
+  walks, skip-scans, OR branches, table lookups) goes through the
+  pager of the source's database; the plan's table and index are
+  checked to still be there first (as `scan_temp` checks). A source
+  without an access path, an OR branch without one and an automatic
+  index's scan read the table whole as before (`scan_source` now
+  dispatches to `scan_temp`). The executors (materialised, streamed,
+  join) take the access path before the whole-table read
+  (`planned_foreign`); the frozen VM (`--features vm`) reads such a
+  source through the driver's access-path and automatic-index readers,
+  as it reads a WITHOUT ROWID table (`host_kind`), so
+  `tests/vm_rest_v17.rs`'s TEMP / attached joins stay on the VM.
+- *EXPLAIN QUERY PLAN* (`eqp::Walk::cat_of` / `enter`): a loop over
+  another database's table names its indexes, key columns and
+  automatic-index keys from that database's catalog: `SEARCH aux.t
+  USING INTEGER PRIMARY KEY (rowid=?)`, `SEARCH temp.tt USING
+  COVERING INDEX tv (v=?)`, `SCAN aux.t USING INDEX tb`, `USING INDEX
+  tb FOR IN-OPERATOR`, `SEARCH aux.t EXISTS ...`, `BLOOM FILTER ON
+  aux.t (b=?)`, in the pin's join order.
+- *Locking*: a statement of main that reads an attached table marks
+  that database used at its first step (`lock_ext`, the pin's
+  OP_Transaction), so DETACH inside the transaction is "database is
+  locked" even when its seeks read no row (found by
+  `tests/attach_v16.rs`'s generated corpus once seeks replaced the
+  whole-table read: an `UPDATE main.t ... FROM b.u` over an empty
+  `t` left `b` unlocked).
+- Performance: the 3,000 x 3,000 correlated lookup of the v0.16 gap
+  (`SELECT (SELECT c FROM aux.t WHERE a = m.x) FROM m`) and a 3,000 x
+  3,000 join with a TEMP table took 15.6 s together in a debug build;
+  0.8 s now (`lookups_seek`: four 4,000-row lookups, bound 8 s).
+
+**Not closed (honest gaps, below).**
+- *Item 2 — TEMP triggers on main or attached tables, and TEMP
+  triggers writing another database's table.* Probed (as the
+  `attach` unit did): the pin fires `CREATE TEMP TRIGGER tr AFTER
+  INSERT ON m BEGIN INSERT INTO aux.t ...; END` inside the firing
+  statement's transaction, rolling back every database it wrote on
+  ABORT / RAISE. Design: a trigger program runs as statements of
+  the connection that fires it (`trigger::run_step` plans on
+  `self`); a TEMP program fired by a main write would instead run
+  through main's router with `NEW.` / `OLD.` written in as literals
+  of their affinity and collation (`TrigValue`), and the firing
+  statement would open a statement journal / savepoint on every
+  database the program touches (main, temp, each attached one),
+  release them together on success, roll them all back on ABORT /
+  RAISE(ABORT) / a constraint error, and commit through the
+  super-journal when it autocommits (`commit_all`), with
+  `recursive_triggers`, `changes()` frames and the OR conflict
+  clauses carried across. Blocker: that multi-database statement
+  transaction does not exist — a statement's journal is per pager and
+  only explicit transactions span databases — and building it (with
+  its crash tests) is a unit of its own, well past this wave's size
+  line. Unchanged: such triggers are refused at CREATE
+  (`Unsupported`).
+- *Item 3 — a write of an attached / TEMP table reading another
+  database's view; `pragma_integrity_check` / `pragma_quick_check` as
+  table-valued functions.* Probed: `UPDATE aux.t SET c = (SELECT y2
+  FROM mv WHERE mv.x = t.a)` (`mv` a main view) and `UPDATE tt SET v =
+  (SELECT y2 FROM mv ...)` run on the pin; `SELECT * FROM
+  pragma_integrity_check` answers `ok`, `pragma_integrity_check(2)`
+  is "no such table: 2", `pragma_integrity_check('aux')` "no such
+  table: aux" (the argument is a table name), `aux.pragma_quick_check`
+  checks `aux`. hipp refuses all of them (`Unsupported`). Blockers:
+  the attached database's statement receives other databases' tables
+  as external sources, whose columns carry affinities but a view's
+  rows would need its expansion planned on main and handed over
+  (a new external-source kind); a table-valued pragma is planned
+  synchronously from the catalog (`pragma_source`), and the integrity
+  check reads every B-tree asynchronously — it would have to run in
+  `prepare` before planning. Neither was started.
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin and
+`EXPLAIN QUERY PLAN`): the pin plans another database's table exactly
+as a main one — `SEARCH aux.t USING INTEGER PRIMARY KEY (rowid=?)`
+for a correlated lookup and a join, `(rowid>? AND rowid<?)` for
+BETWEEN, `USING INDEX tb (b=?)` / `USING COVERING INDEX tb (b=?)`,
+`SCAN aux.t USING INDEX tb` for ORDER BY b, `USING INDEX tb FOR
+IN-OPERATOR` for `y IN (SELECT b FROM aux.t)`, `SEARCH tt USING
+COVERING INDEX tv (v=?)` with the TEMP table first in `tt, m WHERE
+m.x = tt.k AND tt.v = 5` (then `SEARCH m USING INTEGER PRIMARY KEY`),
+automatic indexes and Bloom filters on attached / TEMP tables in
+correlated subqueries and joins, partial / expression / generated-
+column indexes, `INDEXED BY tc` / `NOT INDEXED`, and "no such index"
+for an unknown `INDEXED BY`. The loop names the table as written
+(`aux.t`, `temp.tt`, `t`, the alias). A WITHOUT ROWID attached table
+is also searched by its PRIMARY KEY (`SCAN aux.w`, `SEARCH m ...`
+driving from it); hipp still reads it whole (gap below). DETACH of a
+database a statement of the open transaction read is "database is
+locked" even when the statement read no row of it (`FROM e, aux.t`
+with `e` empty; `x IN (SELECT a FROM aux.t WHERE a = 9)`). Every
+remaining divergence of the generated corpus (below) shows the same
+on the pin with every table in main: hipp's planner differs there
+already (mostly automatic indexes the pin builds for correlated
+subqueries over a table with statistics, and some 3-way join orders).
+
+**Tests.** `tests/attach_access_v17.rs` (7 tests; every script on both
+engines in twin directories, statement by statement — rows, plans as
+the pin shell's tree, failing statements): the probed forms over an
+attached and the TEMP database (31 queries with plans: seeks, joins
+in both directions, correlated / IN / EXISTS subqueries, OR, LEFT
+JOIN, INDEXED BY, GROUP BY, ORDER BY ... LIMIT, max()), writes of
+main reading them and the DETACH locks (the regression above), row
+decoding (ALTER TABLE defaults, generated columns, covering entries,
+the WITHOUT ROWID table's rows), plans across DROP / CREATE INDEX and
+a re-created table, the performance bound, and a generated corpus
+(xorshift64: four tables in main, temp and two attached databases
+with random indexes, data, added columns, generated columns and
+ANALYZE; 25 queries each with plans; every script also run with all
+tables in main, and a statement whose all-main twin already differs
+is compared as a set of rows; 12 scripts by default,
+`HIPP_ACCESS_CORPUS=150` ran clean: 87 of 21,691 statements, 0.4%,
+compared as sets). `hipp-cli/tests/cli_v17_attach_access.rs` (2 tests,
+one-shot and stdin byte-identical: 14 plans with their rows, and
+writes). No new multi-database write path (item 2 not built), so
+`tests/crash.rs` is unchanged; it passes.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed. `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info on, with and without `--features
+vm`: pass (no `STACK_*` constant needed re-measuring).
+
+**Size Δ.** tiny 0 (76,928); full 0 (495,060); max +2,792 (986,232 →
+989,024); xl +2,848 (1,089,500 → 1,092,348). Ratchets raised to the
+measured figures (`ci/size-ratchet.toml`), far under wave 18's and
+19's 8-12 KB: the TEMP database's pager arm of each B-tree call of an
+access path (`on_db!`, about 880 B: the TEMP connection's pager is a
+`Pager<MemStorage>`, so each call is instantiated twice), the owner
+lookups and per-database checks (`owner`, `src_db`, `check_src`,
+`pager_of`, `lock_ext`), the attached table's defaults / generated
+columns / hint in `plan_ext_source`, and EXPLAIN QUERY PLAN's
+per-source catalog. Tried and dropped: one async method per B-tree
+call on `Pg` in place of the macro (+80 B more). No offsetting saving
+found in the code the unit touches.
+
+**Honest gaps.**
+- (open: item 2) TEMP triggers on main or attached tables, and TEMP
+  triggers writing another database's table, are refused
+  (`Unsupported`); see "Not closed" above.
+- (open: item 3) A write of an attached or TEMP table reading another
+  database's view, and `pragma_integrity_check` / `pragma_quick_check`
+  as table-valued functions, are refused (`Unsupported`).
+- A WITHOUT ROWID table of another database (and a WITHOUT ROWID TEMP
+  table, refused in a mixed statement as before) is still read whole
+  with no access path; a join with an attached one keeps FROM order.
+- A write of an attached or TEMP table reading *main's* (or a third
+  database's) tables still gets them as external sources read whole
+  (the child connection has no route to the other pagers); only
+  statements of main seek into other databases.
+
 ### Parity: result_gaps — review fixes (2026-11-18)
 
 Six review findings on `result_gaps` (404d6ab), each reproduced and
@@ -559,16 +741,16 @@ out-of-line `att_source` and one boxed future per database measured no
 smaller and were not kept.
 
 **Honest gaps.**
-- (open: items 1 and 2) TEMP triggers on main or attached tables, and
+- (still open after v0.17 attach_access, its item 2) TEMP triggers on main or attached tables, and
   TEMP triggers writing another database's table (qualified or not),
   are refused (`Unsupported`) or fail when they fire; see "Not closed"
   above. Non-TEMP triggers' qualified writes are the pin's error
   ("qualified table names are not allowed ...", unchanged).
-- (open: item 5) No index or rowid access path into attached or TEMP
+- (closed in v0.17: attach_access, item 1 there) No index or rowid access path into attached or TEMP
   tables (read whole once per execution, scanned per outer row); EXPLAIN
   QUERY PLAN shows `SCAN`, and a join with such a table keeps FROM
   order.
-- A write of an attached (or the TEMP) database reading *another*
+- (still open after v0.17 attach_access, its item 3) A write of an attached (or the TEMP) database reading *another*
   database's view is refused (`Unsupported`): external sources are
   tables only (a view's rows would need its column affinities there).
   Reads on main (queries, INSERT into main) expand such views.
@@ -578,7 +760,8 @@ smaller and were not kept.
 - (closed in v0.17: attach review fixes) `UPDATE 't' SET 'a' = 5` (a
   string as a SET column name) does not parse (found along the way; not
   a qualifier).
-- `pragma_integrity_check` / `pragma_quick_check` as table-valued
+- (still open after v0.17 attach_access, its item 3)
+  `pragma_integrity_check` / `pragma_quick_check` as table-valued
   functions are refused (the v0.16 PRAGMA unit's gap, unchanged).
 - With a TEMP database every INSERT / UPDATE / DELETE is parsed once
   more by the ATTACH router (to find a TEMP write reading main).
@@ -13016,7 +13199,8 @@ statements run (and the temp UPDATE / DELETE refusal).
   temp database cannot read main, and only a whole SELECT can be fed
   across. TEMP triggers on main tables (and temp triggers whose
   bodies write main tables) stay refused, as before.
-- Temp tables read by a main statement are scanned in rowid order
+- (closed in v0.17: attach_access, except the WITHOUT ROWID refusal)
+  Temp tables read by a main statement are scanned in rowid order
   with no index access path (a temp index is not planned there, and
   `INDEXED BY` on them is checked only), so unordered output over a
   temp index can differ in order from the pin's; a WITHOUT ROWID
@@ -13657,12 +13841,13 @@ points (boxed futures).
 
 **Honest gaps:**
 
-- (still open in v0.17: `attach` unit, item 5) External sources are
+- (closed in v0.17: attach_access, for statements of main over rowid
+  tables) External sources are
   read whole, in rowid / key order, with no index access path: an unordered query whose pin plan walks an index
   of an attached table (or an `INSERT ... SELECT` without ORDER BY
   feeding one) can list rows in another order. `INDEXED BY` on such a
   source is not checked there.
-- A correlated subquery (or a join) over another database's table
+- (closed in v0.17: attach_access) A correlated subquery (or a join) over another database's table
   scans that table's rows once per evaluation; since the review fix
   they are read from the file once per execution and kept, but the
   scan stays linear per outer row (the review's 3000 x 3000 lookup:

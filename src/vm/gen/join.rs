@@ -828,6 +828,23 @@ fn host_kind<'p>(
         return None;
     }
     if sp.temp {
+        // (A table of another database with an access path, v0.17
+        // `attach`: the driver reads it as a WITHOUT ROWID table's,
+        // through that database's pager.)
+        #[cfg(feature = "expr_index")]
+        if let Some(a) = sp.access.as_deref() {
+            if !access_ok(a, width, nsrc) {
+                return Some(None);
+            }
+            #[cfg(feature = "planner")]
+            if let Some(ai) = a.auto.as_deref() {
+                return Some(Some(Kind::Auto(ai, true)));
+            }
+            return Some(Some(Kind::Host(
+                super::super::op::HOST_ACCESS,
+                a.lateral && !sp.kind.pads_left(),
+            )));
+        }
         return Some(Some(Kind::Host(HOST_SCAN, false)));
     }
     #[cfg(feature = "without_rowid")]

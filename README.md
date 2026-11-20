@@ -33,8 +33,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 495,060 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 986,232 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,089,500 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 989,024 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,092,348 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,26 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **Index and rowid access into attached and TEMP tables** (unit
+  `attach_access`, leaf `attach`). A statement of main that reads a
+  table of an attached database or of the TEMP database plans it with
+  that database's own catalog and reads it through that database's own
+  pager, as it does a main table: rowid and index seeks (ranges, IN
+  lists, partial / expression / collated indexes, covering indexes),
+  index order for ORDER BY, `INDEXED BY` / `NOT INDEXED`, MULTI-INDEX
+  OR, automatic indexes and Bloom filters, EXISTS-to-join and the
+  pin's join order (a join may be driven from the TEMP or attached
+  table); EXPLAIN QUERY PLAN prints the pin's lines (`SEARCH aux.t
+  USING INTEGER PRIMARY KEY (rowid=?)`, `SEARCH temp.tt USING COVERING
+  INDEX tv (v=?)`). A 3,000 x 3,000 correlated lookup into an attached
+  table no longer scans it per outer row (15.6 s for two such
+  statements in a debug build, 0.8 s now). A statement reading an
+  attached table locks it against DETACH from its first step. Still
+  open (STATUS.md): WITHOUT ROWID tables of another database (read
+  whole), writes of an attached / TEMP table reading other databases
+  (read whole), TEMP triggers across databases, another database's
+  view read by an attached / TEMP write, and `pragma_integrity_check`
+  as a table-valued function.
 - **Result-level gaps of wave 18** (unit `result_gaps`, ungated
   fixes). The pin's top-N sorter: under an ORDER BY with a LIMIT and
   no DISTINCT a row's ORDER BY key is computed first, and a row whose
@@ -115,8 +135,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   reads another database's same-named table by an unqualified name and
   other databases' tables by three-part names. Still open (STATUS.md):
   TEMP triggers on main or attached tables or writing another
-  database, index / rowid access paths into attached and TEMP tables,
-  and an attached or TEMP write reading another database's view.
+  database, and an attached or TEMP write reading another database's
+  view (index / rowid access into attached and TEMP tables: closed by
+  `attach_access` above).
 - **VALUES chains, lazy collations, inert aggregates** (unit
   `values_chain`, ungated fixes). A multi-row VALUES is the pin's
   `sqlite3MultiValues` row by row — a co-routine, or one-row selects
@@ -1214,9 +1235,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   database, WHEN clauses included) and the pin's unqualified-name
   order (temp, main, then attached in attach order). Not yet: TEMP
   triggers on main or attached tables, or writing schema-qualified
-  tables (refused cleanly), and index access paths into another
-  database's tables (they are read whole, once per execution). (v0.17
-  `attach` closed the string-literal qualifier, the integrity check
+  tables (refused cleanly). (v0.17 `attach_access` closed the index
+  and rowid access paths into another database's tables for statements
+  of main; v0.17 `attach` closed the string-literal qualifier, the integrity check
   over every database, attached views beside other databases' tables,
   TEMP writes reading other databases and same-named / three-part
   names in attached writes; see "What v0.17 does".) Each attached

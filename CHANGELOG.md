@@ -5,6 +5,27 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Index and rowid access into attached and TEMP tables (wave 20, unit `attach_access`)
+
+- `attach` leaf: a statement of main plans a rowid table of an
+  attached database or of the TEMP database with that database's
+  catalog (indexes, NOT NULL columns, `sqlite_stat1`) and reads it
+  through that database's pager (`Connection::owner` / `pager_of`):
+  rowid and index seeks, ranges, IN lists, covering, partial and
+  expression indexes, ORDER BY from an index, `INDEXED BY` / `NOT
+  INDEXED` (an unknown index is "no such index"), MULTI-INDEX OR,
+  automatic indexes, Bloom filters, EXISTS-to-join and the join order;
+  EXPLAIN QUERY PLAN names that database's indexes. Before, such a
+  table was read whole and scanned per outer row in FROM order.
+- A statement of main that reads an attached table locks it against
+  DETACH from its first step, even when its seeks read no row.
+- Still open: WITHOUT ROWID tables of another database, writes of an
+  attached / TEMP table reading other databases, TEMP triggers across
+  databases, views of another database read by such writes,
+  `pragma_integrity_check` as a table-valued function (STATUS.md).
+- Tests: `tests/attach_access_v17.rs`,
+  `hipp-cli/tests/cli_v17_attach_access.rs`.
+
 ### Result-level gaps of wave 18 (wave 19, unit `result_gaps`)
 
 - Fixes (ungated): the pin's top-N sorter — under an ORDER BY the loop
