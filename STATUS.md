@@ -11,6 +11,174 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: shell — hipp-cli dot-commands, output modes and `.dump` options (2026-11-20)
+
+Wave 20's hipp-cli unit (owner decision 2026-11-20: SQLite 3.54.1
+parity continues): the shell gaps `gaps_plan_cli` recorded, each
+probed on the live pin first (notes below). hipp-cli only
+(`hipp-cli/src`, `hipp-cli/tests`): no library file changes, so no
+size gate moves (tiny, full, max and xl Δ 0).
+
+**Shipped.**
+- *Output modes* (`render.rs`): `.mode list`, `csv`, `column`, `line`,
+  `box`, `markdown`, `table`, `quote`, `json`, `tabs`, `insert
+  [TABLE]` and `ascii`, byte for byte as the pin's query result
+  formatter writes them: csv / tabs quoting (empty, blanks, controls,
+  quotes, bytes past 0x7e, the column separator), `^X` escapes, text
+  up to its first NUL, reals as the core's REAL-to-text (list, csv,
+  quote, line, columnar) or `%.16g` (insert, json; `9e+999`), blobs
+  as text (display modes), `x'..'` (quote, insert) or `\u00XX` (json);
+  the columnar modes' widths (the pin's display widths: Kuhn's
+  combining and East Asian wide ranges, measured code point by code
+  point; a complete UTF-8 sequence is one character, any stray byte
+  one column), centred titles, numbers right-aligned, tab expansion,
+  multi-line cells, the rule between every row once any cell holds a
+  newline (or overflows a `.width`), box's rounded corners and its
+  `╘═╧═╛` under titles over no row, trailing blanks trimmed in
+  `column`; line mode's right-aligned names and indented continuation
+  lines. `.headers on|off|always` (and the pin's auto: titles shown in
+  the columnar modes only, `always` over no row), `.separator COL
+  ?ROW?`, `.nullvalue`, `.width` (fixed widths, negative ones right
+  aligned, a width of 1 that a cell overflows widened to 2, and the
+  pin's wrapping: half the cut's bytes in, the last blank, else the
+  last change between word and other characters, the cut itself
+  included), and `.mode` with no argument (the settings that differ
+  from the mode's: `--colsep`, `--null`, `--rowsep`, `--tablename`,
+  `--titles`, `--widths`), `--list`, and the options `--titles`,
+  `--colsep`, `--rowsep`, `--null`, `--tablename`, `--widths`.
+- *Column names* (`names.rs`): the library's `Statement` hands out
+  values only, so the shell names a result's columns from its parsed
+  text (`hipp::sql::parser`) and the catalog as the pin's
+  `generateColumnNames` does: aliases, a column reference by its
+  source's column (a table's declared name, a subquery's / view's /
+  CTE's own name made unique with `:1`, `rowid` or the INTEGER
+  PRIMARY KEY's name), `*` / `t.*` (USING / NATURAL columns once),
+  the text as written otherwise, a compound's first core, `column1`,
+  PRAGMA columns, RETURNING over the target table; only the modes
+  that show names pay for them.
+- *Dot-commands* (`shell.rs`, `help.rs`): `.help [PATTERN]` (the pin's
+  help text, verbatim, for the commands hipp has — its first lines,
+  the `.PATTERN*` glob with details or the `.mode` / `.output` /
+  `.once` usage text for one hit, the `%PATTERN%` LIKE search,
+  `Nothing matches`), `.show`, `.print`, `.echo`, `.bail`, `.changes`,
+  `.timer on|off|once` (`Run Time: real ... user ... sys ...`, CPU
+  times from `/proc/self/stat`), `.output [FILE|off|stdout||cmd]`,
+  `.once FILE` (the next SQL or dot-command only), `.read FILE|cmd`
+  (nesting limit 25, `.quit` ends the file, `.exit` the program),
+  `.width`, `.limit [NAME]` (the pin's table; setting a limit is
+  refused), `.indexes [-a|--sys|--expr] [PATTERN]`, `.fullschema`;
+  `.tables [PATTERN]` and `.indexes` in the pin's column grid, sorted
+  (they printed one name per line). The pin's argument parsing
+  (quotes, backslash escapes in `"..."`, one trailing `;` dropped),
+  command prefixes (`.h` is `.headers`, `.hel` `.help`, `.e` `.echo`,
+  `.ex` `.exit`, `.o` `.output`, `.on` `.once`; `.timer`, `.limit`
+  need their full names), `booleanValue` (`on`/`yes`/digits/`0x`
+  hex, else the pin's warning and false), the usage lines, and the
+  `line N:` / `FILE:N:` / `argv[N]:` caret errors (`unknown mode`,
+  `bad option`, `surplus argument`, `missing argument`, `unknown
+  option`, `bad argument`); the input loop as the pin's
+  `process_input` (a line of blanks and comments dropped, a `;` line
+  run, a chunk ending `; -- comment` run). `.parameter` with an
+  unknown subcommand prints its help, as on the pin.
+- *`.dump` options*: `--data-only` (no PRAGMA / BEGIN / COMMIT /
+  CREATE / ANALYZE lines, a virtual table's rows dumped where it
+  stands), `--nosys` (no `sqlite_` table), `--preserve-rowids` (the
+  column list written, `rowid` first unless an INTEGER PRIMARY KEY or
+  WITHOUT ROWID, read through the first of `rowid`, `_rowid_`, `oid`
+  no column takes), `--newlines` (taken; the pin 3.54.1 ignores it
+  too), one or two dashes, `unknown option`; patterns as before.
+- *A new database file* (`lazy.rs`): the pager writes page 1 when it
+  opens an empty file (library side, the tiny profile's open path);
+  the shell now opens files through `LazyFile`, which keeps that page
+  in memory until a write leaves it something other than a fresh
+  database, so the file stays at 0 bytes, as the pin leaves it, for
+  `SELECT`, `.tables`, `BEGIN; COMMIT;`, `PRAGMA page_size = N`, an
+  `ATTACH` of a new name; a write (CREATE, `PRAGMA user_version = 0`,
+  `journal_mode = wal`) writes it as before. No library change.
+- *Version line*: `-version` prints the pin's layout with hipp's name
+  in the source id's place: `3.54.1 2026-10-16 14:45:20 hipp-0.16.0
+  (64-bit)` (decision: the first word stays the pinned SQLite version
+  tools read; the date and time are the pin's check-in, the source id
+  — the one field that names a build — is hipp's).
+- *Lazy open*: `.indexes`, `.limit`, `.fullschema` open the database
+  (as the pin does), `.show`, `.help`, `.mode`, `.print` and the other
+  settings never do; argument errors of `.indexes`, `.dump` and
+  `.fullschema` are reported before the database is opened, as on the
+  pin.
+
+**Probing notes (live pin).** `.show` lists echo, eqp, explain,
+headers (`always` for an untouched columnar mode), mode, nullvalue,
+output, colseparator, rowseparator (`"\n"`, octal for other controls
+and stray bytes), stats, width, filename; it opens nothing. `.mode X`
+resets the separators and the NULL text to X's (csv `,` / `\r\n`, tabs
+`\t`, line `: `, quote / insert NULL `NULL`, json `null`, ascii
+`\037` / `\036`), keeps `.headers`, `.width` and the insert table;
+insert and json ignore the row separator, json and insert the NULL
+text, line the row separator. `.mode bogus` is `argv[2]: .mode bogus`
+/ caret / `Use ".help .mode" for more info` (exit 1 in one-shot,
+counted in a script); `.mode list extra` is no error, a third word is
+`bad argument`; `.headers maybe` warns on stderr and exits 0;
+`.headers true` and `-1` are not booleans. `.print hi;;` prints `hi;`.
+`.help` matches `.PATTERN*` against the whole first line (`*mo*` hits
+`.nonce`), case-sensitively; the LIKE fallback is case-insensitive.
+`.tables`: names LIKE the pattern (case-insensitive), sorted bytewise,
+in as many columns as fit 80 with two blanks between, the gap widened
+to at most five; a name past 80 wraps, one per line, blank lines
+between. `.indexes PATTERN` matches an index name LIKE `PATTERN%` (an
+automatic index also by its table's name). The wrap rules came from
+probing the pin column by column (`.width -10` over `a*m + ' '*s +
+b*12`, the threshold at half the cut's bytes: `aaüüü` breaks at 2 in
+a width of 3, `aüüüü` does not). The 3.54.1 shell reads `--newlines`
+and changes nothing (`unistr('x\u000ay')` either way). A fresh file
+stays 0 bytes for everything that writes no page (`PRAGMA page_size =
+1024` included), 4,096 bytes after `PRAGMA user_version = 0`.
+
+**Tests.** `hipp-cli/tests/cli_v17_shell.rs` (14 tests, byte for byte
+against the live pin: stdout, stderr — an SQL error's text aside —,
+exit status and the files left): every mode under every `.headers`,
+separator and NULL text (192 runs), reals and texts per mode, every
+printable ASCII character in csv / tabs; 240 xorshift-generated
+results (names, values of every kind, modes, titles, separators, NULL
+texts, widths); 160 generated `.width` wraps plus 17 named shapes;
+52 queries' column names in three modes; 141 dot-command lines each
+in one-shot mode, in a script and against a file; `.help` per
+command; 136 `.dump` runs over 34 option / pattern sets; 27 fresh-file
+cases; `.tables` / `.indexes` grids and patterns; `.fullschema`,
+`.limit`; `.echo`, `.bail`, `.changes`; `.read`, `.output`, `.once`
+(the files' bytes); `.timer`'s lines; the version line.
+`cli_diff.rs` and `cli_v04.rs` now compare `.tables` with the pin's
+grid (they expected one name per line). A scratch fuzzer of the same
+generators ran 2,000+ further cases at other seeds with no divergence.
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` workspace suite included).
+
+Size Δ: none — no library file changed. tiny 0, full 0, max 0, xl 0.
+
+**Honest gaps.**
+- `.help` with no pattern, or one that hits a command hipp lacks
+  (`.help %`, `.help DUMP`), lists only hipp's commands; the pin's
+  other commands (`.version`, `.import`, `.backup`, `.eqp`, ...), modes
+  (`html`, `tcl`, `qbox`, `psql`, `count`, `off`, ...) and options
+  (`.mode -v`, `--reset`, `--quote`, `--align`, `--limits` ...,
+  `.output -x` / `-e` / `--bom`, `.open --new` / `--readonly` ...,
+  `.fullschema --indent`, `.schema --indent` / `--nosys`, setting a
+  `.limit`) are refused by name.
+- SQL errors still print hipp's own text (`Error: Schema { kind:
+  UnknownColumn }`), not the pin's `Parse error near line N: ...`
+  with its caret.
+- `.indexes PATTERN` over TEMP / attached indexes follows the pin's
+  name rule, which the pin applies there in ways not fully probed.
+- `.timer`'s user / sys times come from `/proc/self/stat` (100 Hz
+  ticks; 0 off Linux).
+- The column names are the shell's reading of the statement: shapes
+  the corpus does not cover (a view over a table-valued function, a
+  CTE shadowing a view of the same name inside a subquery) may name a
+  column differently; a statement that does not parse names its
+  columns `column1`, ....
+- `ANALYZE` of several tables writes `sqlite_stat1` rows in another
+  order than the pin (library, pre-existing), which `.dump` shows.
+
 ### Parity: attach_access — index and rowid access into attached and TEMP tables (2026-11-20)
 
 Wave 20's unit (owner decision 2026-11-20: SQLite 3.54.1 parity
@@ -1626,11 +1794,13 @@ and could not take the lone-table one).
   push-down, so mixed-affinity compound subqueries still compare with
   the compound's affinity there.
 - hipp-cli: a fresh database file gets its 4,096-byte header page
-  when opened (the pin leaves a 0-byte file until its first write);
-  the version line names hipp, not the pin's source id; the pin's
-  other options are refused rather than implemented; `.dump`'s own
-  options (`--data-only`, `--newlines`, `--nosys`,
-  `--preserve-rowids`) are still ignored.
+  when opened (the pin leaves a 0-byte file until its first write)
+  (closed in v0.17: shell); the version line names hipp, not the
+  pin's source id (closed in v0.17: shell — the pin's layout, hipp's
+  name in the source id's place); the pin's other options are refused
+  rather than implemented; `.dump`'s own options (`--data-only`,
+  `--newlines`, `--nosys`, `--preserve-rowids`) are still ignored
+  (closed in v0.17: shell).
 
 **Review fixes (2026-11-16).** Nine findings, each reproduced on the
 live pin and on hipp first; eight fixed at the root (the same pattern
@@ -1823,7 +1993,11 @@ Honest gaps the review fixes leave (new or found on the way):
   EQP only.
 - hipp-cli: the pin's other dot-commands (`.help`, `.mode`, `.print`,
   ...) are still unknown commands to hipp (they open no database, as
-  on the pin); `.indexes`, `.limit`, `.fullschema` open none in hipp.
+  on the pin); `.indexes`, `.limit`, `.fullschema` open none in hipp
+  (closed in v0.17: shell — those three and `.help`, `.mode`,
+  `.headers`, `.separator`, `.nullvalue`, `.print`, `.echo`, `.bail`,
+  `.changes`, `.timer`, `.output`, `.once`, `.read`, `.show`, `.width`
+  are the pin's; its others stay unknown).
 
 ### Parity: gaps_eval — evaluator and statement-level divergences (2026-11-15)
 
@@ -10381,7 +10555,7 @@ COLUMN cut and the catalog guard.
   and read identically). Pre-existing pager behaviour, found
   here; left for a pager unit (it is on the tiny path).
 - hipp-cli `.tables` prints one name per line (the oracle shell
-  columnates); `.dump` still differs from the shell's around
+  columnates) (closed in v0.17: shell); `.dump` still differs from the shell's around
   `PRAGMA foreign_keys` / `writable_schema` and `sqlite_stat1`.
 
 ### Parser and evaluator depth limits (2026-11-03)
@@ -13890,7 +14064,9 @@ points (boxed futures).
   database on its own (the pin's one statement commits them together
   through the super-journal).
 - ATTACH of a file that does not exist leaves a 4,096-byte empty
-  database where the pin leaves a 0-byte file: hipp's `Pager::open`
+  database where the pin leaves a 0-byte file (closed in v0.17 for
+  hipp-cli: shell, `LazyFile`; the library still writes page 1 of an
+  empty file it opens): hipp's `Pager::open`
   writes page 1 of every empty file it opens (main included, in every
   profile — the tiny profile's open path). The file is valid and reads
   the same on both engines (`PRAGMA aux.page_count` is 0 on both).
@@ -17358,7 +17534,8 @@ status. (v0.1 was pushed 2026-10-18, remote tip 6bd49a31.)
   stricter than SQLite, which aborts only the statement. Safe
   direction; named here until statement-level savepoints exist.
 - CLI divergences from the oracle shell (by design, D4 scope):
-  `.tables` prints one name per line (oracle uses a grid);
+  `.tables` prints one name per line (oracle uses a grid) (closed in
+  v0.17: shell);
   errors print hipp's remedy-named Debug form (`Error: Parse {
   offset, kind }`, `Error: Schema { kind }`, …) and exit 1;
   prompts only when stdin is a terminal; no `.import`/`.export`,

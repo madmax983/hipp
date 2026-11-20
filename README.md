@@ -69,6 +69,22 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **The pin shell's dot-commands and output modes in hipp-cli** (unit
+  `shell`, hipp-cli only: no library or size change). `.mode list`,
+  `csv`, `column`, `line`, `box`, `markdown`, `table`, `quote`, `json`,
+  `tabs`, `insert`, `ascii` with `.headers`, `.separator`,
+  `.nullvalue` and `.width` (the pin's widths, wrapping and rules),
+  the column names the pin's titles show; `.help` (the pin's text for
+  hipp's commands), `.show`, `.print`, `.echo`, `.bail`, `.changes`,
+  `.timer`, `.output`, `.once`, `.read`, `.limit`, `.indexes`,
+  `.fullschema`, `.tables` in the pin's grid, the pin's argument
+  parsing, command prefixes and error messages; `.dump --data-only`,
+  `--nosys`, `--preserve-rowids`, `--newlines`; a new database file
+  left at 0 bytes until it is written; `-version` in the pin's layout
+  with hipp's name in the source id's place. Each byte for byte with
+  the live pin's shell (`hipp-cli/tests/cli_v17_shell.rs`). Still
+  open (STATUS.md): the pin's other commands, modes and options
+  (refused by name), the pin's SQL error texts.
 - **Index and rowid access into attached and TEMP tables** (unit
   `attach_access`, leaf `attach`). A statement of main that reads a
   table of an attached database or of the TEMP database plans it with
@@ -1682,15 +1698,20 @@ and `cargo test --workspace`.
 ## hipp-cli
 
 A std binary shell (`hipp-cli/`, decision D4): interactive,
-stdin-batch and one-shot modes with list-format output
-byte-diffable against the pinned oracle CLI, the pin shell's command
-line (v0.17: `hipp [OPTIONS] [FILENAME [SQL...]]`, `-help`,
-`-version`, `--`; the pin's other options are refused), plus `.tables`,
-`.schema`, `.dump`, `.open`, `.databases` (v0.16, with attached
-databases in `.schema` / `.tables`), `.parameter` (v0.16: `set`,
-`unset`, `clear`, `list`, `init`, bound by name as the oracle
-shell binds them), `.exit [N]` / `.quit` (v0.17: neither opens the
-database). Its first job is
+stdin-batch and one-shot modes with output byte-diffable against the
+pinned oracle CLI, the pin shell's command line (v0.17: `hipp
+[OPTIONS] [FILENAME [SQL...]]`, `-help`, `-version`, `--`; the pin's
+other options are refused), plus `.tables`, `.schema`, `.dump` (v0.17:
+`--data-only`, `--nosys`, `--preserve-rowids`, `--newlines`), `.open`,
+`.databases` (v0.16, with attached databases in `.schema` /
+`.tables`), `.parameter` (v0.16: `set`, `unset`, `clear`, `list`,
+`init`, bound by name as the oracle shell binds them), `.exit [N]` /
+`.quit` (v0.17: neither opens the database), and (v0.17) the pin's
+output modes (`.mode` list, csv, column, line, box, markdown, table,
+quote, json, tabs, insert, ascii; `.headers`, `.separator`,
+`.nullvalue`, `.width`), `.help`, `.show`, `.print`, `.echo`, `.bail`,
+`.changes`, `.timer`, `.output`, `.once`, `.read`, `.limit`,
+`.indexes`, `.fullschema`. Its first job is
 differential testing. It is a separate crate and contributes
 0 bytes to the core's tiny build.
 

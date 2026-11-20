@@ -1,13 +1,19 @@
 //! hipp-cli: a shell over the hipp library (SPEC §9.4, decision
 //! D4). Interactive + one-shot modes over the library's SQL
-//! subset, list-format output (`|` separator, NULL = empty) that
-//! is byte-diffable against the pinned SQLite oracle CLI.
+//! subset, output byte-diffable against the pinned SQLite oracle
+//! CLI (3.54.1).
 //!
 //! Its first job is differential testing; demo surface second.
-//! Dot-commands: `.tables`, `.schema`, `.dump`, `.open`, `.databases`,
-//! `.parameter`, `.exit` (alias `.quit`). No line editing, no
-//! `.import`/`.export`, no format/flag parity beyond diffable
-//! basics.
+//! Dot-commands (v0.17, the pin's text and errors; `shell`): `.bail`,
+//! `.changes`, `.databases`, `.dump` (with `--data-only`, `--nosys`,
+//! `--preserve-rowids`, `--newlines`), `.echo`, `.exit`, `.fullschema`,
+//! `.headers`, `.help`, `.indexes`, `.limit`, `.mode` (`list`, `csv`,
+//! `column`, `line`, `box`, `markdown`, `table`, `quote`, `json`,
+//! `tabs`, `insert`, `ascii`; `render`), `.nullvalue`, `.once`,
+//! `.open`, `.output`, `.parameter`, `.print`, `.quit`, `.read`,
+//! `.schema`, `.separator`, `.show`, `.tables`, `.timer`, `.width`.
+//! No line editing, no `.import`; the pin's other commands, modes and
+//! options are refused by name.
 //!
 //! The command line is the pin shell's (v0.17): `[OPTIONS]
 //! [FILENAME [SQL...]]`, the database `:memory:` when none is
@@ -20,7 +26,13 @@
 //! table by its name (a nameless `?` by `?N`), NULL when the
 //! table has no such key.
 
-use std::io::{BufRead, IsTerminal, Write};
+mod help;
+mod lazy;
+mod names;
+mod render;
+mod shell;
+
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
 use hipp::storage::block_on;
@@ -29,11 +41,12 @@ use hipp::{Config, Connection, FileStorage, MemStorage, OwnedValue, Step, Value}
 /// The `.parameter` bindings (v0.16): the oracle shell's
 /// `temp.sqlite_parameters` table — key (the parameter's name as
 /// written, `?N` for a nameless `?`) to value, in key order.
-type Params = std::collections::BTreeMap<String, OwnedValue>;
+pub type Params = std::collections::BTreeMap<String, OwnedValue>;
 
 /// The open database: a file or `:memory:`.
-enum Db {
-    File(Connection<FileStorage>),
+pub enum Db {
+    /// A file, written only once something is (`lazy::LazyFile`, v0.17).
+    File(Connection<lazy::LazyFile>),
     Mem(Connection<MemStorage>),
 }
 
@@ -46,6 +59,7 @@ fn open_db(path: &str) -> Result<Db, String> {
             Ok(Db::Mem(conn))
         } else {
             let fs = FileStorage::open(std::path::Path::new(path)).map_err(|e| format!("{e:?}"))?;
+            let fs = lazy::LazyFile::new(fs);
             let conn = Connection::open(fs, cli_config())
                 .await
                 .map_err(|e| format!("{e:?}"))?;
@@ -697,63 +711,14 @@ fn fmt_literal(v: Value<'_>) -> Vec<u8> {
     }
 }
 
-/// One output row in list format: `|` separators, NULL empty,
-/// value bytes written raw (text/blob may be non-UTF-8).
-fn write_row(out: &mut impl Write, vals: &[Vec<u8>]) {
-    for (i, v) in vals.iter().enumerate() {
-        if i > 0 {
-            let _ = out.write_all(b"|");
-        }
-        let _ = out.write_all(v);
-    }
-    let _ = out.write_all(b"\n");
-}
-
-/// The oracle shell's list-mode byte rendering (verified byte by
-/// byte against the pinned oracle): bytes below 0x20 render in
-/// caret notation (`^` + byte+0x40), except tab and newline, which
-/// pass through raw; everything else passes through raw. TEXT
-/// values are treated as C strings and stop at the first NUL —
-/// BLOBs render in full.
-fn shell_bytes(b: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(b.len());
-    for &c in b {
-        if c < 0x20 && c != b'\t' && c != b'\n' {
-            out.push(b'^');
-            out.push(c + 0x40);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-fn value_bytes(v: Value<'_>) -> Vec<u8> {
-    match v {
-        Value::Null => Vec::new(),
-        Value::Integer(i) => i.to_string().into_bytes(),
-        Value::Real(f) => fmt_real(f).into_bytes(),
-        Value::Text(b) => {
-            let end = b.iter().position(|c| *c == 0).unwrap_or(b.len());
-            shell_bytes(&b[..end])
-        }
-        Value::Blob(b) => shell_bytes(b),
-    }
-}
-
 /// The oracle shell's EXPLAIN QUERY PLAN rendering (`eqp_render`):
 /// `QUERY PLAN`, then each row under its parent, `|--` before a row
 /// with a later sibling and `` `-- `` before the last, children
 /// indented by `|  ` or three blanks; nothing for a plan with no
 /// rows. Like the shell's 100-byte prefix buffer, it stops descending
 /// past 31 levels.
-fn eqp_render(out: &mut impl Write, rows: &[(i64, i64, Vec<u8>)]) {
-    fn level(
-        out: &mut impl Write,
-        rows: &[(i64, i64, Vec<u8>)],
-        parent: i64,
-        prefix: &mut Vec<u8>,
-    ) {
+fn eqp_render(out: &mut dyn Write, rows: &[(i64, i64, Vec<u8>)]) {
+    fn level(out: &mut dyn Write, rows: &[(i64, i64, Vec<u8>)], parent: i64, prefix: &mut Vec<u8>) {
         let kids: Vec<&(i64, i64, Vec<u8>)> = rows.iter().filter(|r| r.1 == parent).collect();
         for (i, r) in kids.iter().enumerate() {
             let more = i + 1 < kids.len();
@@ -776,17 +741,25 @@ fn eqp_render(out: &mut impl Write, rows: &[(i64, i64, Vec<u8>)]) {
     level(out, rows, 0, &mut Vec::new());
 }
 
-/// Run one SQL statement, printing any result rows. `Err` carries
-/// the user-facing message (hipp's remedy-named Debug form).
+/// Run one SQL statement, writing its rows in the current output mode
+/// (v0.17: `.mode`, `.headers`, `.nullvalue`, ...; `render`). `Err`
+/// carries the user-facing message (hipp's remedy-named Debug form).
 async fn run_statement<S: hipp::Storage>(
     db: &mut Connection<S>,
     sql: &str,
-    params: &Params,
-    out: &mut impl Write,
+    io: &mut shell::Io,
 ) -> Result<(), String>
 where
     S::Error: core::fmt::Debug,
 {
+    // The names come from the text and the catalog (`names`), read
+    // before the statement holds the connection; only the modes that
+    // show them pay for them.
+    let names = if io.set.wants_names() {
+        names::result_names(db, sql)
+    } else {
+        Vec::new()
+    };
     let mut st = db.prepare(sql).await.map_err(|e| format!("{e:?}"))?;
     // The oracle shell's `bind_prepared_stmt`: each parameter
     // from the `.parameter` table by name, else NULL.
@@ -794,7 +767,7 @@ where
         let key = st
             .parameter_name(i)
             .map_or_else(|| format!("?{i}"), str::to_string);
-        if let Some(v) = params.get(&key) {
+        if let Some(v) = io.params.get(&key) {
             st.bind_value(i, v.as_value())
                 .map_err(|e| format!("{e:?}"))?;
         }
@@ -809,17 +782,33 @@ where
                 st.column_bytes(3).unwrap_or(&[]).to_vec(),
             ));
         }
-        eqp_render(out, &rows);
+        eqp_render(&mut io.out, &rows);
         return Ok(());
     }
-    // Step to completion, printing every row (a statement whose
-    // planning waited for its bindings knows its columns only
-    // once stepped).
+    // Step to completion, writing every row (a statement whose
+    // planning waited for its bindings knows its columns only once
+    // stepped, so the names are fitted to its width then).
+    let shell::Io { set, out, .. } = io;
+    let mut emit: Option<render::Emit<'_>> = None;
+    let fit = |mut n: Vec<Vec<u8>>, w: usize| {
+        n.truncate(w);
+        while n.len() < w {
+            n.push(format!("column{}", n.len() + 1).into_bytes());
+        }
+        n
+    };
     while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
-        let vals: Vec<Vec<u8>> = (0..st.column_count())
-            .map(|i| value_bytes(st.column_value(i).unwrap_or(Value::Null)))
+        let w = st.column_count();
+        let vals: Vec<render::Val> = (0..w)
+            .map(|i| render::Val::of(st.column_value(i).unwrap_or(Value::Null)))
             .collect();
-        write_row(out, &vals);
+        let e = emit.get_or_insert_with(|| render::Emit::new(set, fit(names.clone(), w)));
+        e.row(vals, out);
+    }
+    let w = st.column_count();
+    if w > 0 {
+        emit.unwrap_or_else(|| render::Emit::new(set, fit(names, w)))
+            .finish(out);
     }
     Ok(())
 }
@@ -956,99 +945,6 @@ fn split_script(script: &str) -> (Vec<String>, bool) {
     (out, complete)
 }
 
-/// What a dot-command wants the shell loop to do next.
-enum Flow {
-    Continue,
-    /// `.exit` / `.quit`: stop with the session's status.
-    Exit,
-    /// `.exit N` with N not 0 (v0.17): stop at once with status N
-    /// (its low byte), as the pin's `exit(N)`.
-    ExitWith(u8),
-}
-
-/// The pin shell's `integerValue` of an `.exit` argument (v0.17):
-/// a decimal or `0x` hexadecimal integer prefix, 0 for none.
-fn exit_status(arg: &str) -> i64 {
-    let (neg, digits) = match arg.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, arg.strip_prefix('+').unwrap_or(arg)),
-    };
-    let (radix, digits) = match digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        Some(h) => (16, h),
-        None => (10, digits),
-    };
-    let mut v: i64 = 0;
-    for c in digits.chars() {
-        match c.to_digit(radix) {
-            Some(d) => v = v.wrapping_mul(i64::from(radix)).wrapping_add(i64::from(d)),
-            None => break,
-        }
-    }
-    if neg { v.wrapping_neg() } else { v }
-}
-
-/// Whether a dot-command reads the database (v0.17): the pin's shell
-/// opens it for these and for SQL only, so `.quit`, `.exit` or an
-/// unknown command make no file.
-fn needs_db(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        ".tables" | ".schema" | ".dump" | ".databases" | ".parameter" | ".param" | ".open"
-    )
-}
-
-/// A dot-command that needs no database (v0.17; `needs_db`).
-fn dot_nodb(line: &str) -> Result<Flow, String> {
-    let mut parts = line.splitn(2, char::is_whitespace);
-    let cmd = parts.next().unwrap_or("");
-    let arg = parts.next().map(str::trim).unwrap_or("");
-    match cmd {
-        // (`.quit` takes no status; `.exit 0` is `.exit`.)
-        ".exit" => match exit_status(shell_args(arg).first().map_or("", String::as_str)) {
-            0 => Ok(Flow::Exit),
-            n => Ok(Flow::ExitWith(n as u8)),
-        },
-        ".quit" => Ok(Flow::Exit),
-        _ => Err(format!(
-            "unknown command or invalid arguments:  \"{}\". Enter \".help\" for help",
-            cmd.get(1..).unwrap_or("")
-        )),
-    }
-}
-
-/// Split a dot-command line into arguments the way the oracle
-/// shell does: whitespace-separated words, a word starting with
-/// `'` or `"` running to the matching quote (the quotes
-/// dropped).
-fn shell_args(line: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut chars = line.chars().peekable();
-    loop {
-        while chars.next_if(|c| c.is_whitespace()).is_some() {}
-        let Some(&c) = chars.peek() else {
-            return args;
-        };
-        let mut word = String::new();
-        if c == '\'' || c == '"' {
-            chars.next();
-            for d in chars.by_ref() {
-                if d == c {
-                    break;
-                }
-                word.push(d);
-            }
-        } else {
-            while let Some(d) = chars.next_if(|d| !d.is_whitespace()) {
-                word.push(d);
-            }
-        }
-        args.push(word);
-    }
-}
-
 /// `.parameter set KEY VALUE`'s value (v0.16): VALUE as an SQL
 /// expression when it is one (`5`, `2.5`, `x'01'`, `'text'`,
 /// `1+2`), else the text itself — the oracle shell's two-try
@@ -1067,28 +963,110 @@ where
     OwnedValue::from_value(Value::Text(text.as_bytes()))
 }
 
-async fn dot_command<S: hipp::Storage>(
+/// The pin's limits as `.limit` lists them (`%20s %d`), in its order:
+/// hipp enforces the ones it has at these values (the pin's defaults)
+/// and models no VDBE, worker threads or trigger-step count.
+const LIMITS: [(&str, i64); 15] = [
+    ("length", 1_000_000_000),
+    ("sql_length", 1_000_000_000),
+    ("column", 2000),
+    ("expr_depth", 1000),
+    ("parser_depth", 2500),
+    ("compound_select", 500),
+    ("vdbe_op", 250_000_000),
+    ("function_arg", 1000),
+    ("attached", 10),
+    ("like_pattern_length", 50000),
+    ("variable_number", 32766),
+    ("trigger_depth", 1000),
+    ("worker_threads", 0),
+    ("schema", 10_000_000),
+    ("trigger_steps", 65000),
+];
+
+/// The argument errors of a database command, reported before the
+/// database is opened (the pin opens it only once they pass).
+fn db_precheck(
+    cmd: &str,
+    args: &[(String, usize)],
+    caret: &dyn Fn(usize, &str) -> shell::Failed,
+) -> Result<(), shell::Failed> {
+    match cmd {
+        "fullschema" => match args.get(1).map(|a| a.0.as_str()) {
+            None => Ok(()),
+            Some("--indent" | "-indent") if args.len() == 2 => {
+                eprintln!("Error: .fullschema --indent is not supported by hipp");
+                Err(shell::Failed)
+            }
+            Some(_) => {
+                eprintln!("Usage: .fullschema ?--indent?");
+                Err(shell::Failed)
+            }
+        },
+        "indexes" => {
+            let mut pat = false;
+            for (t, off) in &args[1..] {
+                match t.as_str() {
+                    "-a" | "-all" | "--all" | "-sys" | "--sys" | "-expr" | "--expr" => {}
+                    _ if t.starts_with('-') => return Err(caret(*off, "unknown option")),
+                    _ if pat => return Err(caret(*off, "unknown argument")),
+                    _ => pat = true,
+                }
+            }
+            Ok(())
+        }
+        "dump" => {
+            for (t, off) in &args[1..] {
+                if let Some(o) = t.strip_prefix('-')
+                    && !matches!(
+                        o.strip_prefix('-').unwrap_or(o),
+                        "data-only" | "nosys" | "preserve-rowids" | "newlines"
+                    )
+                {
+                    return Err(caret(*off, "unknown option"));
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A dot-command that reads the database (v0.17: `.tables`,
+/// `.indexes`, `.schema`, `.fullschema`, `.databases`, `.dump`,
+/// `.parameter`, `.limit`). `Err` when it failed (its message
+/// printed).
+async fn db_command<S: hipp::Storage>(
     db: &mut Connection<S>,
+    cmd: &str,
     line: &str,
-    params: &mut Params,
-    out: &mut impl Write,
-) -> Result<Flow, String>
+    args: &[(String, usize)],
+    io: &mut shell::Io,
+    ctx: &shell::Ctx,
+) -> Result<(), shell::Failed>
 where
     S::Error: core::fmt::Debug,
 {
-    let mut parts = line.splitn(2, char::is_whitespace);
-    let cmd = parts.next().unwrap_or("");
-    let arg = parts.next().map(str::trim).unwrap_or("");
+    let a: Vec<&str> = args.iter().map(|(s, _)| s.as_str()).collect();
+    let caret = |off: usize, msg: &str| {
+        let p = match ctx {
+            shell::Ctx::Argv(n) => format!("argv[{n}]: "),
+            shell::Ctx::Line(None, n) => format!("line {n}: "),
+            shell::Ctx::Line(Some(f), n) => format!("{f}:{n}: "),
+        };
+        eprintln!("{p}{line}");
+        eprintln!("{p}{}^--- {msg}", " ".repeat(off));
+        shell::Failed
+    };
+    let out = &mut io.out;
     match cmd {
-        ".parameter" | ".param" => {
-            let args = shell_args(arg);
-            let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            match args.as_slice() {
-                ["clear"] => params.clear(),
+        "parameter" => {
+            match &a[1..] {
+                ["clear"] => io.params.clear(),
                 ["init"] => {}
                 ["list"] => {
-                    let len = params.keys().map(|k| k.len()).max().unwrap_or(0).min(40);
-                    for (k, v) in params.iter() {
+                    let len = io.params.keys().map(|k| k.len()).max().unwrap_or(0).min(40);
+                    for (k, v) in io.params.iter() {
                         let _ = out.write_all(format!("{k:<len$} ").as_bytes());
                         let _ = out.write_all(&fmt_literal(v.as_value()));
                         let _ = out.write_all(b"\n");
@@ -1096,67 +1074,162 @@ where
                 }
                 ["set", key, value] => {
                     let v = parameter_value(db, value).await;
-                    params.insert((*key).to_string(), v);
+                    io.params.insert((*key).to_string(), v);
                 }
                 ["unset", key] => {
-                    params.remove(*key);
+                    io.params.remove(*key);
                 }
+                // (v0.17: as the pin, its help text, and no error.)
                 _ => {
-                    return Err(
-                        "usage: .parameter clear | init | list | set NAME VALUE | unset NAME"
-                            .to_string(),
-                    );
+                    let _ = out.write_all(help::help(Some("parameter")).as_bytes());
                 }
             }
-            Ok(Flow::Continue)
+            Ok(())
         }
-        ".tables" => {
-            // `sqlite_*` tables (sqlite_sequence, sqlite_stat1) are
-            // not listed, as in the oracle shell.
-            for t in db.tables().iter() {
-                if t.name.starts_with(b"sqlite_") {
-                    continue;
-                }
-                let _ = out.write_all(t.name);
-                let _ = out.write_all(b"\n");
-            }
-            for v in db.views().iter() {
-                let _ = out.write_all(v.name);
-                let _ = out.write_all(b"\n");
-            }
-            // The TEMP database's tables and views (v0.16), named
-            // `temp.x` as the oracle shell lists them.
-            if let Some(t) = db.temp_db() {
-                let names = t.tables().iter().map(|m| m.name).collect::<Vec<_>>();
-                let views = t.views().iter().map(|m| m.name).collect::<Vec<_>>();
-                for n in names.iter().chain(views.iter()) {
+        "tables" => {
+            // The pin's `.tables ?PATTERN?`: the tables and views of
+            // every database (`temp.x`, `aux.x` for the others; no
+            // `sqlite_` names) whose name is LIKE the pattern, sorted,
+            // in its column grid.
+            let pat = a.get(1).copied();
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            if a.len() <= 2 {
+                let mut add = |prefix: &[u8], n: &[u8]| {
                     if n.starts_with(b"sqlite_") {
-                        continue;
+                        return;
                     }
-                    let _ = out.write_all(b"temp.");
-                    let _ = out.write_all(n);
-                    let _ = out.write_all(b"\n");
+                    if let Some(p) = pat
+                        && !help::like(p.as_bytes(), n)
+                    {
+                        return;
+                    }
+                    let mut v = prefix.to_vec();
+                    v.extend_from_slice(n);
+                    names.push(v);
+                };
+                for t in db.tables().iter() {
+                    add(b"", t.name);
+                }
+                for v in db.views().iter() {
+                    add(b"", v.name);
+                }
+                if let Some(t) = db.temp_db() {
+                    for m in t.tables().iter() {
+                        add(b"temp.", m.name);
+                    }
+                    for m in t.views().iter() {
+                        add(b"temp.", m.name);
+                    }
+                }
+                let mut i = 0;
+                while let Some((an, at)) = db.attached_db(i) {
+                    let mut pre = an.to_vec();
+                    pre.push(b'.');
+                    for m in at.tables().iter() {
+                        add(&pre, m.name);
+                    }
+                    for m in at.views().iter() {
+                        add(&pre, m.name);
+                    }
+                    i += 1;
                 }
             }
-            // The attached databases' (v0.16), as `name.x`.
+            names.sort();
+            let mut b = Vec::new();
+            render::grid(&names, &mut b);
+            let _ = out.write_all(&b);
+            Ok(())
+        }
+        "indexes" => {
+            // The pin's `.indexes ?PATTERN?`: the indexes on the tables
+            // LIKE the pattern; `-a` / `--all` adds the automatic ones,
+            // `--sys` shows only those, `--expr` only expression
+            // indexes.
+            let (mut all, mut sys, mut expr) = (false, false, false);
+            let mut pat: Option<&str> = None;
+            for (t, off) in &args[1..] {
+                match t.as_str() {
+                    "-a" | "-all" | "--all" => all = true,
+                    "-sys" | "--sys" => sys = true,
+                    "-expr" | "--expr" => expr = true,
+                    _ if t.starts_with('-') => return Err(caret(*off, "unknown option")),
+                    _ if pat.is_some() => return Err(caret(*off, "unknown argument")),
+                    _ => pat = Some(t),
+                }
+            }
+            let mut dbs: Vec<String> = vec!["main".into()];
+            if db.temp_db().is_some() {
+                dbs.push("temp".into());
+            }
             let mut i = 0;
-            while let Some((an, a)) = db.attached_db(i) {
-                let names = a.tables().iter().map(|m| m.name).collect::<Vec<_>>();
-                let views = a.views().iter().map(|m| m.name).collect::<Vec<_>>();
-                for n in names.iter().chain(views.iter()) {
-                    if n.starts_with(b"sqlite_") {
-                        continue;
-                    }
-                    let _ = out.write_all(an);
-                    let _ = out.write_all(b".");
-                    let _ = out.write_all(n);
-                    let _ = out.write_all(b"\n");
-                }
+            while let Some((an, _)) = db.attached_db(i) {
+                dbs.push(String::from_utf8_lossy(an).into_owned());
                 i += 1;
             }
-            Ok(Flow::Continue)
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            for d in &dbs {
+                let q = d.replace('"', "\"\"");
+                let sql = format!(
+                    "SELECT name, tbl_name, sql FROM \"{q}\".sqlite_schema WHERE type = 'index'"
+                );
+                let mut found: Vec<(Vec<u8>, Vec<u8>, bool)> = Vec::new();
+                if let Ok(mut st) = db.prepare(&sql).await {
+                    while let Ok(Step::Row) = st.step().await {
+                        found.push((
+                            st.column_bytes(0).unwrap_or_default().to_vec(),
+                            st.column_bytes(1).unwrap_or_default().to_vec(),
+                            st.column_bytes(2).is_none(),
+                        ));
+                    }
+                }
+                for (name, tbl, auto) in found {
+                    if sys && !auto || !(all || sys) && auto {
+                        continue;
+                    }
+                    // (The pin's pattern, `%` appended: LIKE the index
+                    // name, or for an automatic index its table's.)
+                    if let Some(p) = pat {
+                        let p = format!("{p}%");
+                        let hit = help::like(p.as_bytes(), &name)
+                            || (auto && help::like(p.as_bytes(), &tbl));
+                        if !hit {
+                            continue;
+                        }
+                    }
+                    if expr {
+                        let x = format!(
+                            "PRAGMA \"{q}\".index_xinfo(\"{}\")",
+                            String::from_utf8_lossy(&name).replace('"', "\"\"")
+                        );
+                        let mut has = false;
+                        if let Ok(mut st) = db.prepare(&x).await {
+                            while let Ok(Step::Row) = st.step().await {
+                                if st.column_i64(1) == Some(-2) {
+                                    has = true;
+                                }
+                            }
+                        }
+                        if !has {
+                            continue;
+                        }
+                    }
+                    let mut v = Vec::new();
+                    if d != "main" {
+                        v.extend_from_slice(d.as_bytes());
+                        v.push(b'.');
+                    }
+                    v.extend_from_slice(&name);
+                    names.push(v);
+                }
+            }
+            names.sort();
+            let mut b = Vec::new();
+            render::grid(&names, &mut b);
+            let _ = out.write_all(&b);
+            Ok(())
         }
-        ".schema" => {
+        "schema" => {
+            let arg = a.get(1).copied().unwrap_or("");
             print_schema(db, arg, out, false, None).await;
             // The TEMP database's objects follow, named `temp.`, as
             // the oracle shell prints them.
@@ -1169,9 +1242,72 @@ where
                 print_schema(db, arg, out, false, Some(i)).await;
                 i += 1;
             }
-            Ok(Flow::Continue)
+            Ok(())
         }
-        ".databases" => {
+        "fullschema" => {
+            // The pin's `.fullschema`: every schema text but the
+            // `sqlite_` tables', main and TEMP together in rowid
+            // order, then the statistics as `.dump` writes them.
+            // (Its arguments are checked by `db_precheck`.)
+            // (Main and TEMP read apart and merged by rowid, main first:
+            // hipp reads no compound of the two schema tables.)
+            let mut rows: Vec<(i64, u8, Vec<u8>)> = Vec::new();
+            let mut srcs = vec![(0u8, "main.sqlite_schema")];
+            if db.temp_db().is_some() {
+                srcs.push((1, "sqlite_temp_schema"));
+            }
+            for (k, tbl) in srcs {
+                let sql = format!(
+                    "SELECT rowid, sql FROM {tbl} WHERE type != 'meta' AND sql NOTNULL \
+                     AND name NOT LIKE 'sqlite_%'"
+                );
+                if let Ok(mut st) = db.prepare(&sql).await {
+                    while let Ok(Step::Row) = st.step().await {
+                        rows.push((
+                            st.column_i64(0).unwrap_or(0),
+                            k,
+                            st.column_bytes(1).unwrap_or_default().to_vec(),
+                        ));
+                    }
+                }
+            }
+            rows.sort_by_key(|r| (r.0, r.1));
+            let texts: Vec<Vec<u8>> = rows.into_iter().map(|r| r.2).collect();
+            for t in &texts {
+                let _ = out.write_all(t);
+                let comment = t.windows(2).any(|w| w == b"--");
+                let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
+            }
+            let stats = db
+                .tables()
+                .iter()
+                .any(|t| matches!(t.name, b"sqlite_stat1" | b"sqlite_stat3" | b"sqlite_stat4"));
+            if !stats {
+                let _ = out.write_all(b"/* No STAT tables available */\n");
+                return Ok(());
+            }
+            let _ = out.write_all(b"ANALYZE sqlite_schema;\n");
+            if db.tables().iter().any(|t| t.name == b"sqlite_stat1")
+                && let Ok(mut st) = db.prepare("SELECT * FROM sqlite_stat1").await
+            {
+                while let Ok(Step::Row) = st.step().await {
+                    let mut l = b"INSERT INTO sqlite_stat1 VALUES(".to_vec();
+                    for i in 0..st.column_count() {
+                        if i > 0 {
+                            l.push(b',');
+                        }
+                        l.extend_from_slice(&dump_literal(
+                            st.column_value(i).unwrap_or(Value::Null),
+                        ));
+                    }
+                    l.extend_from_slice(b");\n");
+                    let _ = out.write_all(&l);
+                }
+            }
+            let _ = out.write_all(b"ANALYZE sqlite_schema;\n");
+            Ok(())
+        }
+        "databases" => {
             // `name: file r/w`, `""` for a database without a file,
             // as the oracle shell prints `PRAGMA database_list`.
             if let Ok(mut st) = db.prepare("PRAGMA database_list").await {
@@ -1188,245 +1324,407 @@ where
                     let _ = out.write_all(b" r/w\n");
                 }
             }
-            Ok(Flow::Continue)
+            Ok(())
         }
-        ".dump" => {
-            // `.dump PATTERN...` (v0.16 review fix: the argument was
-            // ignored): the pin shell's filter — a LIKE on the name,
-            // a virtual table bringing its `name_*` shadow tables.
-            let pats: Vec<String> = shell_args(arg)
-                .into_iter()
-                .filter(|a| !a.starts_with('-'))
-                .collect();
-            let filter = if pats.is_empty() {
-                "1".to_string()
-            } else {
-                pats.iter()
-                    .map(|p| {
-                        let q = format!("'{}'", p.replace('\'', "''"));
-                        format!(
-                            "name LIKE {q} ESCAPE '\\' OR EXISTS (SELECT 1 FROM sqlite_schema \
-                             WHERE name LIKE {q} ESCAPE '\\' AND sql LIKE 'CREATE VIRTUAL TABLE%' \
-                             AND substr(o.name, 1, length(name)+1) == (name||'_'))"
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-            };
-            let mut keep: Vec<Vec<u8>> = Vec::new();
-            if let Ok(mut st) = db
-                .prepare(&format!(
-                    "SELECT name FROM main.sqlite_schema AS o WHERE ({filter}) AND type = 'table' AND sql NOT NULL"
-                ))
-                .await
-            {
-                while let Ok(Step::Row) = st.step().await {
-                    if let Some(n) = st.column_bytes(0) {
-                        keep.push(n.to_vec());
-                    }
-                }
+        "limits" => {
+            if a.len() > 3 {
+                eprintln!("Usage: .limit NAME ?NEW-VALUE?");
+                return Err(shell::Failed);
             }
-            // Snapshot the catalog first (names as bytes) so the
-            // per-table SELECTs can borrow the connection freely.
-            // A table with generated columns dumps only the
-            // other columns (v0.16), as the oracle shell does:
-            // its INSERT ... VALUES replays without them.
-            let tables: Vec<(Vec<u8>, Vec<u8>, String)> = db
-                .tables()
+            let Some(name) = a.get(1) else {
+                for (n, v) in LIMITS {
+                    let _ = writeln!(out, "{n:>20} {v}");
+                }
+                return Ok(());
+            };
+            let hits: Vec<&(&str, i64)> = LIMITS
                 .iter()
-                .map(|t| {
-                    let list = if t.generated.iter().any(|g| *g) {
-                        let cols: Vec<String> = t
-                            .columns
-                            .iter()
-                            .zip(t.generated.iter())
-                            .filter(|(_, g)| !**g)
-                            .map(|(c, _)| {
-                                format!("\"{}\"", String::from_utf8_lossy(c).replace('"', "\"\""))
-                            })
-                            .collect();
-                        cols.join(", ")
-                    } else {
-                        "*".to_string()
-                    };
-                    (t.name.to_vec(), t.sql.to_vec(), list)
+                .filter(|(n, _)| {
+                    n.len() >= name.len()
+                        && n.as_bytes()[..name.len()].eq_ignore_ascii_case(name.as_bytes())
                 })
                 .collect();
-            // `sqlite_sequence` (AUTOINCREMENT, v0.16) comes last and
-            // replays as `DELETE` + `INSERT`s, as in the oracle shell:
-            // the table itself is re-created by the AUTOINCREMENT
-            // table's CREATE (its own CREATE is a reserved name).
-            let is_seq = |n: &[u8]| n == b"sqlite_sequence";
-            // A virtual table (v0.16) replays as its schema row, under
-            // `PRAGMA writable_schema=ON`, in schema order among the
-            // tables; its shadow tables then take `IF NOT EXISTS`.
-            let mut vtabs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let mut order: Vec<Vec<u8>> = Vec::new();
-            if let Ok(mut st) = db
-                .prepare("SELECT name, sql FROM main.sqlite_schema WHERE type = 'table' AND sql NOT NULL")
-                .await
-            {
-                while let Ok(Step::Row) = st.step().await {
-                    if let (Some(n), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
-                        if !keep.iter().any(|k| k == n) {
-                            continue;
-                        }
-                        if q.len() >= 20 && q[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE") {
-                            vtabs.push((n.to_vec(), q.to_vec()));
-                        }
-                        order.push(n.to_vec());
-                    }
+            let (n, v) = match hits.as_slice() {
+                [one] => **one,
+                [] => {
+                    eprintln!("unknown limit: \"{name}\"");
+                    eprintln!("enter \".limits\" with no arguments for a list.");
+                    return Err(shell::Failed);
+                }
+                _ => {
+                    eprintln!("ambiguous limit: \"{name}\"");
+                    return Err(shell::Failed);
+                }
+            };
+            if a.len() == 3 {
+                eprintln!("Error: .limit cannot change a limit in hipp");
+                return Err(shell::Failed);
+            }
+            let _ = writeln!(out, "{n:>20} {v}");
+            Ok(())
+        }
+        "dump" => dump(db, line, args, out, &caret).await,
+        _ => Ok(()),
+    }
+}
+
+/// How `.dump` writes one table's rows: the column list of its
+/// `INSERT`s (with `--preserve-rowids`) and the select that reads them.
+async fn dump_rows<S: hipp::Storage>(
+    db: &mut Connection<S>,
+    name: &[u8],
+    sql: &[u8],
+    list: &str,
+    keep_rowid: bool,
+    out: &mut shell::Output,
+) -> Result<(), String>
+where
+    S::Error: core::fmt::Debug,
+{
+    let quoted = format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
+    let mut head = [b"INSERT INTO ".as_slice(), &dump_name(name)].concat();
+    let mut select = format!("SELECT {list} FROM {quoted}");
+    if keep_rowid {
+        // The pin's `--preserve-rowids`: the column list written out,
+        // the rowid first (as `rowid`) unless the table has an INTEGER
+        // PRIMARY KEY or no rowid; the rowid read through the first of
+        // `rowid`, `_rowid_`, `oid` no column is named.
+        let mut cols: Vec<(Vec<u8>, Vec<u8>, i64)> = Vec::new();
+        let ti = format!("PRAGMA table_xinfo({quoted})");
+        if let Ok(mut st) = db.prepare(&ti).await {
+            while let Ok(Step::Row) = st.step().await {
+                let hidden = st.column_i64(6).unwrap_or(0);
+                if hidden == 0 {
+                    cols.push((
+                        st.column_bytes(1).unwrap_or_default().to_vec(),
+                        st.column_bytes(2).unwrap_or_default().to_vec(),
+                        st.column_i64(5).unwrap_or(0),
+                    ));
                 }
             }
-            // The pin shell's header for a script that writes
-            // `sqlite_schema`, with the `foreign_keys` line it must
-            // precede: replaying it, the shell turns defensive mode
-            // off (v0.16 review fix: without it the pin refused the
-            // replay).
-            // (v0.17 fix: the PRAGMA line is always there.)
-            if !vtabs.is_empty() {
-                let _ = out.write_all(
-                    b"/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */\n",
-                );
+        }
+        let pks: Vec<&(Vec<u8>, Vec<u8>, i64)> = cols.iter().filter(|c| c.2 > 0).collect();
+        let ipk = matches!(pks.as_slice(), [c] if c.1.eq_ignore_ascii_case(b"INTEGER"));
+        let lower = sql.to_ascii_lowercase();
+        let tail = lower.rsplit(|c| *c == b')').next().unwrap_or(&[]);
+        let no_rowid = tail
+            .split(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w == [b"without".as_slice(), b"rowid".as_slice()]);
+        let alias = ["rowid", "_rowid_", "oid"]
+            .into_iter()
+            .find(|r| !cols.iter().any(|c| c.0.eq_ignore_ascii_case(r.as_bytes())));
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut exprs: Vec<String> = Vec::new();
+        if !ipk
+            && !no_rowid
+            && let Some(r) = alias
+        {
+            names.push(b"rowid".to_vec());
+            exprs.push(r.to_string());
+        }
+        for c in &cols {
+            names.push(c.0.clone());
+            exprs.push(format!(
+                "\"{}\"",
+                String::from_utf8_lossy(&c.0).replace('"', "\"\"")
+            ));
+        }
+        head.push(b'(');
+        for (i, n) in names.iter().enumerate() {
+            if i > 0 {
+                head.push(b',');
             }
-            let _ = out.write_all(b"PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
-            let mut writable = false;
-            let ordered = tables
+            head.extend_from_slice(&dump_name(n));
+        }
+        head.push(b')');
+        select = format!("SELECT {} FROM {quoted}", exprs.join(", "));
+    }
+    head.extend_from_slice(b" VALUES(");
+    let mut st = db.prepare(&select).await.map_err(|e| format!("{e:?}"))?;
+    while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
+        let mut line = head.clone();
+        for i in 0..st.column_count() {
+            if i > 0 {
+                line.extend_from_slice(b",");
+            }
+            line.extend_from_slice(&dump_literal(st.column_value(i).unwrap_or(Value::Null)));
+        }
+        line.extend_from_slice(b");\n");
+        let _ = out.write_all(&line);
+    }
+    Ok(())
+}
+
+/// `.dump [OPTIONS] [PATTERN...]` (v0.17: `--data-only`, `--nosys`,
+/// `--preserve-rowids`, `--newlines` — which the pin 3.54.1 takes and
+/// ignores — and LIKE patterns), byte for byte as the pin writes it.
+async fn dump<S: hipp::Storage>(
+    db: &mut Connection<S>,
+    _line: &str,
+    args: &[(String, usize)],
+    out: &mut shell::Output,
+    caret: &dyn Fn(usize, &str) -> shell::Failed,
+) -> Result<(), shell::Failed>
+where
+    S::Error: core::fmt::Debug,
+{
+    let (mut data_only, mut nosys, mut rowids) = (false, false, false);
+    let mut pats: Vec<&str> = Vec::new();
+    for (t, off) in &args[1..] {
+        if let Some(o) = t.strip_prefix('-') {
+            match o.strip_prefix('-').unwrap_or(o) {
+                "data-only" => data_only = true,
+                "nosys" => nosys = true,
+                "preserve-rowids" => rowids = true,
+                "newlines" => {}
+                _ => return Err(caret(*off, "unknown option")),
+            }
+        } else {
+            pats.push(t);
+        }
+    }
+    match dump_body(db, &pats, data_only, nosys, rowids, out).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            Err(shell::Failed)
+        }
+    }
+}
+
+async fn dump_body<S: hipp::Storage>(
+    db: &mut Connection<S>,
+    pats: &[&str],
+    data_only: bool,
+    nosys: bool,
+    rowids: bool,
+    out: &mut shell::Output,
+) -> Result<(), String>
+where
+    S::Error: core::fmt::Debug,
+{
+    // `.dump PATTERN...` (v0.16 review fix: the argument was
+    // ignored): the pin shell's filter — a LIKE on the name, a
+    // virtual table bringing its `name_*` shadow tables.
+    let filter = if pats.is_empty() {
+        "1".to_string()
+    } else {
+        pats.iter()
+            .map(|p| {
+                let q = format!("'{}'", p.replace('\'', "''"));
+                format!(
+                    "name LIKE {q} ESCAPE '\\' OR EXISTS (SELECT 1 FROM sqlite_schema \
+                     WHERE name LIKE {q} ESCAPE '\\' AND sql LIKE 'CREATE VIRTUAL TABLE%' \
+                     AND substr(o.name, 1, length(name)+1) == (name||'_'))"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
+    let mut keep: Vec<Vec<u8>> = Vec::new();
+    if let Ok(mut st) = db
+        .prepare(&format!(
+            "SELECT name FROM main.sqlite_schema AS o WHERE ({filter}) AND type = 'table' AND sql NOT NULL"
+        ))
+        .await
+    {
+        while let Ok(Step::Row) = st.step().await {
+            if let Some(n) = st.column_bytes(0)
+                && !(nosys && n.starts_with(b"sqlite_"))
+            {
+                keep.push(n.to_vec());
+            }
+        }
+    }
+    // Snapshot the catalog first (names as bytes) so the per-table
+    // SELECTs can borrow the connection freely. A table with
+    // generated columns dumps only the other columns (v0.16), as the
+    // oracle shell does: its INSERT ... VALUES replays without them.
+    let tables: Vec<(Vec<u8>, Vec<u8>, String)> = db
+        .tables()
+        .iter()
+        .map(|t| {
+            let list = if t.generated.iter().any(|g| *g) {
+                let cols: Vec<String> = t
+                    .columns
+                    .iter()
+                    .zip(t.generated.iter())
+                    .filter(|(_, g)| !**g)
+                    .map(|(c, _)| {
+                        format!("\"{}\"", String::from_utf8_lossy(c).replace('"', "\"\""))
+                    })
+                    .collect();
+                cols.join(", ")
+            } else {
+                "*".to_string()
+            };
+            (t.name.to_vec(), t.sql.to_vec(), list)
+        })
+        .collect();
+    // `sqlite_sequence` (AUTOINCREMENT, v0.16) comes last and replays
+    // as `DELETE` + `INSERT`s, as in the oracle shell: the table
+    // itself is re-created by the AUTOINCREMENT table's CREATE (its
+    // own CREATE is a reserved name).
+    let is_seq = |n: &[u8]| n == b"sqlite_sequence";
+    // A virtual table (v0.16) replays as its schema row, under `PRAGMA
+    // writable_schema=ON`, in schema order among the tables; its
+    // shadow tables then take `IF NOT EXISTS`. With `--data-only` its
+    // rows are dumped there instead.
+    let mut vtabs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut order: Vec<Vec<u8>> = Vec::new();
+    if let Ok(mut st) = db
+        .prepare("SELECT name, sql FROM main.sqlite_schema WHERE type = 'table' AND sql NOT NULL")
+        .await
+    {
+        while let Ok(Step::Row) = st.step().await {
+            if let (Some(n), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
+                if !keep.iter().any(|k| k == n) {
+                    continue;
+                }
+                if q.len() >= 20 && q[..20].eq_ignore_ascii_case(b"CREATE VIRTUAL TABLE") {
+                    vtabs.push((n.to_vec(), q.to_vec()));
+                }
+                order.push(n.to_vec());
+            }
+        }
+    }
+    // The pin shell's header for a script that writes `sqlite_schema`,
+    // with the `foreign_keys` line it must precede: replaying it, the
+    // shell turns defensive mode off (v0.16 review fix: without it the
+    // pin refused the replay). (v0.17 fix: the PRAGMA line is always
+    // there; `--data-only` writes neither it nor BEGIN / COMMIT.)
+    if !vtabs.is_empty() {
+        let _ = out.write_all(
+            b"/* WARNING: Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */\n",
+        );
+    }
+    if !data_only {
+        let _ = out.write_all(b"PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
+    }
+    let mut writable = false;
+    let ordered = tables
+        .iter()
+        .filter(|t| keep.contains(&t.0))
+        .filter(|t| !is_seq(&t.0))
+        .chain(
+            tables
                 .iter()
                 .filter(|t| keep.contains(&t.0))
-                .filter(|t| !is_seq(&t.0))
-                .chain(
-                    tables
-                        .iter()
-                        .filter(|t| keep.contains(&t.0))
-                        .filter(|t| is_seq(&t.0)),
-                );
-            let mut ordered: Vec<&(Vec<u8>, Vec<u8>, String)> = ordered.collect();
-            if !vtabs.is_empty() {
-                ordered.sort_by_key(|t| order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX));
+                .filter(|t| is_seq(&t.0)),
+        );
+    let mut ordered: Vec<&(Vec<u8>, Vec<u8>, String)> = ordered.collect();
+    if !vtabs.is_empty() {
+        ordered.sort_by_key(|t| order.iter().position(|n| *n == t.0).unwrap_or(usize::MAX));
+    }
+    let mut vt_done = 0usize;
+    let vtab_line = |vn: &[u8], vq: &[u8]| {
+        let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
+        format!(
+            "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
+            lit(vn),
+            lit(vn),
+            lit(vq)
+        )
+    };
+    for (name, sql, list) in ordered {
+        // The virtual tables created before this table.
+        let at = order.iter().position(|n| n == name).unwrap_or(usize::MAX);
+        while let Some((vn, vq)) = vtabs.get(vt_done) {
+            if order.iter().position(|n| n == vn).unwrap_or(usize::MAX) > at {
+                break;
             }
-            let mut vt_done = 0usize;
-            for (name, sql, list) in ordered {
-                // The virtual tables created before this table.
-                let at = order.iter().position(|n| n == name).unwrap_or(usize::MAX);
-                while let Some((vn, vq)) = vtabs.get(vt_done) {
-                    if order.iter().position(|n| n == vn).unwrap_or(usize::MAX) > at {
-                        break;
-                    }
-                    if !writable {
-                        let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
-                        writable = true;
-                    }
-                    let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
-                    let _ = out.write_all(
-                        format!(
-                            "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
-                            lit(vn),
-                            lit(vn),
-                            lit(vq)
-                        )
-                        .as_bytes(),
-                    );
-                    vt_done += 1;
-                }
-                if is_seq(name) {
-                    // (v0.17 fix: the pin re-creates it first.)
-                    if !writable {
-                        let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
-                        writable = true;
-                    }
-                    let _ = out.write_all(
-                        b"CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);\n\
-                          DELETE FROM sqlite_sequence;\n",
-                    );
-                } else if name.starts_with(b"sqlite_stat") && name.len() == 12 {
-                    // (v0.17 fix: ANALYZE's tables replay their rows.)
-                    let _ = out.write_all(b"ANALYZE sqlite_schema;\n");
-                } else if name.starts_with(b"sqlite_") {
-                    continue;
-                } else if sql.starts_with(b"CREATE TABLE \"") || sql.starts_with(b"CREATE TABLE '")
-                {
-                    let _ = out.write_all(b"CREATE TABLE IF NOT EXISTS ");
-                    let _ = out.write_all(&sql[13..]);
-                    let _ = out.write_all(b";\n");
-                } else {
-                    let _ = out.write_all(sql);
-                    let _ = out.write_all(b";\n");
-                }
-                let quoted = format!("\"{}\"", String::from_utf8_lossy(name).replace('"', "\"\""));
-                let mut st = db
-                    .prepare(&format!("SELECT {list} FROM {quoted}"))
-                    .await
-                    .map_err(|e| format!("{e:?}"))?;
-                let head = [b"INSERT INTO ".as_slice(), &dump_name(name), b" VALUES("].concat();
-                while let Step::Row = st.step().await.map_err(|e| format!("{e:?}"))? {
-                    let mut line = head.clone();
-                    for i in 0..st.column_count() {
-                        if i > 0 {
-                            line.extend_from_slice(b",");
-                        }
-                        line.extend_from_slice(&dump_literal(
-                            st.column_value(i).unwrap_or(Value::Null),
-                        ));
-                    }
-                    line.extend_from_slice(b");\n");
-                    let _ = out.write_all(&line);
-                }
-            }
-            // Non-table schema objects follow all table data, in
-            // the oracle shell's .dump order (`ORDER BY type COLLATE
-            // NOCASE DESC`): views, then triggers (v0.16: after the
-            // data, so replaying it fires none), then explicit
-            // indexes, each in schema order. A text holding `--`
-            // ends with its `;` on a line of its own, as there.
-            let mut objs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            if let Ok(mut st) = db
-                .prepare(&format!(
-                    "SELECT type, sql FROM main.sqlite_schema AS o WHERE ({filter}) AND sql NOT NULL"
-                ))
-                .await
-            {
-                while let Ok(Step::Row) = st.step().await {
-                    if let (Some(t), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
-                        objs.push((t.to_vec(), q.to_vec()));
-                    }
-                }
-            }
-            for (vn, vq) in vtabs.iter().skip(vt_done) {
+            if data_only {
+                dump_rows(db, vn, vq, "*", rowids, out).await?;
+            } else {
                 if !writable {
                     let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
                     writable = true;
                 }
-                let lit = |b: &[u8]| String::from_utf8_lossy(b).replace('\'', "''");
-                let _ = out.write_all(
-                    format!(
-                        "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
-                        lit(vn),
-                        lit(vn),
-                        lit(vq)
-                    )
-                    .as_bytes(),
-                );
+                let _ = out.write_all(vtab_line(vn, vq).as_bytes());
             }
-            for ty in [&b"view"[..], b"trigger", b"index"] {
-                for (t, sql) in objs.iter() {
-                    if !t.eq_ignore_ascii_case(ty) {
-                        continue;
-                    }
-                    let _ = out.write_all(sql);
-                    let comment = sql.windows(2).any(|w| w == b"--");
-                    let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
+            vt_done += 1;
+        }
+        if is_seq(name) {
+            // (v0.17 fix: the pin re-creates it first.)
+            if !writable {
+                let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+                writable = true;
+            }
+            let _ = out.write_all(
+                b"CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);\n\
+                  DELETE FROM sqlite_sequence;\n",
+            );
+        } else if name.starts_with(b"sqlite_stat") && name.len() == 12 {
+            // (v0.17 fix: ANALYZE's tables replay their rows.)
+            if !data_only {
+                let _ = out.write_all(b"ANALYZE sqlite_schema;\n");
+            }
+        } else if name.starts_with(b"sqlite_") {
+            continue;
+        } else if data_only {
+        } else if sql.starts_with(b"CREATE TABLE \"") || sql.starts_with(b"CREATE TABLE '") {
+            let _ = out.write_all(b"CREATE TABLE IF NOT EXISTS ");
+            let _ = out.write_all(&sql[13..]);
+            let _ = out.write_all(b";\n");
+        } else {
+            let _ = out.write_all(sql);
+            let _ = out.write_all(b";\n");
+        }
+        dump_rows(db, name, sql, list, rowids, out).await?;
+    }
+    for (vn, vq) in vtabs.iter().skip(vt_done) {
+        if data_only {
+            dump_rows(db, vn, vq, "*", rowids, out).await?;
+            continue;
+        }
+        if !writable {
+            let _ = out.write_all(b"PRAGMA writable_schema=ON;\n");
+            writable = true;
+        }
+        let _ = out.write_all(vtab_line(vn, vq).as_bytes());
+    }
+    // Non-table schema objects follow all table data, in the oracle
+    // shell's .dump order (`ORDER BY type COLLATE NOCASE DESC`):
+    // views, then triggers (v0.16: after the data, so replaying it
+    // fires none), then explicit indexes, each in schema order. A
+    // text holding `--` ends with its `;` on a line of its own, as
+    // there.
+    if !data_only {
+        let mut objs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        if let Ok(mut st) = db
+            .prepare(&format!(
+                "SELECT type, sql FROM main.sqlite_schema AS o WHERE ({filter}) AND sql NOT NULL"
+            ))
+            .await
+        {
+            while let Ok(Step::Row) = st.step().await {
+                if let (Some(t), Some(q)) = (st.column_bytes(0), st.column_bytes(1)) {
+                    objs.push((t.to_vec(), q.to_vec()));
                 }
             }
-            // Last, as the pin shell writes it.
-            if writable {
-                let _ = out.write_all(b"PRAGMA writable_schema=OFF;\n");
-            }
-            let _ = out.write_all(b"COMMIT;\n");
-            Ok(Flow::Continue)
         }
-        _ => dot_nodb(line),
+        for ty in [&b"view"[..], b"trigger", b"index"] {
+            for (t, sql) in objs.iter() {
+                if !t.eq_ignore_ascii_case(ty) {
+                    continue;
+                }
+                let _ = out.write_all(sql);
+                let comment = sql.windows(2).any(|w| w == b"--");
+                let _ = out.write_all(if comment { b"\n;\n" } else { b";\n" });
+            }
+        }
     }
+    // Last, as the pin shell writes it.
+    if writable {
+        let _ = out.write_all(b"PRAGMA writable_schema=OFF;\n");
+    }
+    if !data_only {
+        let _ = out.write_all(b"COMMIT;\n");
+    }
+    Ok(())
 }
 
 /// Whether `sql` holds nothing but blanks and comments (the pin
@@ -1441,82 +1739,6 @@ fn no_sql(sql: &str) -> bool {
             rest = r.find("*/").map_or("", |i| &r[i + 2..]);
         } else {
             return rest.is_empty();
-        }
-    }
-}
-
-/// `dispatch`, opening the database `path` first if no input has
-/// needed it yet (v0.17: as the pin's shell, which opens it on the
-/// first statement or database command, so an empty script, `-help`,
-/// `-version`, `.quit` or `.exit` makes no file). `dot`: `input` is a
-/// dot-command (a line whose first character is `.`), else SQL.
-async fn dispatch_lazy(
-    db: &mut Option<Db>,
-    path: &str,
-    input: &str,
-    dot: bool,
-    params: &mut Params,
-    out: &mut impl Write,
-) -> Result<Flow, String> {
-    if dot && !needs_db(input.split_whitespace().next().unwrap_or("")) {
-        return dot_nodb(input);
-    }
-    let db = match db {
-        Some(d) => d,
-        // (Blank and comment-only input needs no database.)
-        None if !dot && no_sql(input) => return Ok(Flow::Continue),
-        // (A first `.open` replaces the database before anything
-        // reads it.)
-        None if input.split_whitespace().next() == Some(".open") => db.insert(open_db(":memory:")?),
-        None => db.insert(open_db(path)?),
-    };
-    dispatch(db, input, dot, params, out).await
-}
-
-/// Execute one input unit (statement or dot-command) against the
-/// current database, handling `.open` by swapping `db`.
-async fn dispatch(
-    db: &mut Db,
-    input: &str,
-    dot: bool,
-    params: &mut Params,
-    out: &mut impl Write,
-) -> Result<Flow, String> {
-    let trimmed = input.trim();
-    if dot {
-        let mut parts = trimmed.splitn(2, char::is_whitespace);
-        if parts.next() == Some(".open") {
-            let path = parts.next().map(str::trim).unwrap_or("");
-            if path.is_empty() {
-                return Err("usage: .open <path|:memory:>".to_string());
-            }
-            // The pin's order: close the current database first (a
-            // WAL-mode log is checkpointed and removed), then open
-            // the new one. Opening first would leave two connections
-            // on one file, and the old one's close would unlink the
-            // log the new one appends to. If the open fails, the pin
-            // carries on with a substitute in-memory database.
-            let old = std::mem::replace(db, open_db(":memory:")?);
-            let closed = close_db(old);
-            let opened = open_db(path).map(|new| *db = new);
-            closed?;
-            opened?;
-            return Ok(Flow::Continue);
-        }
-        match db {
-            Db::File(c) => dot_command(c, trimmed, params, out).await,
-            Db::Mem(c) => dot_command(c, trimmed, params, out).await,
-        }
-    } else {
-        match db {
-            // The statement as written (only leading space dropped):
-            // its trailing text can belong in sqlite_schema.sql.
-            Db::File(c) => run_statement(c, input.trim_start(), params, out)
-                .await
-                .map(|()| Flow::Continue),
-            Db::Mem(c) => run_statement(c, input.trim_start(), params, out)
-                .await
-                .map(|()| Flow::Continue),
         }
     }
 }
@@ -1641,21 +1863,22 @@ const PIN_OPTIONS: &[&str] = &[
 /// The command line as the pin's shell reads it (v0.17): options
 /// (`-x`, or `--x`) anywhere before `-` / `--`, which ends them; the
 /// first other argument is the database (`:memory:` when there is
-/// none), the rest SQL texts run in order. `Err`: the exit status
+/// none), the rest SQL texts run in order, each with its index in the
+/// command line (the `argv[N]: ` of an error). `Err`: the exit status
 /// `-help`, `-version` or a bad option ends with, having printed
 /// what the pin prints (no database is opened, so no file made).
 fn parse_args(
     argv0: &str,
     args: impl Iterator<Item = String>,
-) -> Result<(String, Vec<String>), ExitCode> {
+) -> Result<(String, Vec<(usize, String)>), ExitCode> {
     let mut file: Option<String> = None;
-    let mut cmds: Vec<String> = Vec::new();
+    let mut cmds: Vec<(usize, String)> = Vec::new();
     let mut opts = true;
-    for a in args {
+    for (k, a) in args.enumerate() {
         if !opts || !a.starts_with('-') {
             match file {
                 None => file = Some(a),
-                Some(_) => cmds.push(a),
+                Some(_) => cmds.push((k + 1, a)),
             }
             continue;
         }
@@ -1671,7 +1894,9 @@ fn parse_args(
                 return Err(ExitCode::SUCCESS);
             }
             "-version" => {
-                println!("3.54.1 (hipp {})", env!("CARGO_PKG_VERSION"));
+                // (v0.17: the pin's layout, with hipp's name where
+                // the pin prints its source id.)
+                println!("{}", version_line());
                 return Err(ExitCode::SUCCESS);
             }
             _ if PIN_OPTIONS.contains(&z) => {
@@ -1686,6 +1911,18 @@ fn parse_args(
         }
     }
     Ok((file.unwrap_or_else(|| String::from(":memory:")), cmds))
+}
+
+/// `-version` (v0.17): the pin's `VERSION DATE TIME SOURCE-ID
+/// (NN-bit)` with hipp's name and version in the source id's place —
+/// the first word, the SQLite version hipp is pinned to, stays the
+/// pin's, so tools that read it see 3.54.1.
+fn version_line() -> String {
+    format!(
+        "3.54.1 2026-10-16 14:45:20 hipp-{} ({}-bit)",
+        env!("CARGO_PKG_VERSION"),
+        usize::BITS
+    )
 }
 
 fn main() -> ExitCode {
@@ -1707,11 +1944,12 @@ fn run() -> ExitCode {
         Ok(x) => x,
         Err(code) => return code,
     };
-    let mut db = None;
-    let code = session(&mut db, &file, &cmds);
+    let mut sh = shell::Shell::new(file);
+    let code = session(&mut sh, &cmds);
+    sh.finish();
     // The oracle shell closes the database however the session
     // ended (v0.16: a WAL-mode log is checkpointed and removed).
-    if let Some(db) = db
+    if let Some(db) = sh.db.take()
         && let Err(e) = close_db(db)
     {
         eprintln!("Error: {e}");
@@ -1720,44 +1958,29 @@ fn run() -> ExitCode {
     code
 }
 
-/// Run the one-shot SQL arguments, or the interactive / stdin
-/// session, against `db`.
-fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
-    let mut out = std::io::stdout().lock();
-    let mut params = Params::new();
-
+/// Run the one-shot arguments, or the interactive / stdin session.
+fn session(sh: &mut shell::Shell, cmds: &[(usize, String)]) -> ExitCode {
     // One-shot mode: run the arguments in order, stop at the first
     // error. An argument whose first character is `.` is one
     // dot-command; any other is SQL (possibly several statements),
     // for which the pin opens the database even when it is blank
     // (v0.17: a dot-command opens it only if it reads it).
     if !cmds.is_empty() {
-        for arg in cmds {
-            let dot = arg.starts_with('.');
-            if !dot && db.is_none() {
-                match open_db(path) {
-                    Ok(d) => *db = Some(d),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        return ExitCode::FAILURE;
-                    }
+        for (k, arg) in cmds {
+            sh.ctx = shell::Ctx::Argv(*k);
+            sh.echo(arg);
+            let r = if arg.starts_with('.') {
+                match sh.meta(arg.trim_end()) {
+                    Ok(shell::Flow::Continue) => Ok(()),
+                    Ok(shell::Flow::Quit | shell::Flow::Exit) => return ExitCode::SUCCESS,
+                    Ok(shell::Flow::ExitWith(n)) => return ExitCode::from(n),
+                    Err(e) => Err(e),
                 }
-            }
-            let units = if dot {
-                vec![arg.trim_end().to_string()]
             } else {
-                split_statements(arg)
+                sh.sql(arg)
             };
-            for unit in units {
-                match block_on(dispatch_lazy(db, path, &unit, dot, &mut params, &mut out)) {
-                    Ok(Flow::Continue) => {}
-                    Ok(Flow::Exit) => return ExitCode::SUCCESS,
-                    Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
+            if r.is_err() {
+                return ExitCode::FAILURE;
             }
         }
         return ExitCode::SUCCESS;
@@ -1765,102 +1988,18 @@ fn session(db: &mut Option<Db>, path: &str, cmds: &[String]) -> ExitCode {
 
     // Interactive / stdin-batch mode.
     let stdin = std::io::stdin();
-    let interactive = stdin.is_terminal();
-    if interactive {
+    sh.interactive = stdin.is_terminal();
+    if sh.interactive {
         println!("hipp — reads and writes SQLite database files (format pin: SQLite 3.54.1)");
-        println!("Enter SQL or dot-commands (.tables .schema .dump .open .parameter .exit)");
+        println!("Enter SQL or dot-commands (\".help\" lists them)");
     }
-    let mut lines = stdin.lock().lines();
-    let mut buffer = String::new();
-    // A statement or dot-command failed: the script goes on, and
-    // the shell exits 1 at its end (or at `.exit`), as the pin's
-    // `process_input` returns `errCnt > 0`.
-    let mut failed = false;
-    let status = |failed: bool| {
-        if failed {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        }
-    };
-    loop {
-        if interactive {
-            print!("{}", if buffer.is_empty() { "hipp> " } else { "...> " });
-            let _ = std::io::stdout().flush();
-        }
-        let line = match lines.next() {
-            Some(Ok(l)) => l,
-            Some(Err(e)) => {
-                eprintln!("Error: {e}");
-                return ExitCode::FAILURE;
-            }
-            None => break,
-        };
-        // Lines keep their trailing spaces (the pin's input buffer
-        // does, and a schema text can hold them).
-        let line = line.as_str();
-        // The pin's `process_input`: between statements, a line whose
-        // first character is `.` is a dot-command (one with leading
-        // blanks is SQL: v0.17 fix) and one starting `#` is skipped.
-        if buffer.is_empty() && line.starts_with('#') {
-            continue;
-        }
-        if buffer.is_empty() && line.starts_with('.') {
-            match block_on(dispatch_lazy(
-                db,
-                path,
-                line.trim_end(),
-                true,
-                &mut params,
-                &mut out,
-            )) {
-                Ok(Flow::Continue) => {}
-                Ok(Flow::Exit) => return status(failed),
-                Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    failed = true;
-                }
-            }
-            continue;
-        }
-        if !buffer.is_empty() {
-            buffer.push('\n');
-        }
-        buffer.push_str(line);
-        if buffer.trim_end().ends_with(';') && split_script(&buffer).1 {
-            let script = std::mem::take(&mut buffer);
-            for stmt in split_statements(&script) {
-                match block_on(dispatch_lazy(db, path, &stmt, false, &mut params, &mut out)) {
-                    Ok(Flow::Continue) => {}
-                    Ok(Flow::Exit) => return status(failed),
-                    Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
-                    Err(e) => {
-                        // The rest of this input chunk is skipped (the
-                        // pin's shell runs a chunk as one exec, which
-                        // stops at its first error).
-                        eprintln!("Error: {e}");
-                        failed = true;
-                        break;
-                    }
-                }
-            }
-        }
+    // A statement or dot-command failed: the script goes on (unless
+    // `.bail on`), and the shell exits 1 at its end (or at `.exit`),
+    // as the pin's `process_input` returns `errCnt > 0`.
+    let (errs, flow) = sh.process(stdin.lock(), None);
+    match flow {
+        shell::Flow::ExitWith(n) => ExitCode::from(n),
+        _ if errs > 0 => ExitCode::FAILURE,
+        _ => ExitCode::SUCCESS,
     }
-    // A trailing unterminated statement still runs at EOF.
-    if !buffer.trim().is_empty() {
-        for stmt in split_statements(&buffer) {
-            match block_on(dispatch_lazy(db, path, &stmt, false, &mut params, &mut out)) {
-                Ok(Flow::Continue) => {}
-                Ok(Flow::Exit) => return status(failed),
-                Ok(Flow::ExitWith(n)) => return ExitCode::from(n),
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    }
-    let _ = out.flush();
-    status(failed)
 }

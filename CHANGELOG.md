@@ -5,6 +5,30 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The pin shell's dot-commands, output modes and `.dump` options (wave 20, unit `shell`)
+
+- hipp-cli only (no library or size change): `.mode` list, csv,
+  column, line, box, markdown, table, quote, json, tabs, insert and
+  ascii, `.headers`, `.separator`, `.nullvalue`, `.width`, byte for
+  byte as the pin's shell writes them (`render.rs`), with the column
+  names its titles show (`names.rs`); `.help` (the pin's text for the
+  commands hipp has), `.show`, `.print`, `.echo`, `.bail`, `.changes`,
+  `.timer`, `.output`, `.once`, `.read`, `.limit`, `.indexes`,
+  `.fullschema`; the pin's argument parsing, command prefixes, usage
+  lines and caret errors (`shell.rs`).
+- `.tables` (and `.indexes`) print the pin's sorted column grid
+  (hipp printed one name per line) and take its LIKE pattern.
+- `.dump --data-only`, `--nosys`, `--preserve-rowids`, `--newlines`
+  (ignored, as by the pin), `unknown option` for any other.
+- A new database file stays at 0 bytes until it is written, as the
+  pin leaves it (`lazy.rs`: the shell's storage holds the pager's
+  first page until a real write).
+- `-version` prints the pin's layout with hipp's name in the source
+  id's place: `3.54.1 2026-10-16 14:45:20 hipp-0.16.0 (64-bit)`.
+- `.parameter` with an unknown subcommand prints its help, as the pin.
+- Tests: `hipp-cli/tests/cli_v17_shell.rs`; `cli_diff.rs` and
+  `cli_v04.rs` compare `.tables` with the pin's grid.
+
 ### Index and rowid access into attached and TEMP tables (wave 20, unit `attach_access`)
 
 - `attach` leaf: a statement of main plans a rowid table of an
