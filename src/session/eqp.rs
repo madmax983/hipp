@@ -525,6 +525,15 @@ pub(super) struct Walk<'a> {
     /// The subqueries being shown are an index loop's IN probes (no
     /// Bloom filter of the IN operator; v0.17).
     probing: bool,
+    /// The statement's own catalog, then (v0.17, `attach`) the TEMP
+    /// database's and each attached database's, in main's numbering
+    /// (`Connection::src_db`), and each external source's database:
+    /// a loop over another database's table is described with that
+    /// database's catalog (`cat_of`).
+    #[cfg(feature = "attach")]
+    dbs: AVec<Option<(&'a Catalog, &'a Arena)>>,
+    #[cfg(feature = "attach")]
+    exts: AVec<u8>,
 }
 
 /// View copies are numbered from here (`cte::Expander`), then shown
@@ -544,7 +553,34 @@ impl<'a> Walk<'a> {
             mats: AVec::new(),
             update_from: false,
             probing: false,
+            #[cfg(feature = "attach")]
+            dbs: AVec::new(),
+            #[cfg(feature = "attach")]
+            exts: AVec::new(),
         }
+    }
+
+    /// The catalog that describes source `sp`'s table (v0.17,
+    /// `attach`: `dbs`).
+    #[cfg(feature = "attach")]
+    fn cat_of(&self, sp: &SubSource) -> (&'a Catalog, &'a Arena) {
+        let db = match usize::from(sp.ext).checked_sub(1) {
+            _ if !sp.temp => 0,
+            None => 1,
+            Some(k) => self.exts.as_slice().get(k).copied().unwrap_or(0),
+        };
+        match self.dbs.as_slice().get(usize::from(db)) {
+            Some(Some(c)) => *c,
+            _ => (self.cat, self.ca),
+        }
+    }
+
+    /// Describe with source `sp`'s catalog (`cat_of`) until `leave`.
+    #[cfg(feature = "attach")]
+    fn enter(&mut self, sp: &SubSource) -> (&'a Catalog, &'a Arena) {
+        let was = (self.cat, self.ca);
+        (self.cat, self.ca) = self.cat_of(sp);
+        was
     }
 
     /// Run `f` twice: once to learn the select numbers in use, then
@@ -1096,9 +1132,12 @@ impl<'a> Walk<'a> {
             if (sp.eqp.minmax != 0 || mm_core) && line.as_slice().starts_with(b"SCAN ") {
                 let mut l = copy_vec(b"SEARCH ");
                 l.extend_from_slice(line.as_slice().get(5..).unwrap_or(&[]));
+                #[cfg(feature = "attach")]
+                let cat = self.cat_of(sp).0;
+                #[cfg(not(feature = "attach"))]
+                let cat = self.cat;
                 let wr_pk = sp.derived.is_none()
-                    && self
-                        .cat
+                    && cat
                         .tables
                         .iter()
                         .find(|t| t.root == sp.root)
@@ -1122,7 +1161,13 @@ impl<'a> Walk<'a> {
             for (q, sq) in c.sources.iter().enumerate() {
                 if sp.eqp.bloom_lines & (1u64 << q) != 0 {
                     let mut b = AVec::new();
+                    #[cfg(feature = "attach")]
+                    let was = self.enter(sq);
                     self.bloom_line(sq, &mut b);
+                    #[cfg(feature = "attach")]
+                    {
+                        (self.cat, self.ca) = was;
+                    }
                     self.add(parent, &[b.as_slice()]);
                 }
             }
@@ -1384,7 +1429,13 @@ impl<'a> Walk<'a> {
 
     /// The loop over one FROM source.
     fn loop_line(&mut self, sp: &SubSource, out: &mut AVec<u8>, probes: &mut AVec<usize>) {
+        #[cfg(feature = "attach")]
+        let was = self.enter(sp);
         self.loop_line_of(sp, out, probes);
+        #[cfg(feature = "attach")]
+        {
+            (self.cat, self.ca) = was;
+        }
         // A semi-join loop (v0.17, `planner`): `SEARCH t EXISTS ...`.
         #[cfg(feature = "planner")]
         if sp.exists {
@@ -1527,14 +1578,18 @@ impl<'a> Walk<'a> {
     /// `planner`).
     #[cfg(feature = "planner")]
     fn auto_keys(&self, sp: &SubSource, ai: &crate::xplan::AutoIdx, out: &mut AVec<u8>) {
-        let t = self.cat.tables.iter().find(|t| t.root == sp.root);
+        #[cfg(feature = "attach")]
+        let (cat, ca) = self.cat_of(sp);
+        #[cfg(not(feature = "attach"))]
+        let (cat, ca) = (self.cat, self.ca);
+        let t = cat.tables.iter().find(|t| t.root == sp.root);
         out.push(b'(');
         for (i, k) in ai.keys.iter().enumerate() {
             if i > 0 {
                 out.extend_from_slice(b" AND ");
             }
             if let Some(c) = t.and_then(|t| t.columns.as_slice().get(k.col)) {
-                out.extend_from_slice(handle_bytes(self.ca, c.name));
+                out.extend_from_slice(handle_bytes(ca, c.name));
             }
             out.extend_from_slice(b"=?");
         }
@@ -1544,6 +1599,17 @@ impl<'a> Walk<'a> {
     /// The index part of a loop's line.
     #[cfg(feature = "expr_index")]
     fn access(&mut self, sp: &SubSource, a: &crate::xplan::IdxAccess, out: &mut AVec<u8>) {
+        #[cfg(feature = "attach")]
+        let was = self.enter(sp);
+        self.access_of(sp, a, out);
+        #[cfg(feature = "attach")]
+        {
+            (self.cat, self.ca) = was;
+        }
+    }
+
+    #[cfg(feature = "expr_index")]
+    fn access_of(&mut self, sp: &SubSource, a: &crate::xplan::IdxAccess, out: &mut AVec<u8>) {
         #[cfg(feature = "planner")]
         if a.or.is_some() {
             out.truncate(0);
@@ -1632,6 +1698,21 @@ impl<'a> Walk<'a> {
     /// UNIQUE one of exactly those columns when an index loop probes
     /// with the values), the affinities allowing it.
     #[cfg(feature = "planner")]
+    fn in_index_of(&mut self, x: &RExpr, p: &SubPlan) -> Option<AVec<u8>> {
+        #[cfg(feature = "attach")]
+        let was = match p.sources.as_slice().first() {
+            Some(sp) => self.enter(sp),
+            None => (self.cat, self.ca),
+        };
+        let line = self.in_index(x, p);
+        #[cfg(feature = "attach")]
+        {
+            (self.cat, self.ca) = was;
+        }
+        line
+    }
+
+    #[cfg(feature = "planner")]
     fn in_index(&self, x: &RExpr, p: &SubPlan) -> Option<AVec<u8>> {
         use crate::record::Affinity;
         if !p.uncorrelated
@@ -1648,7 +1729,13 @@ impl<'a> Walk<'a> {
             return None;
         }
         let sp = p.sources.as_slice().first()?;
-        if sp.derived.is_some() || sp.rec != 0 || sp.temp {
+        // (A table of another database read in place, v0.17 `attach`:
+        // `in_index_of` describes it with its own catalog.)
+        #[cfg(feature = "attach")]
+        let foreign = sp.temp && sp.root <= 1;
+        #[cfg(not(feature = "attach"))]
+        let foreign = sp.temp;
+        if sp.derived.is_some() || sp.rec != 0 || foreign {
             return None;
         }
         #[cfg(any(feature = "json", feature = "vtab"))]
@@ -1658,10 +1745,6 @@ impl<'a> Walk<'a> {
         // (A FROM subquery or view the flattener merged is still one
         // on the pin.)
         if !p.view_names.is_empty() {
-            return None;
-        }
-        #[cfg(feature = "attach")]
-        if sp.ext != 0 {
             return None;
         }
         let t = self.cat.tables.iter().find(|t| t.root == sp.root)?;
@@ -1886,7 +1969,7 @@ impl<'a> Walk<'a> {
             // `sqlite3FindInIndex`; v0.17 review fix, `planner`).
             #[cfg(feature = "planner")]
             if let RExpr::InSub(x, ..) = e
-                && let Some(line) = self.in_index(x, p)
+                && let Some(line) = self.in_index_of(x, p)
             {
                 self.add(parent, &[line.as_slice()]);
                 continue;
@@ -2583,7 +2666,21 @@ impl<S: Storage> Statement<'_, S> {
             return fut.await;
         }
         let conn = &*self.conn;
-        let walk = Walk::new(&conn.catalog, &conn.catalog_arena);
+        #[cfg_attr(not(feature = "attach"), allow(unused_mut))]
+        let mut walk = Walk::new(&conn.catalog, &conn.catalog_arena);
+        #[cfg(feature = "attach")]
+        if conn.alias.is_none() && !conn.is_temp {
+            walk.dbs.push(None);
+            walk.dbs
+                .push(conn.temp.as_deref().map(|c| (&c.catalog, &c.catalog_arena)));
+            for a in conn.attached.iter() {
+                walk.dbs
+                    .push(Some((&a.conn.catalog, &a.conn.catalog_arena)));
+            }
+            for e in conn.ext.borrow().iter() {
+                walk.exts.push(e.db);
+            }
+        }
         let (plan, ast, arena) = (&self.plan, &self.ast, &self.arena);
         Ok(walk.run(&|w| describe(w, plan, ast, arena, conn)))
     }

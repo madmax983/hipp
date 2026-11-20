@@ -1265,7 +1265,7 @@ fn coroutine_at(sources: &[SourcePlan], i: usize) -> bool {
 }
 
 /// Whether nested plan `q` of an `EXISTS` term is one the pin's
-/// `existsToJoin` turns into a join loop: one table of main (no view,
+/// `existsToJoin` turns into a join loop: one table (no view,
 /// CTE, subquery, virtual table or table-valued function), no
 /// aggregate, compound, window function or LIMIT / OFFSET of its own
 /// (only the implicit first-row LIMIT 1 every EXISTS gets).
@@ -1287,21 +1287,12 @@ fn exists_ok(q: &SubPlan) -> bool {
         && s.derived.is_none()
         && !tvf_source(s)
         && s.rec == 0
-        && !s.temp
+        // (A table of another database read in place: v0.17 `attach`,
+        // `Connection::owner`; one read whole has root 0.)
+        && (cfg!(feature = "attach") || !s.temp)
         && s.root > 1
         && s.kind == crate::sql::JoinKind::Inner
         && s.on.is_none()
-        && ext_none(s)
-}
-
-/// The source is no attached database's.
-fn ext_none(s: &SourcePlan) -> bool {
-    #[cfg(feature = "attach")]
-    if s.ext != 0 {
-        return false;
-    }
-    let _ = s;
-    true
 }
 
 /// The pin's `existsToJoin`: each `EXISTS (SELECT ... FROM t WHERE

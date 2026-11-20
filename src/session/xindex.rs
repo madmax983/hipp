@@ -459,6 +459,36 @@ fn rowid_eq(v: &OwnedValue) -> Option<i64> {
     }
 }
 
+/// The pager a source's B-tree reads go through (v0.17): the
+/// statement's own database's or (`attach`) an attached one's (`Db`),
+/// or the TEMP database's (`Temp`); `Connection::pager_of`, read by
+/// `on_db!` at each B-tree call of an access path.
+#[cfg(feature = "attach")]
+pub(super) enum Pg<'a, S: Storage> {
+    Db(&'a mut crate::pager::Pager<S>),
+    Temp(&'a mut crate::pager::Pager<crate::storage::MemStorage>),
+}
+
+/// Run B-tree call `$call`, which reads through pager `$p`, on the
+/// pager of database `$db` (`Connection::src_db`; v0.17, `attach`: a
+/// table of another database is read in place).
+macro_rules! on_db {
+    ($st:expr, $db:expr, |$p:ident| $call:expr) => {{
+        #[cfg(feature = "attach")]
+        let r = match $st.conn.pager_of($db)? {
+            Pg::Db($p) => $call.await?,
+            Pg::Temp($p) => $call.await.map_err(super::temp::mem_err)?,
+        };
+        #[cfg(not(feature = "attach"))]
+        let r = {
+            let _ = $db;
+            let $p = &mut $st.conn.pager;
+            $call.await?
+        };
+        r
+    }};
+}
+
 impl<'c, S: Storage> Statement<'c, S> {
     /// The rows source `sp` reads through its access path, against
     /// `row` (the enclosing row, or the combination so far for a
@@ -470,6 +500,16 @@ impl<'c, S: Storage> Statement<'c, S> {
         row: &RowData,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
         let mut out = AVec::new();
+        // A table of another database (v0.17, `attach`): read through
+        // its own pager, once the plan is checked to be still current.
+        #[cfg(feature = "attach")]
+        let db = self.conn.src_db(sp);
+        #[cfg(feature = "attach")]
+        if db != 0 {
+            self.conn.check_src(db, sp.root, sp.ncols, acc.root)?;
+        }
+        #[cfg(not(feature = "attach"))]
+        let db = 0u8;
         // A MULTI-INDEX OR loop (v0.17, `planner`): each branch's
         // rows in turn, a row at the first branch it satisfies.
         #[cfg(feature = "planner")]
@@ -518,7 +558,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 None => btree::ScanCursor::new(sp.root),
             };
             let mut buf = AVec::new();
-            while let Some(r) = cur.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            while let Some(r) = on_db!(self, db, |p| cur.next_row_into(p, &mut buf)) {
                 if hi_r.is_some_and(|h| r > h) {
                     break;
                 }
@@ -534,7 +574,9 @@ impl<'c, S: Storage> Statement<'c, S> {
         // column NULL — with no table lookup.
         if let Some(cover) = &acc.cover {
             let mut ents: AVec<AVec<OwnedValue>> = AVec::new();
-            let rowids = self.access_walk(sp.root, acc, row, Some(&mut ents)).await?;
+            let rowids = self
+                .access_walk(sp.root, acc, row, db, Some(&mut ents))
+                .await?;
             for (rowid, e) in rowids.iter().zip(ents.iter()) {
                 let mut rec: AVec<OwnedValue> = AVec::new();
                 for _ in 0..sp.ncols {
@@ -557,9 +599,9 @@ impl<'c, S: Storage> Statement<'c, S> {
             }
             return Ok(out);
         }
-        let rowids = self.access_rowids(sp.root, acc, row).await?;
+        let rowids = self.access_walk(sp.root, acc, row, db, None).await?;
         for rowid in rowids.iter() {
-            if let Some(p) = btree::seek_rowid(&mut self.conn.pager, sp.root, *rowid).await? {
+            if let Some(p) = on_db!(self, db, |p| btree::seek_rowid(p, sp.root, *rowid)) {
                 out.push((
                     source_row::<S::Error>(sp, *rowid, p.as_slice())?,
                     Some(*rowid),
@@ -697,16 +739,18 @@ impl<'c, S: Storage> Statement<'c, S> {
         acc: &crate::xplan::IdxAccess,
         row: &RowData,
     ) -> Result<AVec<i64>, S::Error> {
-        self.access_walk(table_root, acc, row, None).await
+        self.access_walk(table_root, acc, row, 0, None).await
     }
 
     /// `access_rowids`, also keeping each index entry's values in
-    /// `ents` (in step with the rowids) when given.
+    /// `ents` (in step with the rowids) when given; the B-trees are
+    /// database `db`'s (`Connection::src_db`, v0.17).
     async fn access_walk(
         &mut self,
         table_root: u32,
         acc: &crate::xplan::IdxAccess,
         row: &RowData,
+        db: u8,
         mut ents: Option<&mut AVec<AVec<OwnedValue>>>,
     ) -> Result<AVec<i64>, S::Error> {
         use crate::record::{compare_coll, compare_coll_in};
@@ -729,16 +773,14 @@ impl<'c, S: Storage> Statement<'c, S> {
                 match &sub.acc {
                     Some(a) => {
                         let found =
-                            alloc::boxed::Box::pin(self.access_walk(table_root, a, row, None))
+                            alloc::boxed::Box::pin(self.access_walk(table_root, a, row, db, None))
                                 .await?;
                         out.extend_from_slice(found.as_slice());
                     }
                     None => {
                         let mut cur = btree::ScanCursor::new(table_root);
                         let mut buf = AVec::new();
-                        while let Some(r) =
-                            cur.next_row_into(&mut self.conn.pager, &mut buf).await?
-                        {
+                        while let Some(r) = on_db!(self, db, |p| cur.next_row_into(p, &mut buf)) {
                             out.push(r);
                         }
                     }
@@ -754,7 +796,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         if acc.skip > 0 && acc.root != 0 {
             let mut cur = btree::IndexCursor::new(acc.root, acc.desc.as_slice());
             let mut prefixes: AVec<AVec<OwnedValue>> = AVec::new();
-            while let Some(e) = cur.next_entry(&mut self.conn.pager).await? {
+            while let Some(e) = on_db!(self, db, |p| cur.next_entry(p)) {
                 let p: AVec<OwnedValue> = e.values.iter().take(acc.skip).cloned().collect();
                 let dup = prefixes.as_slice().last().is_some_and(|l| {
                     l.iter().zip(p.iter()).enumerate().all(|(j, (x, y))| {
@@ -795,6 +837,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                     table_root,
                     &a2,
                     row,
+                    db,
                     ents.as_deref_mut(),
                 ))
                 .await?;
@@ -817,9 +860,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             if let Some(vals) = lists.as_slice().first() {
                 for v in vals.iter() {
                     if let Some(r) = rowid_eq(v)
-                        && btree::seek_rowid(&mut self.conn.pager, table_root, r)
-                            .await?
-                            .is_some()
+                        && on_db!(self, db, |p| btree::seek_rowid(p, table_root, r)).is_some()
                     {
                         out.push(r);
                     }
@@ -834,7 +875,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 None => btree::ScanCursor::new(table_root),
             };
             let mut buf = AVec::new();
-            while let Some(r) = cur.next_row_into(&mut self.conn.pager, &mut buf).await? {
+            while let Some(r) = on_db!(self, db, |p| cur.next_row_into(p, &mut buf)) {
                 if hi_r.is_some_and(|h| r > h) {
                     break;
                 }
@@ -889,13 +930,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut cur = if prefix.is_empty() && start.is_none() {
                 btree::IndexCursor::new(acc.root, acc.desc.as_slice())
             } else {
-                btree::IndexCursor::seek(
-                    &mut self.conn.pager,
+                on_db!(self, db, |p| btree::IndexCursor::seek(
+                    p,
                     acc.root,
                     acc.desc.as_slice(),
-                    probe.as_slice(),
-                )
-                .await?
+                    probe.as_slice()
+                ))
             };
             let (lo_r, hi_r) = if acc.range_rowid {
                 let f = |b: &Option<(OwnedValue, bool)>, lower: bool| match b {
@@ -914,7 +954,7 @@ impl<'c, S: Storage> Statement<'c, S> {
                 if none_left {
                     break;
                 }
-                let Some(e) = cur.next_entry(&mut self.conn.pager).await? else {
+                let Some(e) = on_db!(self, db, |p| cur.next_entry(p)) else {
                     break;
                 };
                 let vals = e.values.as_slice();
@@ -1048,6 +1088,118 @@ impl<'c, S: Storage> Statement<'c, S> {
     }
 }
 
+/// The connection whose catalog holds a FROM source's table (v0.17,
+/// `expr_index`): the statement's own, an attached database's, or —
+/// for a TEMP table read by a main statement — the TEMP database's
+/// (`Connection::owner`). The access and join planners ask it for
+/// the table's indexes and statistics, so a table of another database
+/// is planned as a table of main is.
+pub(super) enum Own<'a, S: Storage> {
+    Db(&'a Connection<S>),
+    #[cfg(feature = "attach")]
+    Temp(&'a Connection<crate::storage::MemStorage>),
+}
+
+impl<S: Storage> Clone for Own<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: Storage> Copy for Own<'_, S> {}
+
+impl<'a, S: Storage> Own<'a, S> {
+    /// The table whose B-tree is rooted at `root`.
+    pub(super) fn table(self, root: u32) -> Option<&'a crate::schema::TableDef> {
+        let cat = match self {
+            Own::Db(c) => &c.catalog,
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => &c.catalog,
+        };
+        cat.tables.iter().find(|t| t.root == root)
+    }
+
+    /// `Connection::table_models` there.
+    pub(super) fn table_models(
+        self,
+        arena: &Arena,
+        t: &crate::schema::TableDef,
+        s: &crate::xplan::Src,
+    ) -> (i32, AVec<crate::xplan::IdxModel>) {
+        match self {
+            Own::Db(c) => c.table_models(arena, t, s),
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => c.table_models(arena, t, s),
+        }
+    }
+
+    /// `Connection::not_null_cols` there.
+    pub(super) fn not_null_cols(self, t: &crate::schema::TableDef) -> AVec<bool> {
+        match self {
+            Own::Db(c) => c.not_null_cols(t),
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => c.not_null_cols(t),
+        }
+    }
+
+    /// `Connection::hint_solvable` there.
+    pub(super) fn hint_solvable(
+        self,
+        arena: &Arena,
+        t: &crate::schema::TableDef,
+        hint: crate::query::Hint,
+        s: &crate::xplan::Src,
+        conj: &[&RExpr],
+    ) -> Result<(), S::Error> {
+        match self {
+            Own::Db(c) => c.hint_solvable(arena, t, hint, s, conj),
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => c
+                .hint_solvable(arena, t, hint, s, conj)
+                .map_err(super::temp::mem_err),
+        }
+    }
+
+    /// `Connection::table_rows` there (`sqlite_stat1`).
+    #[cfg(feature = "planner")]
+    pub(super) fn table_rows(self, t: &crate::schema::TableDef) -> i32 {
+        match self {
+            Own::Db(c) => c.table_rows(t),
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => c.table_rows(t),
+        }
+    }
+
+    /// `Connection::table_has_stat` there.
+    #[cfg(feature = "planner")]
+    pub(super) fn table_has_stat(self, t: &crate::schema::TableDef) -> bool {
+        match self {
+            Own::Db(c) => c.table_has_stat(t),
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => c.table_has_stat(t),
+        }
+    }
+
+    /// `Connection::auto_candidate` there.
+    #[cfg(feature = "planner")]
+    pub(super) fn auto_candidate(self, t: &crate::schema::TableDef, col: usize) -> bool {
+        match self {
+            Own::Db(c) => c.auto_candidate(t, col),
+            #[cfg(feature = "attach")]
+            Own::Temp(c) => c.auto_candidate(t, col),
+        }
+    }
+}
+
+#[cfg(not(feature = "attach"))]
+impl<S: Storage> Connection<S> {
+    /// The connection whose catalog holds source `sp`'s table (`Own`;
+    /// without `attach`, a TEMP table's is never planned).
+    pub(super) fn owner(&self, sp: &SourcePlan) -> Option<Own<'_, S>> {
+        (!sp.temp).then_some(Own::Db(self))
+    }
+}
+
 // -------------------------------------------------------- planning
 
 /// What the access planner reads of one query core (v0.16).
@@ -1110,6 +1262,23 @@ pub(super) fn mark_xcover(
             || info.also_reads.iter().any(|(e, _)| f(e))
             || sources.iter().any(|sp| sp.on.as_ref().is_some_and(f));
         m.xcover = !uncovered;
+    }
+}
+
+/// The pin's `sqlite3ExprColUsed` (v0.17 review fix): reading a
+/// generated column of `t` marks every column read, so only an index
+/// holding every column but the rowid alias covers the statement
+/// (the pin's `isCovering`).
+pub(super) fn gen_reads(t: &crate::schema::TableDef, needed: &mut [bool]) {
+    if needed
+        .iter()
+        .zip(t.columns.iter())
+        .any(|(n, c)| *n && c.gen_expr.is_some())
+    {
+        needed.fill(true);
+        if let Some(n) = t.rowid_alias.and_then(|r| needed.get_mut(r)) {
+            *n = false;
+        }
     }
 }
 
@@ -1329,13 +1498,11 @@ impl<S: Storage> Connection<S> {
             conjuncts(f, &mut wconj);
         }
         for (i, sp) in sources.iter().enumerate() {
-            if sp.hint == crate::query::Hint::Any || sp.temp {
+            if sp.hint == crate::query::Hint::Any {
                 continue;
             }
-            let (Some(t), Some(&base)) = (
-                self.catalog.tables.iter().find(|t| t.root == sp.root),
-                offsets.get(i),
-            ) else {
+            let Some(o) = self.owner(sp) else { continue };
+            let (Some(t), Some(&base)) = (o.table(sp.root), offsets.get(i)) else {
                 continue;
             };
             let s = Src {
@@ -1356,7 +1523,7 @@ impl<S: Storage> Connection<S> {
             if let Some(on) = &sp.on {
                 conjuncts(on, &mut conj);
             }
-            self.hint_solvable(arena, t, sp.hint, &s, conj.as_slice())?;
+            o.hint_solvable(arena, t, sp.hint, &s, conj.as_slice())?;
         }
         Ok(())
     }
@@ -1388,17 +1555,17 @@ impl<S: Storage> Connection<S> {
         let mut marks: AVec<(usize, u8)> = AVec::new();
         for i in 0..n {
             let Some(sp) = sources.get(i) else { break };
-            // (A TEMP table's root is the temp database's page.)
-            if sp.derived.is_some() || sp.root <= 1 || sp.rec != 0 || sp.temp {
+            // (A table of another database is planned with its own
+            // catalog: `owner`, v0.17.)
+            if sp.derived.is_some() || sp.root <= 1 || sp.rec != 0 {
                 continue;
             }
             #[cfg(any(feature = "json", feature = "vtab"))]
             if sp.tvf != 0 {
                 continue;
             }
-            let Some(t) = self.catalog.tables.iter().find(|t| t.root == sp.root) else {
-                continue;
-            };
+            let Some(o) = self.owner(sp) else { continue };
+            let Some(t) = o.table(sp.root) else { continue };
             let Some(&base) = offsets.get(i) else { break };
             let s = Src {
                 base,
@@ -1447,12 +1614,7 @@ impl<S: Storage> Connection<S> {
             };
             // (A lone source's never-NULL columns: `never_null_terms`.)
             if n == 1 {
-                never_null_terms(
-                    &mut conj,
-                    self.not_null_cols(t).as_slice(),
-                    base,
-                    &NULL_TRUTH,
-                );
+                never_null_terms(&mut conj, o.not_null_cols(t).as_slice(), base, &NULL_TRUTH);
             }
             let ts = terms(conj.as_slice(), truth.as_slice(), &s, &avail);
             // The ORDER BY (or GROUP BY / DISTINCT) the loop may
@@ -1507,7 +1669,7 @@ impl<S: Storage> Connection<S> {
             // `planner`): the loop reads the argument's order.
             #[cfg(feature = "planner")]
             let mm = if n == 1 && info.has_agg && info.having.is_none() {
-                let nn = self.not_null_cols(t);
+                let nn = o.not_null_cols(t);
                 let nullable = |e: &RExpr| match crate::xplan::strip(e) {
                     RExpr::Column(slot, ..) => !slot
                         .checked_sub(base)
@@ -1536,6 +1698,7 @@ impl<S: Storage> Connection<S> {
             for c in 0..sp.ncols {
                 needed.push(core_reads(info, sources, base + c));
             }
+            gen_reads(t, needed.as_mut_slice());
             let limit = match info.limit {
                 Some(RExpr::Literal(OwnedValue::Integer(k))) if *k > 0 => Some(log_est(*k as u64)),
                 _ => None,
@@ -1573,10 +1736,10 @@ impl<S: Storage> Connection<S> {
                 jm: None,
             };
             #[cfg_attr(not(feature = "planner"), allow(unused_mut))]
-            let (width, mut models) = self.table_models(arena, t, &s);
+            let (width, mut models) = o.table_models(arena, t, &s);
             #[cfg(feature = "planner")]
             mark_xcover(models.as_mut_slice(), &s, info, sources);
-            let notnull = self.not_null_cols(t);
+            let notnull = o.not_null_cols(t);
             let tab = Table {
                 width,
                 indexes: models.as_slice(),
@@ -1584,7 +1747,7 @@ impl<S: Storage> Connection<S> {
                 hint: sp.hint,
                 notnull: notnull.as_slice(),
                 #[cfg(feature = "planner")]
-                rows: self.table_rows(t),
+                rows: o.table_rows(t),
             };
             #[cfg(not(feature = "planner"))]
             let chosen = crate::xplan::choose(&q, &s, &tab, ts.as_slice());
@@ -1977,6 +2140,7 @@ impl<S: Storage> Connection<S> {
             };
             needed.push(expr_refs_range(f, &r));
         }
+        gen_reads(t, needed.as_mut_slice());
         let q = Query {
             conj: conj.as_slice(),
             truth: truth.as_slice(),

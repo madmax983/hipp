@@ -478,6 +478,7 @@ pub(crate) fn or_costs(
             tmask: b.tmask.as_slice(),
             me: j.me,
             pre: j.pre,
+            pconj: conj.as_slice(),
         });
         let qb = Query {
             conj: conj.as_slice(),

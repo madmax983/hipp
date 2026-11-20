@@ -11,6 +11,621 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: shell — review fixes (2026-11-20)
+
+Ten review findings on `shell` (8872cc8), each reproduced and probed
+on the live pin first; the same bug patterns were searched for and
+fixed where found. hipp-cli only (`hipp-cli/src`, `hipp-cli/tests`):
+no library file changes, so no size gate moves.
+
+**Shipped.**
+1. **`.schema` options and patterns** (high; it printed nothing for
+   `--nosys`, `--indent`, `T%`, `sqlite_master`, exit 0, and an index
+   or trigger matched by its own name). Now the pin's `.schema
+   ?--indent? ?--nosys? ?LIKE-PATTERN?`: the pattern is matched
+   against `lower(tbl_name)` with LIKE (`ESCAPE '\'`), or GLOB when it
+   holds `*`, `?` or `[`; a pattern holding `.` is matched against the
+   literal text `%s.%s` (the 3.54.1 shell's query reads
+   `lower(format('%%s.%%s',sname,tbl_name))`, seen with `.schema
+   --debug`), so `main.t` matches nothing and `%.%` everything; a
+   pattern LIKE `sqlite_master` / `sqlite_schema` (else
+   `sqlite_temp_master` / `sqlite_temp_schema`) prints the schema
+   table's declaration first; `--nosys` drops names LIKE `sqlite\_%`;
+   with a pattern the eponymous modules hipp has follow (`/*
+   dbstat(...) */`, `/* generate_series(value) */`); `--indent` is the
+   pin's pretty layout (blanks collapsed, a text of 78 bytes or more
+   broken after `(` and each top-level `,`, the closing `)` on its own
+   line, an index's `WHERE` terms one `AND` per line, a NULL text a
+   blank line; derived from probing and checked over 2,700 generated
+   tables and indexes); a second pattern is `Usage: .schema ?--indent?
+   ?--nosys? ?LIKE-PATTERN?`, another dash word `Unknown option:
+   "..."` (both exit 1, checked before the database opens). The same
+   pattern elsewhere: a text that ends in a comment now ends as the
+   pin's `shell_complete_sql` makes it (`*/;`, `\n;`) in `.schema`,
+   `.fullschema` (which applied a `--` rule) and `.dump`'s views and
+   triggers; `.fullschema --indent` is accepted (it changes nothing on
+   the pin); a `*/` inside a view comment is written `**`; LIKE `_` and
+   GLOB `?` / `[...]` now take one UTF-8 character (`.tables`,
+   `.indexes`, `.help` used the same byte matcher).
+2. **`\r\n` in the columnar modes and line mode's names** (medium).
+   In column, box, table and markdown a `\r\n` breaks the cell's line
+   (the `\r` dropped); any other `\r` is `^M`. The display modes
+   (list, csv, line, ...) write the `\r` of a `\r\n` as is (they wrote
+   `^M`). Line mode's names: the column is as wide as the widest name
+   with control characters and ANSI CSI sequences (`ESC [ 3 1 m`)
+   taking no room; each name is cut to that width counting a control
+   character as one column, written raw (no `^X`), padded on the left
+   (probed: `x\ry` beside `z` prints `x\r`, `\x1b[31m` beside `z` is
+   padded by one). Same pattern in the input loop: a script line lost
+   two `\r`s before its `\n` (`lines()` drops one, the shell another);
+   now one, as the pin's `local_getline`.
+3. **A fresh file and write transactions that change nothing**
+   (medium). The pin writes page 1 when a write transaction commits on
+   an empty file even if it changed nothing; the shell now follows
+   those it can see (`Shell::track_txn`): `BEGIN IMMEDIATE` / `BEGIN
+   EXCLUSIVE` (every file), `PRAGMA [schema.]incremental_vacuum`,
+   `PRAGMA [schema.]schema_version = N` (that schema's file; not
+   `temp`); at the `COMMIT` / `END` / `RELEASE` that ends the
+   transaction (or at once in autocommit) `LazyFile::commit_empty`
+   writes the held page 1 (byte for byte the pin's, UTF-16 and other
+   page sizes included) and the layout is fixed, as after the pin's
+   commit; a `ROLLBACK` or a failed statement writes nothing.
+4. **A file that is not a database** (medium). The pin opens lazily:
+   `.tables` and `.indexes` print nothing (exit 0), `.limit` its table,
+   `.databases` `main: PATH r/w`, `.fullschema` `/* No STAT tables
+   available */` and exits 26 (the NOTADB code; 1 in a script), and
+   `.open` of such a file succeeds; hipp failed each with `Error:
+   BadMagic` / `TruncatedHeader`. The shell now takes those three open
+   errors (`BadMagic`, `TruncatedHeader`, `UnsupportedPageSize`) as the
+   pin's "not a database" and answers these commands as the pin does;
+   other commands still fail (their message text is hipp's).
+5. **`.dump` and `sqlite_sequence` beside a virtual table** (medium):
+   the virtual-table re-sort undid `sqlite_sequence`'s last place (the
+   pin's `ORDER BY tbl_name='sqlite_sequence', rowid`); the sort key is
+   now `(is sqlite_sequence, schema order)` and every virtual table
+   precedes it, with every option.
+6. **A line of only `.`** (low) is nothing, as the pin tokenizes from
+   the second character (`nArg==0`); `. print x` is `.print x` and
+   `..print` is the unknown command `.print`.
+7. **`\0` escapes** (low): a `"..."` argument ends at the first NUL its
+   escapes make (`.print`, `.separator`, `.nullvalue`, `.mode`'s
+   values), as the pin's C strings do.
+8. **`.read` nesting** (low): the limit of 25 counts standard input as
+   a level (24 nested files under stdin, 25 from an argument).
+9. **`.show` after `.mode column`** (low): the modes that write no
+   separator (column, box, markdown, table, json, insert) keep the
+   separators set before, as the pin's `.show` shows them (checked
+   over every pair of modes, before and after `.separator`).
+10. **The command-line forms of the settings** (low): `-ascii`, `-box`,
+    `-column`, `-csv`, `-json`, `-line`, `-list`, `-markdown`,
+    `-quote`, `-table`, `-tabs`, `-header` / `-noheader`, `-separator
+    SEP`, `-newline SEP`, `-nullvalue TEXT` (as written, no escapes),
+    `-cmd COMMAND` (run before the input, its errors at `line 0:`,
+    fatal only under `-bail`), `-bail`, `-echo`, `-batch`, `-noinit`,
+    applied in order; `missing argument to -X`; `-A`, `-zip`,
+    `-insert` are the pin's `unknown option`.
+
+**Probing notes (live pin).** `.schema --debug` prints the 3.54.1
+query: `SELECT shell_complete_sql(sql,1) FROM(SELECT
+shell_format_schema(shell_add_schema(sql,NULL,name),0) AS sql, ...,
+2 AS snum, 'main' as sname FROM "main".sqlite_schema UNION ALL ...
+pragma_module_list) WHERE lower(tbl_name) LIKE 't' ESCAPE '\' AND sql
+IS NOT NULL ORDER BY snum, rowid` (main 2, temp 4, attached 6, ...;
+`--nosys`: `name NOT LIKE 'sqlite__%' ESCAPE '_'`; GLOB for `*?[`;
+`lower(format('%%s.%%s',...))` for a dotted pattern). With a pattern
+the pin's eponymous modules (`completion`, `dbstat`, `fsdir`,
+`fts3tokenize`, `generate_series`, `pragma_module_list`) are listed
+by name after every database. `--indent`: a collapsed text of 78
+bytes is broken, 77 not; nothing inside a string, quoted name or line
+comment counts toward the parentheses; a text the collapse leaves
+ending in a line comment gets `;`, a newline and the open `)`s
+(`CREATE TABLE c(a -- d\n)` prints `CREATE TABLE c(a -- d);` /
+`);`). A fresh file gets 4,096 bytes from `BEGIN IMMEDIATE; COMMIT;`,
+`BEGIN EXCLUSIVE; COMMIT;`, `PRAGMA incremental_vacuum`, `PRAGMA
+schema_version = 0`, `PRAGMA default_cache_size = 10`, and 0 from
+`BEGIN; COMMIT;`, `BEGIN IMMEDIATE; ROLLBACK;`, `BEGIN IMMEDIATE;`
+left open at exit, `PRAGMA temp.schema_version = 0`; an attached
+file under `BEGIN IMMEDIATE` too. The pin's shell resolves `.s` /
+`.sc` to `.scanstats`, `.sh` / `.sy` to `.system`, `.p` to `.prompt`,
+`.l` to `.load`, `.i` to `.import`, `.f` to `.filectrl`, `.c` to
+`.clone` (commands hipp lacks).
+
+**Tests.** `hipp-cli/tests/cli_v17_shell.rs`, eight new tests against
+the live pin: `schema_options_and_patterns_match_pin` (51 argument
+sets in one-shot and script form, attached objects, texts ending in
+comments under `.schema`, `--indent`, `.fullschema`, `.dump`),
+`generated_schema_indent_matches_pin` (120 xorshift-generated tables
+and indexes), `crlf_cells_and_line_names_match_pin` (432 mode × value
+× name runs, 200 generated line-mode names, CRLF script input),
+`fresh_file_write_transactions_match_pin` (28 statement sets, page 1
+byte for byte), `not_a_database_file_matches_pin`,
+`dump_sequence_last_beside_virtual_tables`,
+`dot_line_details_match_pin` (`.` lines, `\0`, `.read` nesting, 144
+mode pairs' `.show`), `command_line_options_match_pin` (38 command
+lines and two scripts).
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` workspace suite included).
+
+Size Δ: none — no library file changed. tiny 0, full 0, max 0, xl 0.
+
+**Honest gaps.**
+- `.schema PATTERN` lists only the eponymous modules hipp has
+  (`dbstat`, `generate_series`), not the pin shell's `completion`,
+  `fsdir`, `fts3tokenize` and `pragma_module_list`, so `.schema %`
+  differs by those lines. `.schema --debug` is refused by name.
+- Write transactions hipp cannot run leave the file as hipp leaves it:
+  `PRAGMA locking_mode` and `default_cache_size` are unsupported in
+  the library (the pin writes page 1 for `default_cache_size = N`).
+  A transaction begun by a statement the shell does not follow (the
+  pin's other no-op writes) writes nothing.
+- Library, pre-existing, not this unit's: a fresh file hipp writes has
+  a change counter one higher than the pin's (the pager writes page 1
+  with counter 1 at open, then increments it at the first commit; the
+  pin's first commit writes 1), so the files' bytes 24-27 and 92-95
+  differ (sizes and contents otherwise match).
+- On a file that is not a database, `.schema`, `.dump`, `.parameter`
+  and SQL still fail with hipp's open error text (the pin's `Error: in
+  prepare, file is not a database (26)` and friends), and `.dump
+  --data-only`, `.parameter list` / `init` and `PRAGMA page_size` (which
+  the pin answers without reading the file) fail where the pin
+  succeeds.
+- A dot-command prefix that the pin resolves to one of its commands
+  hipp lacks (`.s`, `.sh`, `.p`, `.l`, `.i`, `.f`, `.c`) is hipp's
+  unknown-command error, not that command's usage or action.
+- Script input that is not valid UTF-8 is refused (`stream did not
+  contain valid UTF-8`); the pin reads bytes.
+
+### Parity: shell — hipp-cli dot-commands, output modes and `.dump` options (2026-11-20)
+
+Wave 20's hipp-cli unit (owner decision 2026-11-20: SQLite 3.54.1
+parity continues): the shell gaps `gaps_plan_cli` recorded, each
+probed on the live pin first (notes below). hipp-cli only
+(`hipp-cli/src`, `hipp-cli/tests`): no library file changes, so no
+size gate moves (tiny, full, max and xl Δ 0).
+
+**Shipped.**
+- *Output modes* (`render.rs`): `.mode list`, `csv`, `column`, `line`,
+  `box`, `markdown`, `table`, `quote`, `json`, `tabs`, `insert
+  [TABLE]` and `ascii`, byte for byte as the pin's query result
+  formatter writes them: csv / tabs quoting (empty, blanks, controls,
+  quotes, bytes past 0x7e, the column separator), `^X` escapes, text
+  up to its first NUL, reals as the core's REAL-to-text (list, csv,
+  quote, line, columnar) or `%.16g` (insert, json; `9e+999`), blobs
+  as text (display modes), `x'..'` (quote, insert) or `\u00XX` (json);
+  the columnar modes' widths (the pin's display widths: Kuhn's
+  combining and East Asian wide ranges, measured code point by code
+  point; a complete UTF-8 sequence is one character, any stray byte
+  one column), centred titles, numbers right-aligned, tab expansion,
+  multi-line cells, the rule between every row once any cell holds a
+  newline (or overflows a `.width`), box's rounded corners and its
+  `╘═╧═╛` under titles over no row, trailing blanks trimmed in
+  `column`; line mode's right-aligned names and indented continuation
+  lines. `.headers on|off|always` (and the pin's auto: titles shown in
+  the columnar modes only, `always` over no row), `.separator COL
+  ?ROW?`, `.nullvalue`, `.width` (fixed widths, negative ones right
+  aligned, a width of 1 that a cell overflows widened to 2, and the
+  pin's wrapping: half the cut's bytes in, the last blank, else the
+  last change between word and other characters, the cut itself
+  included), and `.mode` with no argument (the settings that differ
+  from the mode's: `--colsep`, `--null`, `--rowsep`, `--tablename`,
+  `--titles`, `--widths`), `--list`, and the options `--titles`,
+  `--colsep`, `--rowsep`, `--null`, `--tablename`, `--widths`.
+- *Column names* (`names.rs`): the library's `Statement` hands out
+  values only, so the shell names a result's columns from its parsed
+  text (`hipp::sql::parser`) and the catalog as the pin's
+  `generateColumnNames` does: aliases, a column reference by its
+  source's column (a table's declared name, a subquery's / view's /
+  CTE's own name made unique with `:1`, `rowid` or the INTEGER
+  PRIMARY KEY's name), `*` / `t.*` (USING / NATURAL columns once),
+  the text as written otherwise, a compound's first core, `column1`,
+  PRAGMA columns, RETURNING over the target table; only the modes
+  that show names pay for them.
+- *Dot-commands* (`shell.rs`, `help.rs`): `.help [PATTERN]` (the pin's
+  help text, verbatim, for the commands hipp has — its first lines,
+  the `.PATTERN*` glob with details or the `.mode` / `.output` /
+  `.once` usage text for one hit, the `%PATTERN%` LIKE search,
+  `Nothing matches`), `.show`, `.print`, `.echo`, `.bail`, `.changes`,
+  `.timer on|off|once` (`Run Time: real ... user ... sys ...`, CPU
+  times from `/proc/self/stat`), `.output [FILE|off|stdout||cmd]`,
+  `.once FILE` (the next SQL or dot-command only), `.read FILE|cmd`
+  (nesting limit 25, `.quit` ends the file, `.exit` the program),
+  `.width`, `.limit [NAME]` (the pin's table; setting a limit is
+  refused), `.indexes [-a|--sys|--expr] [PATTERN]`, `.fullschema`;
+  `.tables [PATTERN]` and `.indexes` in the pin's column grid, sorted
+  (they printed one name per line). The pin's argument parsing
+  (quotes, backslash escapes in `"..."`, one trailing `;` dropped),
+  command prefixes (`.h` is `.headers`, `.hel` `.help`, `.e` `.echo`,
+  `.ex` `.exit`, `.o` `.output`, `.on` `.once`; `.timer`, `.limit`
+  need their full names), `booleanValue` (`on`/`yes`/digits/`0x`
+  hex, else the pin's warning and false), the usage lines, and the
+  `line N:` / `FILE:N:` / `argv[N]:` caret errors (`unknown mode`,
+  `bad option`, `surplus argument`, `missing argument`, `unknown
+  option`, `bad argument`); the input loop as the pin's
+  `process_input` (a line of blanks and comments dropped, a `;` line
+  run, a chunk ending `; -- comment` run). `.parameter` with an
+  unknown subcommand prints its help, as on the pin.
+- *`.dump` options*: `--data-only` (no PRAGMA / BEGIN / COMMIT /
+  CREATE / ANALYZE lines, a virtual table's rows dumped where it
+  stands), `--nosys` (no `sqlite_` table), `--preserve-rowids` (the
+  column list written, `rowid` first unless an INTEGER PRIMARY KEY or
+  WITHOUT ROWID, read through the first of `rowid`, `_rowid_`, `oid`
+  no column takes), `--newlines` (taken; the pin 3.54.1 ignores it
+  too), one or two dashes, `unknown option`; patterns as before.
+- *A new database file* (`lazy.rs`): the pager writes page 1 when it
+  opens an empty file (library side, the tiny profile's open path);
+  the shell now opens files through `LazyFile`, which keeps that page
+  in memory until a write leaves it something other than a fresh
+  database, so the file stays at 0 bytes, as the pin leaves it, for
+  `SELECT`, `.tables`, `BEGIN; COMMIT;`, `PRAGMA page_size = N`, an
+  `ATTACH` of a new name; a write (CREATE, `PRAGMA user_version = 0`,
+  `journal_mode = wal`) writes it as before. No library change.
+- *Version line*: `-version` prints the pin's layout with hipp's name
+  in the source id's place: `3.54.1 2026-10-16 14:45:20 hipp-0.16.0
+  (64-bit)` (decision: the first word stays the pinned SQLite version
+  tools read; the date and time are the pin's check-in, the source id
+  — the one field that names a build — is hipp's).
+- *Lazy open*: `.indexes`, `.limit`, `.fullschema` open the database
+  (as the pin does), `.show`, `.help`, `.mode`, `.print` and the other
+  settings never do; argument errors of `.indexes`, `.dump` and
+  `.fullschema` are reported before the database is opened, as on the
+  pin.
+
+**Probing notes (live pin).** `.show` lists echo, eqp, explain,
+headers (`always` for an untouched columnar mode), mode, nullvalue,
+output, colseparator, rowseparator (`"\n"`, octal for other controls
+and stray bytes), stats, width, filename; it opens nothing. `.mode X`
+resets the separators and the NULL text to X's (csv `,` / `\r\n`, tabs
+`\t`, line `: `, quote / insert NULL `NULL`, json `null`, ascii
+`\037` / `\036`), keeps `.headers`, `.width` and the insert table;
+insert and json ignore the row separator, json and insert the NULL
+text, line the row separator. `.mode bogus` is `argv[2]: .mode bogus`
+/ caret / `Use ".help .mode" for more info` (exit 1 in one-shot,
+counted in a script); `.mode list extra` is no error, a third word is
+`bad argument`; `.headers maybe` warns on stderr and exits 0;
+`.headers true` and `-1` are not booleans. `.print hi;;` prints `hi;`.
+`.help` matches `.PATTERN*` against the whole first line (`*mo*` hits
+`.nonce`), case-sensitively; the LIKE fallback is case-insensitive.
+`.tables`: names LIKE the pattern (case-insensitive), sorted bytewise,
+in as many columns as fit 80 with two blanks between, the gap widened
+to at most five; a name past 80 wraps, one per line, blank lines
+between. `.indexes PATTERN` matches an index name LIKE `PATTERN%` (an
+automatic index also by its table's name). The wrap rules came from
+probing the pin column by column (`.width -10` over `a*m + ' '*s +
+b*12`, the threshold at half the cut's bytes: `aaüüü` breaks at 2 in
+a width of 3, `aüüüü` does not). The 3.54.1 shell reads `--newlines`
+and changes nothing (`unistr('x\u000ay')` either way). A fresh file
+stays 0 bytes for everything that writes no page (`PRAGMA page_size =
+1024` included), 4,096 bytes after `PRAGMA user_version = 0`.
+
+**Tests.** `hipp-cli/tests/cli_v17_shell.rs` (14 tests, byte for byte
+against the live pin: stdout, stderr — an SQL error's text aside —,
+exit status and the files left): every mode under every `.headers`,
+separator and NULL text (192 runs), reals and texts per mode, every
+printable ASCII character in csv / tabs; 240 xorshift-generated
+results (names, values of every kind, modes, titles, separators, NULL
+texts, widths); 160 generated `.width` wraps plus 17 named shapes;
+52 queries' column names in three modes; 141 dot-command lines each
+in one-shot mode, in a script and against a file; `.help` per
+command; 136 `.dump` runs over 34 option / pattern sets; 27 fresh-file
+cases; `.tables` / `.indexes` grids and patterns; `.fullschema`,
+`.limit`; `.echo`, `.bail`, `.changes`; `.read`, `.output`, `.once`
+(the files' bytes); `.timer`'s lines; the version line.
+`cli_diff.rs` and `cli_v04.rs` now compare `.tables` with the pin's
+grid (they expected one name per line). A scratch fuzzer of the same
+generators ran 2,000+ further cases at other seeds with no divergence.
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` workspace suite included).
+
+Size Δ: none — no library file changed. tiny 0, full 0, max 0, xl 0.
+
+**Honest gaps.**
+- `.help` with no pattern, or one that hits a command hipp lacks
+  (`.help %`, `.help DUMP`), lists only hipp's commands; the pin's
+  other commands (`.version`, `.import`, `.backup`, `.eqp`, ...), modes
+  (`html`, `tcl`, `qbox`, `psql`, `count`, `off`, ...) and options
+  (`.mode -v`, `--reset`, `--quote`, `--align`, `--limits` ...,
+  `.output -x` / `-e` / `--bom`, `.open --new` / `--readonly` ...,
+  setting a `.limit`) are refused by name. (`.schema --indent` /
+  `--nosys` and `.fullschema --indent`, which this entry listed but
+  were not refused, closed in v0.17: shell review fixes.)
+- SQL errors still print hipp's own text (`Error: Schema { kind:
+  UnknownColumn }`), not the pin's `Parse error near line N: ...`
+  with its caret.
+- `.indexes PATTERN` over TEMP / attached indexes follows the pin's
+  name rule, which the pin applies there in ways not fully probed.
+- `.timer`'s user / sys times come from `/proc/self/stat` (100 Hz
+  ticks; 0 off Linux).
+- The column names are the shell's reading of the statement: shapes
+  the corpus does not cover (a view over a table-valued function, a
+  CTE shadowing a view of the same name inside a subquery) may name a
+  column differently; a statement that does not parse names its
+  columns `column1`, ....
+- `ANALYZE` of several tables writes `sqlite_stat1` rows in another
+  order than the pin (library, pre-existing), which `.dump` shows.
+
+### Parity: attach_access — review fixes (2026-11-20)
+
+Two review findings on `attach_access` (91bdf2a), each reproduced
+and probed on the live pin first. Both are planner bugs that were
+already there for main tables; 91bdf2a exposed them on TEMP and
+attached tables when it began planning those tables like main ones.
+Both are fixed for every database, with no new gating: the code lives
+in `planner` (finding 1) and `expr_index` (finding 2), as before.
+
+**Shipped.**
+1. **A LEFT JOIN's ON term proves no other source's partial index**
+   (high, wrong answer). `SELECT t.id FROM aux.t LEFT JOIN m ON t.a
+   = 5` over `ti ON t(id) WHERE a IS NOT NULL` returned 2 for the pin's
+   1, 2, 3, because hipp scanned `t` through `ti` (`SCAN aux.t USING
+   INDEX ti`; the pin says `SCAN aux.t`). The TEMP and all-main forms
+   had the same bug. Root cause: `xplan::candidates` checked a
+   partial index's WHERE (`implies`) against every term of the
+   join's WHERE clause, including other sources' LEFT JOIN ON terms.
+   The pin's `whereUsablePartialIndex` accepts a term only when it is
+   not an outer-join ON term, or is one for this source
+   (`!ExprHasProperty(pExpr, EP_OuterON) || pExpr->w.iJoin==iTab`),
+   and, on a LEFT JOIN's right side, only its own ON terms
+   (`(jointype & JT_OUTER)==0 || ExprHasProperty(pExpr, EP_OuterON)`).
+   The join planner now gives `candidates` exactly those terms
+   (`JMask::pconj`, built with `xjoin::owns`). `owns` is also the test
+   that the partial automatic index already used, so the two now
+   share one function. The same pattern was searched for elsewhere:
+   the non-`planner` join path plans each source only with its own
+   terms (the WHERE, plus its own ON clause), and `hint_solvable`
+   (`INDEXED BY` with a partial index) gets the same per-source list.
+   Both were already right. A MULTI-INDEX OR branch keeps the branch's
+   own terms.
+2. **Reading a generated column marks every column read** (low,
+   EXPLAIN QUERY PLAN, and the planner choices that follow from it).
+   For `g(a INTEGER PRIMARY KEY, b, c AS (b*2), d AS (b||'x') STORED,
+   e)` with index `ge ON g(e, d)`, the query `SELECT a, d FROM g WHERE
+   e = 'dflt'` is `SEARCH g USING INDEX ge (e=?)` on the pin, where
+   hipp said `COVERING INDEX`. Likewise `SELECT count(*) FROM g WHERE
+   d = '1x'` is `SCAN g` on the pin, where hipp scanned `ge` as a
+   covering index. The pin's `sqlite3ExprColUsed` returns
+   `MASKBIT(nCol)-1` (every column) for a reference to a
+   `COLFLAG_GENERATED` column, stored or virtual. Such a statement is
+   covered only by an index holding every column but the INTEGER
+   PRIMARY KEY (`isCovering`, `sqlite3CreateIndex`). hipp now does
+   the same through `xindex::gen_reads`, which sets every column but
+   the rowid alias in the read-column set (`needed`, `JSrc::used`).
+   It is applied in all three places that build that set: lone and
+   non-`planner` sources, the join planner, and UPDATE / DELETE. The
+   rows were already right. Probed on the pin: a stored or virtual
+   column in a WHERE, ORDER BY, GROUP BY or result column, a join, a
+   self-join, UPDATE / DELETE, max(), and a table with only stored
+   generated columns whose index holds every column (still `COVERING`
+   on both).
+
+**Tests.** `tests/attach_access_v17.rs` has 2 new tests:
+- `partial_on_terms_and_generated_cover`: both reductions and their
+  variants (own ON terms, inner joins, WHERE terms, chained LEFT
+  JOINs, stored and virtual generated columns, UPDATE / DELETE), run
+  over main, TEMP and an attached database, with plans.
+- `generated_partial_left_joins`: an xorshift64 corpus of 24 scripts.
+  Each has partial indexes with random predicates in main, temp and
+  aux, and 12 three-way LEFT / inner joins with random ON and WHERE
+  terms, each with its plan. Every script is also run with all
+  tables in main. A statement whose all-main twin already differs is
+  compared as a set of rows: 11 of 1,329, all join-order cost ties of
+  main tables, and a set comparison still catches a lost row.
+
+With the finding 1 fix reverted, both tests fail. `hipp-cli/tests/
+cli_v17_attach_access.rs` adds `partial_on_terms_and_generated_cover`
+(7 queries with plans, byte-identical one-shot and over stdin).
+`HIPP_ACCESS_CORPUS=60` over the original corpus passed (31 of 8,911
+statements compared as sets).
+
+**Gates.** `cargo fmt --all` and a full `ci/local-gates.sh`: all gates
+passed. The first run failed only the max size gate (+104 B), and the
+ratchets were then raised as below. `tests/depth_v16.rs`,
+`tests/depth_tiny_v16.rs` and `tests/triggers_v16.rs` were also run
+with debug info on, with and without `--features vm`, and they pass.
+No recursive or async-nested path was changed.
+
+**Size Δ** (against 91bdf2a's figures). tiny 0 (76,928); full 0 (495,060); max +104
+(989,024 → 989,128: `gen_reads` and its three calls); xl +272
+(1,092,348 → 1,092,620: the `max` growth plus `JMask::pconj` and
+`xjoin::owns`). Ratchets were raised to the measured figures, each
+with a one-line justification in `ci/size-ratchet.toml`. Three
+smaller versions were tried: a `fill` form of `gen_reads` (no
+change), and a plain push loop in place of an iterator `collect` for
+`pconj`, which saved 240 B of the first xl figure of +512 B. No
+other offsetting saving was found. The owner must approve the raises
+before they are pushed.
+
+**Honest gaps.** Unchanged from the unit below. The 11 set-compared
+statements of the new corpus are join orders that hipp's planner
+already picks differently with every table in main (cost ties in
+3-way joins), outside this unit. The pin's `JT_LTORJ` rule (no
+partial index for a source to the left of a RIGHT JOIN) was probed
+(`t RIGHT JOIN m ON t.a = 5`), and it agrees, because hipp does not
+plan RIGHT JOINs through the cost-based join planner.
+
+### Parity: attach_access — index and rowid access into attached and TEMP tables (2026-11-20)
+
+Wave 20's unit (owner decision 2026-11-20: SQLite 3.54.1 parity
+continues): the three ATTACH items the `attach` unit left open, each
+probed on the live pin first (notes below). Item 1 is closed; items 2
+and 3 stay open with the design and the blocker recorded. Everything
+new is behind the `attach` leaf (planning behind `expr_index` /
+`planner` as on main); no new leaf, and no path without the leaf
+changes (tiny and full Δ 0).
+
+**Shipped (item 1).** A statement of main that reads a table of an
+attached database or of the TEMP database plans and reads it as it
+plans a main table, through that database's own catalog and pager;
+the table is no longer copied into main and scanned once per outer
+row.
+- *Planning* (`xindex::Own`, `Connection::owner`): the access planner
+  (`plan_accesses_from`, `hint_checks`), the join planner
+  (`plan_join_body`: join order, automatic indexes, Bloom filters,
+  `sqlite_stat1` estimates of that database) and EXISTS-to-join ask
+  the owning connection — this one, an attached one (`Connection<S>`)
+  or the TEMP one (`Connection<MemStorage>`) — for the table's index
+  models, NOT NULL columns, row estimates and automatic-index
+  candidates. `plan_ext_source` now gives an attached rowid table its
+  root page, defaults (columns added by ALTER TABLE), generated
+  columns and `INDEXED BY` / `NOT INDEXED` hint (an unknown index is
+  the pin's "no such index"); `plan_temp_source` keeps the hint it
+  already checked. So rowid seeks, ranges and IN lists, index seeks
+  (multi-column, DESC, partial, expression, collated indexes),
+  covering indexes, index order for ORDER BY, min() / max(),
+  MULTI-INDEX OR, skip-scans and automatic indexes all apply, and a
+  join may be driven from the TEMP or attached table, as on the pin.
+- *Reading* (`on_db!` in `session::xindex`, `Connection::pager_of` /
+  `src_db` / `check_src`): every B-tree call of an access path
+  (`access_rows`, `access_walk`: the rowid tree, index seeks and
+  walks, skip-scans, OR branches, table lookups) goes through the
+  pager of the source's database; the plan's table and index are
+  checked to still be there first (as `scan_temp` checks). A source
+  without an access path, an OR branch without one and an automatic
+  index's scan read the table whole as before (`scan_source` now
+  dispatches to `scan_temp`). The executors (materialised, streamed,
+  join) take the access path before the whole-table read
+  (`planned_foreign`); the frozen VM (`--features vm`) reads such a
+  source through the driver's access-path and automatic-index readers,
+  as it reads a WITHOUT ROWID table (`host_kind`), so
+  `tests/vm_rest_v17.rs`'s TEMP / attached joins stay on the VM.
+- *EXPLAIN QUERY PLAN* (`eqp::Walk::cat_of` / `enter`): a loop over
+  another database's table names its indexes, key columns and
+  automatic-index keys from that database's catalog: `SEARCH aux.t
+  USING INTEGER PRIMARY KEY (rowid=?)`, `SEARCH temp.tt USING
+  COVERING INDEX tv (v=?)`, `SCAN aux.t USING INDEX tb`, `USING INDEX
+  tb FOR IN-OPERATOR`, `SEARCH aux.t EXISTS ...`, `BLOOM FILTER ON
+  aux.t (b=?)`, in the pin's join order.
+- *Locking*: a statement of main that reads an attached table marks
+  that database used at its first step (`lock_ext`, the pin's
+  OP_Transaction), so DETACH inside the transaction is "database is
+  locked" even when its seeks read no row (found by
+  `tests/attach_v16.rs`'s generated corpus once seeks replaced the
+  whole-table read: an `UPDATE main.t ... FROM b.u` over an empty
+  `t` left `b` unlocked).
+- Performance: the 3,000 x 3,000 correlated lookup of the v0.16 gap
+  (`SELECT (SELECT c FROM aux.t WHERE a = m.x) FROM m`) and a 3,000 x
+  3,000 join with a TEMP table took 15.6 s together in a debug build;
+  0.8 s now (`lookups_seek`: four 4,000-row lookups, bound 8 s).
+
+**Not closed (honest gaps, below).**
+- *Item 2 — TEMP triggers on main or attached tables, and TEMP
+  triggers writing another database's table.* Probed (as the
+  `attach` unit did): the pin fires `CREATE TEMP TRIGGER tr AFTER
+  INSERT ON m BEGIN INSERT INTO aux.t ...; END` inside the firing
+  statement's transaction, rolling back every database it wrote on
+  ABORT / RAISE. Design: a trigger program runs as statements of
+  the connection that fires it (`trigger::run_step` plans on
+  `self`); a TEMP program fired by a main write would instead run
+  through main's router with `NEW.` / `OLD.` written in as literals
+  of their affinity and collation (`TrigValue`), and the firing
+  statement would open a statement journal / savepoint on every
+  database the program touches (main, temp, each attached one),
+  release them together on success, roll them all back on ABORT /
+  RAISE(ABORT) / a constraint error, and commit through the
+  super-journal when it autocommits (`commit_all`), with
+  `recursive_triggers`, `changes()` frames and the OR conflict
+  clauses carried across. Blocker: that multi-database statement
+  transaction does not exist — a statement's journal is per pager and
+  only explicit transactions span databases — and building it (with
+  its crash tests) is a unit of its own, well past this wave's size
+  line. Unchanged: such triggers are refused at CREATE
+  (`Unsupported`).
+- *Item 3 — a write of an attached / TEMP table reading another
+  database's view; `pragma_integrity_check` / `pragma_quick_check` as
+  table-valued functions.* Probed: `UPDATE aux.t SET c = (SELECT y2
+  FROM mv WHERE mv.x = t.a)` (`mv` a main view) and `UPDATE tt SET v =
+  (SELECT y2 FROM mv ...)` run on the pin; `SELECT * FROM
+  pragma_integrity_check` answers `ok`, `pragma_integrity_check(2)`
+  is "no such table: 2", `pragma_integrity_check('aux')` "no such
+  table: aux" (the argument is a table name), `aux.pragma_quick_check`
+  checks `aux`. hipp refuses all of them (`Unsupported`). Blockers:
+  the attached database's statement receives other databases' tables
+  as external sources, whose columns carry affinities but a view's
+  rows would need its expansion planned on main and handed over
+  (a new external-source kind); a table-valued pragma is planned
+  synchronously from the catalog (`pragma_source`), and the integrity
+  check reads every B-tree asynchronously — it would have to run in
+  `prepare` before planning. Neither was started.
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin and
+`EXPLAIN QUERY PLAN`): the pin plans another database's table exactly
+as a main one — `SEARCH aux.t USING INTEGER PRIMARY KEY (rowid=?)`
+for a correlated lookup and a join, `(rowid>? AND rowid<?)` for
+BETWEEN, `USING INDEX tb (b=?)` / `USING COVERING INDEX tb (b=?)`,
+`SCAN aux.t USING INDEX tb` for ORDER BY b, `USING INDEX tb FOR
+IN-OPERATOR` for `y IN (SELECT b FROM aux.t)`, `SEARCH tt USING
+COVERING INDEX tv (v=?)` with the TEMP table first in `tt, m WHERE
+m.x = tt.k AND tt.v = 5` (then `SEARCH m USING INTEGER PRIMARY KEY`),
+automatic indexes and Bloom filters on attached / TEMP tables in
+correlated subqueries and joins, partial / expression / generated-
+column indexes, `INDEXED BY tc` / `NOT INDEXED`, and "no such index"
+for an unknown `INDEXED BY`. The loop names the table as written
+(`aux.t`, `temp.tt`, `t`, the alias). A WITHOUT ROWID attached table
+is also searched by its PRIMARY KEY (`SCAN aux.w`, `SEARCH m ...`
+driving from it); hipp still reads it whole (gap below). DETACH of a
+database a statement of the open transaction read is "database is
+locked" even when the statement read no row of it (`FROM e, aux.t`
+with `e` empty; `x IN (SELECT a FROM aux.t WHERE a = 9)`). Every
+remaining divergence of the generated corpus (below) shows the same
+on the pin with every table in main: hipp's planner differs there
+already (mostly automatic indexes the pin builds for correlated
+subqueries over a table with statistics, and some 3-way join orders).
+
+**Tests.** `tests/attach_access_v17.rs` (7 tests; every script on both
+engines in twin directories, statement by statement — rows, plans as
+the pin shell's tree, failing statements): the probed forms over an
+attached and the TEMP database (31 queries with plans: seeks, joins
+in both directions, correlated / IN / EXISTS subqueries, OR, LEFT
+JOIN, INDEXED BY, GROUP BY, ORDER BY ... LIMIT, max()), writes of
+main reading them and the DETACH locks (the regression above), row
+decoding (ALTER TABLE defaults, generated columns, covering entries,
+the WITHOUT ROWID table's rows), plans across DROP / CREATE INDEX and
+a re-created table, the performance bound, and a generated corpus
+(xorshift64: four tables in main, temp and two attached databases
+with random indexes, data, added columns, generated columns and
+ANALYZE; 25 queries each with plans; every script also run with all
+tables in main, and a statement whose all-main twin already differs
+is compared as a set of rows; 12 scripts by default,
+`HIPP_ACCESS_CORPUS=150` ran clean: 87 of 21,691 statements, 0.4%,
+compared as sets). `hipp-cli/tests/cli_v17_attach_access.rs` (2 tests,
+one-shot and stdin byte-identical: 14 plans with their rows, and
+writes). No new multi-database write path (item 2 not built), so
+`tests/crash.rs` is unchanged; it passes.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed. `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info on, with and without `--features
+vm`: pass (no `STACK_*` constant needed re-measuring).
+
+**Size Δ.** tiny 0 (76,928); full 0 (495,060); max +2,792 (986,232 →
+989,024); xl +2,848 (1,089,500 → 1,092,348). Ratchets raised to the
+measured figures (`ci/size-ratchet.toml`), far under wave 18's and
+19's 8-12 KB: the TEMP database's pager arm of each B-tree call of an
+access path (`on_db!`, about 880 B: the TEMP connection's pager is a
+`Pager<MemStorage>`, so each call is instantiated twice), the owner
+lookups and per-database checks (`owner`, `src_db`, `check_src`,
+`pager_of`, `lock_ext`), the attached table's defaults / generated
+columns / hint in `plan_ext_source`, and EXPLAIN QUERY PLAN's
+per-source catalog. Tried and dropped: one async method per B-tree
+call on `Pg` in place of the macro (+80 B more). No offsetting saving
+found in the code the unit touches.
+
+**Honest gaps.**
+- (open: item 2) TEMP triggers on main or attached tables, and TEMP
+  triggers writing another database's table, are refused
+  (`Unsupported`); see "Not closed" above.
+- (open: item 3) A write of an attached or TEMP table reading another
+  database's view, and `pragma_integrity_check` / `pragma_quick_check`
+  as table-valued functions, are refused (`Unsupported`).
+- A WITHOUT ROWID table of another database (and a WITHOUT ROWID TEMP
+  table, refused in a mixed statement as before) is still read whole
+  with no access path; a join with an attached one keeps FROM order.
+- A write of an attached or TEMP table reading *main's* (or a third
+  database's) tables still gets them as external sources read whole
+  (the child connection has no route to the other pagers); only
+  statements of main seek into other databases.
+
 ### Parity: result_gaps — review fixes (2026-11-18)
 
 Six review findings on `result_gaps` (404d6ab), each reproduced and
@@ -559,16 +1174,16 @@ out-of-line `att_source` and one boxed future per database measured no
 smaller and were not kept.
 
 **Honest gaps.**
-- (open: items 1 and 2) TEMP triggers on main or attached tables, and
+- (still open after v0.17 attach_access, its item 2) TEMP triggers on main or attached tables, and
   TEMP triggers writing another database's table (qualified or not),
   are refused (`Unsupported`) or fail when they fire; see "Not closed"
   above. Non-TEMP triggers' qualified writes are the pin's error
   ("qualified table names are not allowed ...", unchanged).
-- (open: item 5) No index or rowid access path into attached or TEMP
+- (closed in v0.17: attach_access, item 1 there) No index or rowid access path into attached or TEMP
   tables (read whole once per execution, scanned per outer row); EXPLAIN
   QUERY PLAN shows `SCAN`, and a join with such a table keeps FROM
   order.
-- A write of an attached (or the TEMP) database reading *another*
+- (still open after v0.17 attach_access, its item 3) A write of an attached (or the TEMP) database reading *another*
   database's view is refused (`Unsupported`): external sources are
   tables only (a view's rows would need its column affinities there).
   Reads on main (queries, INSERT into main) expand such views.
@@ -578,7 +1193,8 @@ smaller and were not kept.
 - (closed in v0.17: attach review fixes) `UPDATE 't' SET 'a' = 5` (a
   string as a SET column name) does not parse (found along the way; not
   a qualifier).
-- `pragma_integrity_check` / `pragma_quick_check` as table-valued
+- (still open after v0.17 attach_access, its item 3)
+  `pragma_integrity_check` / `pragma_quick_check` as table-valued
   functions are refused (the v0.16 PRAGMA unit's gap, unchanged).
 - With a TEMP database every INSERT / UPDATE / DELETE is parsed once
   more by the ATTACH router (to find a TEMP write reading main).
@@ -1443,11 +2059,13 @@ and could not take the lone-table one).
   push-down, so mixed-affinity compound subqueries still compare with
   the compound's affinity there.
 - hipp-cli: a fresh database file gets its 4,096-byte header page
-  when opened (the pin leaves a 0-byte file until its first write);
-  the version line names hipp, not the pin's source id; the pin's
-  other options are refused rather than implemented; `.dump`'s own
-  options (`--data-only`, `--newlines`, `--nosys`,
-  `--preserve-rowids`) are still ignored.
+  when opened (the pin leaves a 0-byte file until its first write)
+  (closed in v0.17: shell); the version line names hipp, not the
+  pin's source id (closed in v0.17: shell — the pin's layout, hipp's
+  name in the source id's place); the pin's other options are refused
+  rather than implemented; `.dump`'s own options (`--data-only`,
+  `--newlines`, `--nosys`, `--preserve-rowids`) are still ignored
+  (closed in v0.17: shell).
 
 **Review fixes (2026-11-16).** Nine findings, each reproduced on the
 live pin and on hipp first; eight fixed at the root (the same pattern
@@ -1640,7 +2258,11 @@ Honest gaps the review fixes leave (new or found on the way):
   EQP only.
 - hipp-cli: the pin's other dot-commands (`.help`, `.mode`, `.print`,
   ...) are still unknown commands to hipp (they open no database, as
-  on the pin); `.indexes`, `.limit`, `.fullschema` open none in hipp.
+  on the pin); `.indexes`, `.limit`, `.fullschema` open none in hipp
+  (closed in v0.17: shell — those three and `.help`, `.mode`,
+  `.headers`, `.separator`, `.nullvalue`, `.print`, `.echo`, `.bail`,
+  `.changes`, `.timer`, `.output`, `.once`, `.read`, `.show`, `.width`
+  are the pin's; its others stay unknown).
 
 ### Parity: gaps_eval — evaluator and statement-level divergences (2026-11-15)
 
@@ -10198,7 +10820,7 @@ COLUMN cut and the catalog guard.
   and read identically). Pre-existing pager behaviour, found
   here; left for a pager unit (it is on the tiny path).
 - hipp-cli `.tables` prints one name per line (the oracle shell
-  columnates); `.dump` still differs from the shell's around
+  columnates) (closed in v0.17: shell); `.dump` still differs from the shell's around
   `PRAGMA foreign_keys` / `writable_schema` and `sqlite_stat1`.
 
 ### Parser and evaluator depth limits (2026-11-03)
@@ -13016,7 +13638,8 @@ statements run (and the temp UPDATE / DELETE refusal).
   temp database cannot read main, and only a whole SELECT can be fed
   across. TEMP triggers on main tables (and temp triggers whose
   bodies write main tables) stay refused, as before.
-- Temp tables read by a main statement are scanned in rowid order
+- (closed in v0.17: attach_access, except the WITHOUT ROWID refusal)
+  Temp tables read by a main statement are scanned in rowid order
   with no index access path (a temp index is not planned there, and
   `INDEXED BY` on them is checked only), so unordered output over a
   temp index can differ in order from the pin's; a WITHOUT ROWID
@@ -13657,12 +14280,13 @@ points (boxed futures).
 
 **Honest gaps:**
 
-- (still open in v0.17: `attach` unit, item 5) External sources are
+- (closed in v0.17: attach_access, for statements of main over rowid
+  tables) External sources are
   read whole, in rowid / key order, with no index access path: an unordered query whose pin plan walks an index
   of an attached table (or an `INSERT ... SELECT` without ORDER BY
   feeding one) can list rows in another order. `INDEXED BY` on such a
   source is not checked there.
-- A correlated subquery (or a join) over another database's table
+- (closed in v0.17: attach_access) A correlated subquery (or a join) over another database's table
   scans that table's rows once per evaluation; since the review fix
   they are read from the file once per execution and kept, but the
   scan stays linear per outer row (the review's 3000 x 3000 lookup:
@@ -13705,7 +14329,9 @@ points (boxed futures).
   database on its own (the pin's one statement commits them together
   through the super-journal).
 - ATTACH of a file that does not exist leaves a 4,096-byte empty
-  database where the pin leaves a 0-byte file: hipp's `Pager::open`
+  database where the pin leaves a 0-byte file (closed in v0.17 for
+  hipp-cli: shell, `LazyFile`; the library still writes page 1 of an
+  empty file it opens): hipp's `Pager::open`
   writes page 1 of every empty file it opens (main included, in every
   profile — the tiny profile's open path). The file is valid and reads
   the same on both engines (`PRAGMA aux.page_count` is 0 on both).
@@ -17173,7 +17799,8 @@ status. (v0.1 was pushed 2026-10-18, remote tip 6bd49a31.)
   stricter than SQLite, which aborts only the statement. Safe
   direction; named here until statement-level savepoints exist.
 - CLI divergences from the oracle shell (by design, D4 scope):
-  `.tables` prints one name per line (oracle uses a grid);
+  `.tables` prints one name per line (oracle uses a grid) (closed in
+  v0.17: shell);
   errors print hipp's remedy-named Debug form (`Error: Parse {
   offset, kind }`, `Error: Schema { kind }`, …) and exit 1;
   prompts only when stdin is a terminal; no `.import`/`.export`,

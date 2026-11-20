@@ -695,11 +695,17 @@ fn term_mask(t: &Term, bands: &[RefRange]) -> u64 {
 /// of the main database, a virtual table, or a JSON table-valued
 /// function (v0.17); no RIGHT / FULL join.
 pub(super) fn join_source_ok(sp: &SourcePlan) -> bool {
-    if sp.kind.pads_left() || sp.rec != 0 || sp.temp {
+    if sp.kind.pads_left() || sp.rec != 0 {
+        return false;
+    }
+    // (A table of another database read in place, v0.17 `attach`:
+    // `Connection::owner`; its root is 0 when it is read whole.)
+    #[cfg(not(feature = "attach"))]
+    if sp.temp {
         return false;
     }
     #[cfg(feature = "attach")]
-    if sp.ext != 0 {
+    if sp.temp && sp.root <= 1 {
         return false;
     }
     if virtual_source(sp) {
@@ -1066,16 +1072,16 @@ impl<S: Storage> Connection<S> {
         use crate::xplan::{conjuncts, log_est, terms};
         let n = sources.len();
         // Per source: its table (None for a virtual one).
-        let mut tabs: AVec<Option<&crate::schema::TableDef>> = AVec::new();
+        let mut tabs: AVec<Option<(xindex::Own<'_, S>, &crate::schema::TableDef)>> = AVec::new();
         for sp in sources.iter() {
             if virtual_source(sp) {
                 tabs.push(None);
                 continue;
             }
-            let Some(t) = self.catalog.tables.iter().find(|t| t.root == sp.root) else {
+            let Some((o, t)) = self.owner(sp).and_then(|o| Some((o, o.table(sp.root)?))) else {
                 return Ok(false);
             };
-            tabs.push(Some(t));
+            tabs.push(Some((o, t)));
         }
         let offsets: AVec<usize> = cur.offsets.clone();
         let first_src = cur.first_src;
@@ -1175,28 +1181,31 @@ impl<S: Storage> Connection<S> {
         }
         for e in prop.as_mut_slice().iter_mut() {
             let RExpr::IsNull(x, not) = e else { continue };
-            let never = match &**x {
-                RExpr::Rowid(s) => s
-                    .checked_sub(first_src)
-                    .is_some_and(|i| !can_null.as_slice().get(i).copied().unwrap_or(true)),
-                RExpr::Column(slot, ..) => (0..n).any(|i| {
-                    let base = offsets.as_slice().get(i).copied().unwrap_or(0);
-                    let sp = sources.as_slice().get(i);
-                    let nc = sp.map_or(0, |s| s.ncols);
-                    *slot >= base
-                        && *slot < base + nc
-                        && !can_null.as_slice().get(i).copied().unwrap_or(true)
-                        && (sp.is_some_and(|s| s.rowid_alias == Some(*slot - base))
-                            || tabs.as_slice().get(i).copied().flatten().is_some_and(|t| {
-                                self.not_null_cols(t)
-                                    .as_slice()
-                                    .get(*slot - base)
-                                    .copied()
-                                    .unwrap_or(false)
-                            }))
-                }),
-                _ => false,
-            };
+            let never =
+                match &**x {
+                    RExpr::Rowid(s) => s
+                        .checked_sub(first_src)
+                        .is_some_and(|i| !can_null.as_slice().get(i).copied().unwrap_or(true)),
+                    RExpr::Column(slot, ..) => (0..n).any(|i| {
+                        let base = offsets.as_slice().get(i).copied().unwrap_or(0);
+                        let sp = sources.as_slice().get(i);
+                        let nc = sp.map_or(0, |s| s.ncols);
+                        *slot >= base
+                            && *slot < base + nc
+                            && !can_null.as_slice().get(i).copied().unwrap_or(true)
+                            && (sp.is_some_and(|s| s.rowid_alias == Some(*slot - base))
+                                || tabs.as_slice().get(i).copied().flatten().is_some_and(
+                                    |(o, t)| {
+                                        o.not_null_cols(t)
+                                            .as_slice()
+                                            .get(*slot - base)
+                                            .copied()
+                                            .unwrap_or(false)
+                                    },
+                                ))
+                    }),
+                    _ => false,
+                };
             if never {
                 *e = RExpr::Literal(OwnedValue::Integer(i64::from(*not)));
             }
@@ -1261,29 +1270,32 @@ impl<S: Storage> Connection<S> {
         // The pin's min() / max() optimisation (v0.17, `planner`):
         // the join reads the argument's order.
         let mm = has_agg && having.is_none() && {
-            let nullable = |e: &RExpr| match crate::xplan::strip(e) {
-                RExpr::Column(slot, ..) => !(0..n).any(|i| {
-                    let base = offsets.as_slice().get(i).copied().unwrap_or(0);
-                    let sp = sources.as_slice().get(i);
-                    let nc = sp.map_or(0, |s| s.ncols);
-                    *slot >= base
-                        && *slot < base + nc
-                        && !can_null.as_slice().get(i).copied().unwrap_or(true)
-                        && (sp.is_some_and(|s| s.rowid_alias == Some(*slot - base))
-                            || tabs.as_slice().get(i).copied().flatten().is_some_and(|t| {
-                                self.not_null_cols(t)
-                                    .as_slice()
-                                    .get(*slot - base)
-                                    .copied()
-                                    .unwrap_or(false)
-                            }))
-                }),
-                RExpr::Rowid(x) => x
-                    .checked_sub(first_src)
-                    .is_none_or(|i| can_null.as_slice().get(i).copied().unwrap_or(true)),
-                RExpr::Literal(v) => matches!(v, OwnedValue::Null),
-                _ => true,
-            };
+            let nullable =
+                |e: &RExpr| match crate::xplan::strip(e) {
+                    RExpr::Column(slot, ..) => !(0..n).any(|i| {
+                        let base = offsets.as_slice().get(i).copied().unwrap_or(0);
+                        let sp = sources.as_slice().get(i);
+                        let nc = sp.map_or(0, |s| s.ncols);
+                        *slot >= base
+                            && *slot < base + nc
+                            && !can_null.as_slice().get(i).copied().unwrap_or(true)
+                            && (sp.is_some_and(|s| s.rowid_alias == Some(*slot - base))
+                                || tabs.as_slice().get(i).copied().flatten().is_some_and(
+                                    |(o, t)| {
+                                        o.not_null_cols(t)
+                                            .as_slice()
+                                            .get(*slot - base)
+                                            .copied()
+                                            .unwrap_or(false)
+                                    },
+                                ))
+                    }),
+                    RExpr::Rowid(x) => x
+                        .checked_sub(first_src)
+                        .is_none_or(|i| can_null.as_slice().get(i).copied().unwrap_or(true)),
+                    RExpr::Literal(v) => matches!(v, OwnedValue::Null),
+                    _ => true,
+                };
             match crate::xmulti::minmax(
                 items.as_slice(),
                 order_by.as_slice(),
@@ -1332,11 +1344,11 @@ impl<S: Storage> Connection<S> {
                 break;
             };
             match t {
-                Some(t) => {
-                    let (w, mut ms) = self.table_models(arena, t, s);
+                Some((o, t)) => {
+                    let (w, mut ms) = o.table_models(arena, t, s);
                     xindex::mark_xcover(ms.as_mut_slice(), s, &core_info, sources.as_slice());
                     models.push((w, ms));
-                    notnulls.push(self.not_null_cols(t));
+                    notnulls.push(o.not_null_cols(t));
                 }
                 None => {
                     models.push((1, AVec::new()));
@@ -1376,7 +1388,7 @@ impl<S: Storage> Connection<S> {
             ) else {
                 break;
             };
-            let Some(t) = t else {
+            let Some((o, t)) = *t else {
                 // A virtual table: no b-tree loops, only its own.
                 #[cfg(not(any(feature = "json", feature = "vtab")))]
                 let vl: AVec<(u64, i32, i32)> = AVec::new();
@@ -1519,8 +1531,9 @@ impl<S: Storage> Connection<S> {
                         .copied()
                         .unwrap_or(crate::record::Affinity::Blob),
                 );
-                good.push(self.auto_candidate(t, c));
+                good.push(o.auto_candidate(t, c));
             }
+            xindex::gen_reads(t, used.as_mut_slice());
             jsrcs.push(JSrc {
                 s,
                 tab: Table {
@@ -1529,7 +1542,7 @@ impl<S: Storage> Connection<S> {
                     wr: !t.has_rowid(),
                     hint: sp.hint,
                     notnull: nn.as_slice(),
-                    rows: self.table_rows(t),
+                    rows: o.table_rows(t),
                 },
                 ts,
                 tmask,
@@ -1543,7 +1556,7 @@ impl<S: Storage> Connection<S> {
                 semi: sp.exists,
                 auto_ok: sp.hint == crate::query::Hint::Any,
                 root: sp.root,
-                stat: self.table_has_stat(t),
+                stat: o.table_has_stat(t),
                 vt: None,
                 ors,
             });
@@ -2123,7 +2136,7 @@ impl<S: Storage> Connection<S> {
     /// pin's `columnIsGoodIndexCandidate`): no index starts with it,
     /// and none with statistics holds it where a prefix ending there
     /// matches more than 4 rows.
-    fn auto_candidate(&self, t: &crate::schema::TableDef, c: usize) -> bool {
+    pub(super) fn auto_candidate(&self, t: &crate::schema::TableDef, c: usize) -> bool {
         let ca = &self.catalog_arena;
         for ix in self.catalog.indexes_for(ca, handle_bytes(ca, t.name)) {
             for (j, k) in ix.columns.iter().enumerate() {

@@ -130,10 +130,21 @@ CREATE VIEW w(n) AS SELECT count(*) FROM t;
         ".schema must be byte-identical (view comment included)"
     );
 
-    // .tables: hipp prints one name per line (documented v0.2
-    // divergence from the oracle's grid) — compare as a set.
+    // .tables: the oracle's grid (v0.17: hipp printed one name per
+    // line), byte for byte on the same database.
     let hout = run(hipp_bin(), &[hdb.to_str().unwrap(), ".tables"]);
-    let names: Vec<&str> = std::str::from_utf8(&hout.stdout).unwrap().lines().collect();
+    let oout = run(
+        oracle().to_str().unwrap(),
+        &[hdb.to_str().unwrap(), ".tables"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&hout.stdout),
+        String::from_utf8_lossy(&oout.stdout)
+    );
+    let names: Vec<&str> = std::str::from_utf8(&hout.stdout)
+        .unwrap()
+        .split_whitespace()
+        .collect();
     assert_eq!(names, vec!["t", "v", "w"]);
 
     // .dump from hipp, replayed into the oracle: the view comes
