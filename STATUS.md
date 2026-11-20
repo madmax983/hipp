@@ -11,6 +11,662 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: result_gaps — review fixes (2026-11-18)
+
+Six review findings on `result_gaps` (404d6ab), each reproduced and
+probed on the live pin first. All ungated fixes on claimed paths; no
+new leaf.
+
+**Shipped.**
+1. **An EXISTS over a UNION with a LIMIT other than 1 or an OFFSET
+   merges again** (high; a regression of item 9's `mark_exists_inert`,
+   which made every UNION there a UNION ALL): `EXISTS (SELECT a FROM t
+   UNION SELECT a FROM t LIMIT 2 OFFSET 4)` is 0 and `EXISTS (SELECT a
+   FROM t UNION SELECT abs(-9223372036854775808) LIMIT 2)` fails, as on
+   the pin. The root cause was the pin's UNION-with-LIMIT-1 shortcut,
+   which hipp modelled in three places (executor, EQP, merge keys) for
+   all-UNION chains only; it is now one parser rule
+   (`parser::union_limit_one`), and the executor special cases
+   (`union_first_row`, `first_core_row`, the EQP and `merge_member`
+   branches, the VM's `CompInfo::first_row`) are gone. Its shapes,
+   probed: a compound with no ORDER BY (an EXISTS drops its own) and no
+   OFFSET whose LIMIT is exactly 1 reads the UNIONs of its trailing run
+   of UNION / UNION ALL operators as UNION ALL — the operators left of
+   its last INTERSECT / EXCEPT keep theirs (`a UNION ALL 3 UNION a
+   LIMIT 1` is t's first row, `a EXCEPT 1 UNION 0 LIMIT 1` is 2); the
+   LIMIT is an integer with any signs at the top level, in FROM / IN
+   subqueries, CTEs and views (`+1`, `-(-1)`, `(1)`, `0x1`; not `'1'`,
+   `1.0`, `0+1`, `1 OFFSET 0`, `0, 1`), and in a scalar / EXISTS
+   subquery the implicit one or a bare integer token 1 (the pin's `X <>
+   0` rewrite keeps no other). A shortcut core computes no later core
+   (`SELECT 1 UNION SELECT abs(..) LIMIT 1` is 1) and needs no merge
+   collation (`a COLLATE bogus .. UNION .. LIMIT 1` answers). An EXISTS
+   core is a placeholder only when every operator to its right is a
+   UNION ALL (`Statement::dest`).
+2. **A co-routine's collated order delivers an equal GROUP BY and
+   ORDER BY** (high; items 3 and 4): `SELECT x, count(*) FROM (SELECT c
+   AS x, n FROM t ORDER BY 1 COLLATE NOCASE LIMIT 9) GROUP BY x ORDER BY
+   x` keeps the subquery's NOCASE order (`|1 a|1 A|1 a|1 b|1 B|1`), as
+   the pin's `orderByGrp` with `sqlite3WhereIsSorted` omits the sorter;
+   the plan already said so, the executor sorted the groups again. The
+   reader's ORDER BY is dropped at plan time when the subquery's order
+   delivers the GROUP BY and that ORDER BY in its own directions
+   (`plan_core`, `sub_delivers`); a DESC reader still sorts.
+3. **A partly index-delivered ORDER BY ends its loop at the LIMIT's
+   prefix group** (medium; item 1): the pin computes every row as it
+   comes (`nOBSat > 0`), and `pushOntoSorter` flushes at each new prefix
+   group, ending the loop (`OP_IfNot iLimit -> labelDone`) once OFFSET
+   + LIMIT rows went out — the first row of the next group is computed,
+   later ones never visited. `TopN::part` (carried in `pre_skip`'s third
+   bound) stops the materializing, streamed, subquery and `query`-only
+   projections there: `SELECT CASE WHEN a=1 THEN abs(..) ELSE a END FROM
+   t WHERE b>=0 ORDER BY b, a LIMIT 1` over an index on b is 4, as on
+   the pin; a scalar subquery and an INSERT's SELECT stop too.
+4. **A statement's names and string literals are handles into its
+   stored text** (medium; item 6 overstated what shipped: a row still
+   cost 8 B of arena beyond its text, so a 3,000-row `(i, 'xi')` INSERT
+   of 45,800 B failed under the 64 KiB `stmt_max`): every lexer of
+   `prepare` reads the arena's copy of the text, and
+   `Arena::handle_or_copy` returns a handle to bytes the arena already
+   holds (an unquoted or bracketed name, a literal without `''`). The
+   arena's high water for such a statement is now its text: 4,000-row
+   `(i, 'xi')` (61,800 B), `(abs(i), 1)`, `(random(), 1)` and 5,000-row
+   `(random())` INSERTs run under `Config::default()`; only a statement
+   whose text nears `stmt_max` fails (by design).
+5. **The "nested too deep" count is the pin's cursor count** (low;
+   item 7 counted CTE references, views and FROM subqueries only):
+   probed, the count at a CTE reference is `Parse.nTab` — one cursor
+   per FROM item a select's `selectExpander` assigns before its
+   expressions (tables, views, CTE references, FROM subqueries with
+   their own items, table-valued functions), one for an UPDATE / DELETE
+   target and each of its indexes, and for UPDATE ... FROM one more
+   plus two per FROM item. `count_from` / `target_cursors` count them;
+   a core's FROM is expanded before its result columns, as the pin's
+   walk does. `SELECT count(*) FROM u WHERE x IN (999 refs)`, `DELETE`
+   / `UPDATE ... WHERE x IN (999 refs)`, `EXISTS (SELECT 1 WHERE 1 IN
+   (999 refs))` and `UPDATE u SET x=2 FROM (SELECT 1 WHERE 1 IN (996
+   refs))` now fail as on the pin.
+
+**Not fixed (evidence).**
+- Finding 3's compound half: a merge arm whose order an index delivers
+  is a co-routine the pin's merge stops at the LIMIT (UNION included);
+  hipp computes each core whole, so `SELECT b, X FROM t UNION SELECT
+  9,9 ORDER BY 1 LIMIT 1` over an index on b still fails (pre-existing;
+  a lazy merge is beyond this unit). Also DISTINCT under a partly
+  delivered ORDER BY: the pin stops after the LIMIT's distinct rows,
+  hipp computes every row (its projections keep duplicates until the
+  end, so counting there gave too few rows when tried).
+- Finding 6 (pre-existing, unrecorded until now): `x IN (SELECT col
+  FROM tbl ORDER BY <failing>)` where an index or the rowid covers
+  `col` — the pin reads the index (`sqlite3FindInIndex`) and never runs
+  the subquery or its ORDER BY; hipp runs it and fails. EQP's
+  `in_index` already models the choice; executing it needs the
+  catalog at the IN's evaluation (left open). Also pre-existing:
+  `SELECT * FROM w, s ORDER BY a, abs(-9223372036854775808)` (w WITHOUT
+  ROWID in a join) answers in hipp where the pin fails (`LAST TERM OF
+  ORDER BY`).
+
+**Oracle-probing notes.** Shortcut: EQP of `SELECT a FROM t UNION
+SELECT a FROM t LIMIT 1` is `COMPOUND QUERY / UNION ALL`, `LIMIT 2` and
+`LIMIT 1 OFFSET 0` are `MERGE (UNION)`; `a INTERSECT a UNION 9 LIMIT 1`
+is `MERGE (INTERSECT)` then `UNION ALL`; `a UNION a EXCEPT 9 UNION 3
+LIMIT 1` keeps `MERGE (UNION)` inside `MERGE (EXCEPT)`. `(SELECT a FROM
+t UNION SELECT a FROM t LIMIT 1)` is 2 (shortcut), `LIMIT +1` / `-(-1)`
+there is 1 (merge); at the top level both are 2. Group order: EQP of
+the collated case shows no temp b-tree; `ORDER BY x DESC` sorts.
+Partial order: rows `(1,0),(7,0),(2,0),(3,1),(5,1),(9,2),(4,3)`, a=9
+failing, index on b: `ORDER BY b, a LIMIT 1/2/3` and `LIMIT 1 OFFSET 2`
+answer, `LIMIT 4` and `LIMIT 1 OFFSET 3` fail (the next group's first
+row is computed); a=9 inside the first group always fails. Arena:
+`Statement::arena_high_water` equals the text length after the fix
+(was text + 8 B per row). Cursors, first failing reference counts:
+table-less 1,000; `FROM u` 999; `u JOIN w` 998; three tables 997; `FROM
+v` (a view of u) 998, a view of v 997; `SELECT refs, (SELECT 1 FROM u)`
+1,000 but `(SELECT 1 FROM u), refs` 999; DELETE / UPDATE with two
+indexes 997; INSERT 1,000; UPDATE ... FROM w 996, FROM w, w2 994.
+
+**Tests.** `tests/result_gaps_v17.rs` (+5 tests): 67 shortcut / EXISTS
+shapes with plans, 250 co-routine GROUP BY + ORDER BY shapes (240
+generated), 56 partial-order scripts plus 200 generated, 8 long INSERTs
+under the default arena (with their high water), 62 cursor-count
+boundaries (each shape on both sides). `hipp-cli/tests/cli_v17_result_gaps.rs`
+(+1 test, off the VM): the same on a stdin script.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh` (fmt, clippy on
+default / all features / every feature set, workspace tests, the
+`--features vm` workspace suite, no_std builds for thumbv7em / thumbv6m
+/ riscv32imac / wasm32, the four size gates): all gates passed.
+`tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info: pass (no `STACK_*` change).
+
+**Size Δ** (against 9225830). tiny 0 (76,928: the text-handle lookup
+and the literal check are `query`-only); full +768 (494,292 →
+495,060); max +760 (985,472 → 986,232); xl +768 (1,088,732 →
+1,089,500). Ratchets raised to the measured figures with a reason each
+(`ci/size-ratchet.toml`). Offsets taken first: the three executor / EQP
+copies of the UNION-with-LIMIT-1 shortcut (`union_first_row`,
+`first_core_row`, the EQP and `merge_member` branches, the VM's
+`CompInfo::first_row`) and the per-view / per-subquery count
+increments are gone.
+
+**Honest gaps.**
+- `LIMIT +1` in a scalar / EXISTS subquery takes the shortcut in hipp
+  (its parser folds the sign into the literal) and not on the pin.
+- The cursor count follows hipp's walk, which reads a compound's cores
+  left to right (the pin's rightmost first: `SELECT 1 WHERE 1 IN (999
+  refs) UNION ALL SELECT 1 FROM u` fails on the pin only) and an
+  expression's subqueries before a FROM subquery's body in a different
+  order in places; UPDATE ... RETURNING allocates about ten more cursors
+  on the pin before its RETURNING expressions (990 references fail
+  there).
+- The compound merge's lazy arms, DISTINCT under a partly delivered
+  ORDER BY, and the IN-index read (see "Not fixed").
+- Found by the partial-order corpus (pre-existing planner gaps): `WHERE
+  b IS NOT NULL` is no index range in hipp (the pin: `SEARCH t USING
+  INDEX tbd (b>?)`), so a top-N over it sorts every row; and an ORDER
+  BY term naming a delivered column again by ordinal (`ORDER BY b, 1`
+  with `b` result column 1) is not seen as delivered.
+
+### Parity: result_gaps — result-level wrong answers left by wave 18 (2026-11-18)
+
+Wave 19's second unit (owner decision 2026-11-18: SQLite 3.54.1
+parity continues): the result-level honest gaps `order_offset` and
+`values_chain` recorded (and their review fixes), each probed on the
+live pin first (notes below), fixed at the root and differential-tested.
+All ungated fixes on claimed paths (ADR 0001); no new leaf. Eight of
+the nine items are closed (item 9's scan found and fixed one more: an
+EXISTS computed its result columns); what stays open is listed below.
+
+**Shipped.**
+1. **The pin's top-N sorter** (item 1; `TopN`, `pre_skip`'s third
+   bound): under an ORDER BY the loop does not deliver, with a LIMIT
+   and no DISTINCT, select.c's `pushOntoSorter` holds OFFSET + LIMIT
+   rows and loads a row's result columns only after its key entered
+   (`pDeferredRowLoad` after `OP_IfNotZero` / `OP_IdxLE`): a row whose
+   key is not below the largest it holds is skipped with no column
+   computed, ties never entering. Every projection now computes the
+   ORDER BY key first, and a result column the key repeats is taken
+   from it, never computed again (`key_col`; it was computed twice,
+   so `random()` there drew twice): the top level (the materializing
+   and streamed executors, the synchronous `query`-only one), FROM /
+   IN subqueries, views and CTEs read once (co-routines), groups
+   (every group's aggregates still finish first, as the pin's
+   AggFinal does), window queries (rows in the window's order), joins,
+   and each core of a compound's merge whose operators to its right
+   are all UNION ALL (`arm_top`: `multiSelectOrderBy`'s `regLimitA` /
+   `regLimitB`, the core sorted by the compound ORDER BY). Not: a
+   scalar subquery or an INSERT's SELECT (registers the pin
+   preallocates, `iSdst` set: `Statement::dest`), a materialized CTE,
+   DISTINCT, an ORDER BY an index delivers in part (`nOBSat`: the row
+   loads first, and the loop ends at the LIMIT's prefix group — added
+   by the review fixes, `TopN::part`). The sorter holds its own LIMIT's rows whatever its
+   reader takes (found by the corpus).
+2. **A WITHOUT ROWID table read in its own order keeps the loop that
+   delivers its ORDER BY** (item 2; `xplan::best_access`): the
+   executor knows the delivered order, so `ORDER BY k,
+   abs(-9223372036854775808)` over NOT NULL columns answers.
+3. **A lone FROM subquery's order delivers its reader's GROUP BY**
+   (item 3; `groups_adjacent`, `sub_delivers` under `WHERE_GROUPBY`,
+   direction and NULLS placement ignored): the groups come in the
+   subquery's order and a group ends where the next row's key differs
+   (`ORDER BY x COLLATE BINARY` under a NOCASE GROUP BY makes `A` and
+   `a` two groups, as on the pin). An index walk's groups close the
+   same way (one comparison per row, not a search of every group).
+4. **A subquery's ORDER BY written as an ordinal or alias under COLLATE
+   is that result column** (item 4; `SubPlan::ob_refs`, `written_refs`:
+   the pin's `resolveOrderGroupBy` strips the COLLATE before
+   `iOrderByCol`), so its reader keeps its order (`ORDER BY 1 COLLATE
+   BINARY LIMIT 10` read `ORDER BY x` is BINARY order); a column name
+   or expression under COLLATE is none.
+5. **A TEMP CREATE TABLE ... AS that reads main keeps a FLEXNUM
+   column's REAL** (item 5; `TempFeed::flex`): the temp INSERT takes
+   the column without affinity and the other values with NUMERIC.
+6. **The statement arena holds a long VALUES list** (item 6): the
+   recorded cause was not the chain — a non-constant row cost 24
+   bytes of arena beyond its text, constant ones nothing, because the
+   ATTACH and TEMP routers each lexed the statement into the arena
+   (every name copied three times), and a chunk that missed the
+   geometric size fell back to one exact chunk per allocation. The
+   routers' copies are rewound when the statement stays on main, and
+   the last chunk takes the rest of the budget (`Arena::alloc_pos`):
+   a row now costs its text plus one copy of its names, so 3,400
+   `(random())` rows (was 1,866) or 2,000 `((SELECT i))` rows read
+   under the default 64 KiB arena. (Overstated: a row still cost 8 B
+   beyond its text; the review fixes make names handles into the
+   text, `Arena::handle_or_copy`.) A statement whose text and names
+   exceed `Config::stmt_max` still fails (by design; the pin has no
+   such arena).
+7. **A CTE reference counts one toward the "nested too deep" limit**
+   (item 7; `MAX_COPIES`): probed, the pin counts each CTE reference
+   (1,000 fail), whatever its body's size, plus one for each view or
+   written FROM subquery inside which references were expanded; a
+   view or FROM subquery without one counts nothing. hipp counted the
+   SELECTs of every copied body, so three reads of a 450-arm CTE (and
+   MATERIALIZED ones, and 600-CTE chains inside a view) were refused;
+   `count_selects` is gone. (The review fixes count the pin's cursors
+   instead: every FROM item, DML targets and their indexes.)
+8. **Without `sql`, the synchronous executor skips the OFFSET's rows
+   and the top-N sorter's** (item 8; `project_rows` with `pre_skip`).
+9. **An EXISTS computes no result column, ORDER BY or DISTINCT** of a
+   UNION / UNION ALL core (found by item 9's scan while probing item
+   1; `DEST_EXISTS`, `mark_exists_inert`): the pin's `SRT_Exists`
+   codes no column and `IgnorableOrderby` drops its ORDER BY and
+   DISTINCT, a UNION being a UNION ALL there (its plan says so — only
+   under the LIMIT-1 shortcut, corrected by the review fixes), so
+   `EXISTS (SELECT abs(-9223372036854775808) FROM t)` is 1 and
+   `EXISTS (SELECT DISTINCT a FROM t LIMIT 1 OFFSET 2)` counts rows.
+   Its aggregates still step and finish (a `sum()` overflow fails),
+   its HAVING and window terms run, and an INTERSECT / EXCEPT core
+   computes its values.
+
+**Oracle-probing notes** (live pin; EXPLAIN for the opcode order).
+Top-N: `EXPLAIN SELECT CASE .. FROM t ORDER BY b LIMIT 1` codes
+`Column b; Sequence; IfNotZero; Last; IdxLE; Delete` before the CASE's
+columns, `MakeRecord`, `IdxInsert`; the scalar form (`SELECT (SELECT
+.. LIMIT 1)`) codes the CASE before the key (`iSdst` set: no
+`pDeferredRowLoad`). Rows `(2,1),(3,2),(1,5),(4,0)` with `a=1`
+overflowing: `ORDER BY b LIMIT 1` / `LIMIT 2` / `LIMIT 1 OFFSET 1` /
+`b NULLS LAST` / `-b DESC` / `b+0` / `(SELECT t.b)` / `rowid DESC`
+answer; `LIMIT 3`, `LIMIT 1 OFFSET 2`, `LIMIT -1`, no LIMIT,
+`b DESC`, DISTINCT, `ORDER BY x` for its alias, a scalar subquery, an
+INSERT ... SELECT, a CTE read twice or MATERIALIZED fail; FROM / IN
+subqueries, a view, a CTE read once, CREATE TABLE AS, a join's FROM
+subquery after a table, `GROUP BY b ORDER BY b+0` / `sum(b)`, `sum(a)
+OVER ()`, `row_number() OVER (ORDER BY b)` answer, `OVER (ORDER BY
+a)` fails (the window's order brings the row first); ties (`ORDER BY
+b >= 1 LIMIT 1`) skip the equal key. Compounds: `b, X FROM t UNION
+ALL SELECT 9, 9 ORDER BY 1 LIMIT 1` / `LIMIT 2` / `LIMIT 1 OFFSET 1`
+answer, `UNION` and no LIMIT fail. WITHOUT ROWID: `w(k NOT NULL, v
+NOT NULL, z)`: `ORDER BY k, X` answers, `k, v, X` fails (`LAST TERM
+OF ORDER BY`). GROUP BY over a co-routine: `(.. ORDER BY 1 DESC)
+GROUP BY x` is `C, b, A, 1, NULL`; `ORDER BY x COLLATE BINARY DESC`
+under NOCASE `x` gives seven groups; `GROUP BY y, x` over `ORDER BY 1,
+2` sorts (positional); `NULLS FIRST` delivers; a join, an ORDER BY
+with only count() (the subquery's ORDER BY omitted) and `GROUP BY +x`
+sort. COLLATE ordinal: `ORDER BY 1 COLLATE BINARY LIMIT 10` / alias
+`x COLLATE BINARY` keep BINARY order under the reader's `ORDER BY x`;
+`c COLLATE BINARY`, `+x COLLATE BINARY` re-sort; a reader's own
+alias under COLLATE sorts. TEMP CTAS: `CAST(1 AS REAL) UNION ALL
+SELECT r FROM t` is `1.0|real` on the pin (`x NUM`). Arena (64 KiB,
+`Statement::arena_high_water`): `(abs(i))` rows cost 24 B each beyond
+their text before, 8 B after; `(i)` rows nothing. CTE limit, bisected
+on the pin: a chain of 999 CTEs reads, 1,000 fail; doubling chains
+fail at 1,023 references (9 levels read); 999 `(SELECT x FROM c0)`
+read, 1,000 fail (also MATERIALIZED, also as an IN list); inside one
+FROM subquery 998 read, 999 fail; inside two, 997 / 998; inside three,
+996 / 997; `(SELECT x FROM (SELECT x FROM c0))` counts two (500
+fail), two references in one FROM subquery three (334 fail); 1,500
+FROM subqueries without a CTE read; a view counts nothing (400 views
+of views read) unless it expands a CTE (`vc`: 500 fail); a recursive
+CTE counts its own reference too. EXISTS: `SELECT abs(..)`, `ORDER BY
+abs(..)`, `DISTINCT .. OFFSET 2`, `max(a), abs(..)`, `abs(sum(b) -
+..)`, `row_number() OVER (), abs(..)`, VALUES rows, UNION / UNION ALL
+cores (also after a non-empty one, and an INTERSECT on the left) are
+not computed (1); `sum()` overflow, HAVING, `OVER (ORDER BY abs(..))`,
+`SELECT * FROM (SELECT abs(..))`, INTERSECT / EXCEPT cores fail; the
+plan of `EXISTS (.. UNION SELECT y)` says `UNION ALL`.
+Found on the way: a derived table's fifth equal column name is `:4`
+(`sqlite3ColumnsFromExprList` forms it before switching to random
+suffixes at `cnt > 3`); hipp refused it (`rules::unique_names`), so
+`SELECT 1 FROM (SELECT (SELECT 1), ... x5)` was `Unsupported`.
+
+**Tests.** `tests/result_gaps_v17.rs` (11 tests, rows in order and,
+where shapes allow, plans against the live pin): 70 top-N shapes
+(every destination, groups, windows, joins, partial index orders,
+compound merges, reader bounds), 7 write scripts (INSERT ... SELECT,
+CREATE TABLE AS, UPDATE / DELETE subqueries), a generated top-N corpus
+of 240 queries over six row orders (xorshift; at least a quarter
+answer on the pin), 14 WITHOUT ROWID shapes, 31 co-routine GROUP BY
+shapes, 19 collated-ordinal shapes, 45 EXISTS shapes, 55 CTE-count
+boundaries (each probed limit on both sides of it), 5 equal-name
+shapes, 9 TEMP CTAS scripts and 12 long VALUES lists under the
+default arena. `tests/offset_query_v17.rs` (2 tests): 24 OFFSET /
+top-N shapes in the `query` grammar on the default build and,
+through a nested `cargo test --no-default-features --features
+std,query`, on the synchronous executor. `hipp-cli/tests/cli_v17_result_gaps.rs`
+(5 tests): the same fixes on stdin scripts and one-shot arguments,
+byte for byte; the top-N, EXISTS and co-routine GROUP BY scripts run
+only when the shell is not on the frozen VM (`on_vm`, see the gaps).
+Existing suites whose expectations moved: none (every v16 / v17
+suite passes unchanged).
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh` (fmt, clippy on
+default / all features / every feature set, workspace tests, the
+`--features vm` workspace suite with the frozen VM's strict suites,
+no_std builds for thumbv7em / thumbv6m / riscv32imac / wasm32, the four
+size gates): all gates passed. `tests/depth_v16.rs`,
+`tests/depth_tiny_v16.rs` and `tests/triggers_v16.rs` with debug info:
+pass (no `STACK_*` change; see the gaps for the pre-existing
+debug-info `--features vm` overflow of `depth_tiny_v16`).
+
+**Size Δ.** tiny 0 (76,928); full +3,896 (490,396 → 494,292); max
++4,460 (981,700 → 986,160); xl +3,452 (1,084,848 → 1,088,300).
+Ratchets raised to the measured figures with a reason each
+(`ci/size-ratchet.toml`). Offsets taken first: `count_selects` and
+`shown_keys` removed, the five projections' key / column loops shared
+in one `keyed` helper (-640 B on full against inline loops). `keyed` and the merge cores' ORDER BY copies are boxed (+136 B
+on full) so the projections' futures stay small: inline, a debug
+`--features vm` build's step overflowed `depth_tiny_v16`'s 512 KiB
+thread (`prepare`'s future is now 5,648 B, was 5,616; `step`'s is
+6,648 B, unchanged).
+
+**Honest gaps.**
+- The top-N sorter's partly delivered ORDER BY (`nOBSat > 0`, where
+  the pin loads every row first) is read from the first source's
+  index access only: a join path's or a window's own order that
+  delivers a prefix still defers in hipp. A FROM subquery the pin
+  materializes because it follows another subquery or an outer join
+  (`fromClauseTermCanBeCoroutine`) defers in hipp too; a trigger
+  body's SELECT (`SRT_Discard`, ORDER BY dropped) is not modelled.
+- The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) keeps its
+  own sorter, grouping and EXISTS handling: the library suites run
+  on today's executor under `vm`, and the CLI suite checks those
+  shapes only off the VM.
+- EXPLAIN QUERY PLAN still lists an EXISTS result column's
+  subqueries (the pin codes none; rows match).
+- `UPDATE ... WHERE x IN (...)` counts one more toward the CTE limit
+  on the pin (999 references fail there, 1,000 in hipp). (closed in
+  v0.17: result_gaps review fixes — the pin's cursor count)
+- A statement whose text and names exceed `Config::stmt_max` still
+  fails with `ArenaExhausted` (by design; the pin has no such arena);
+  a derived table's sixth equal column name takes a random suffix on
+  the pin and stays `Unsupported` in hipp.
+- Observed, pre-existing: `tests/depth_tiny_v16.rs` overflows its
+  512 KiB thread in a debug-info `--features vm` build at the base
+  commit too (c5cd9b4, checked in a scratch clone); this unit's
+  futures stay within 32 B of the base's (`prepare` 5,648 B, `step`
+  6,648 B), and the gates' debug-free `--features vm` run passes.
+- Item 9's scan left (each needs planner or naming work beyond this
+  unit): `rowid = 1 COLLATE bogus` (the pin refuses the commuted form
+  and the term beside another one, so its rule is not the access path
+  alone), a trigger's `new.k` naming a VALUES column, two unaliased
+  pure chains' `*` ambiguity, a later group's error after printed
+  groups in hipp-cli, a co-routine's join order and partial order
+  match, a GROUP BY over a WITHOUT ROWID clustered index's NOT NULL
+  test, the omission under a window reader or UPDATE ... FROM.
+
+### Parity: attach — ATTACH refusals and index access into attached databases (2026-11-18)
+
+Wave 19's unit (owner decision 2026-11-18: SQLite 3.54.1 parity
+continues): the ATTACH honest gaps of the v0.16 unit (README "Not
+yet", STATUS.md's ATTACH / DETACH gaps), each probed on the live pin
+first (notes below). Four of the seven items are closed, one in part;
+three stay open with the reason recorded. Everything new is behind the
+`attach` leaf (in `max`); no new leaf, and no path without the leaf
+changes (tiny and full Δ 0).
+
+**Shipped.**
+1. **Item 7 — a string literal is a name** (`nm ::= STRING`): `'aux'.t`,
+   `aux.'t'`, `'aux'.'t'.c`, `INSERT INTO 'aux'.t`, `CREATE TABLE
+   'aux'.z`, `PRAGMA 'aux'.table_info('t')`, `DROP TABLE 'aux'.z`. The
+   lexer reads a string literal next to a dot as a quoted name, and the
+   parser's `name()` takes a string literal where it takes a name (so
+   `FROM 't'`, `INSERT INTO 't'('a')`, `t AS 'x'` and the router's
+   `INSERT INTO aux.'z'` → `INSERT INTO 'z'` parse there too).
+2. **Item 6 — the integrity check over every database.** An unqualified
+   `PRAGMA integrity_check` / `quick_check` (also `(N)`) checks main,
+   then the TEMP database, then each attached one in attach order
+   (`Statement::integrity_rest`), under one error limit, and answers
+   `ok` only when no database reported anything; a B-tree row names its
+   database (`*** in database aux ***`: it said `main` for an attached
+   database). Reading a database inside a transaction locks it against
+   DETACH, as on the pin. `PRAGMA x.integrity_check`, a table argument
+   and `foreign_key_check` (unqualified: main only on the pin too) were
+   already the pin's.
+3. **Item 4 — names across databases.**
+   - *An attached database's view read on main*: the expander looks
+     `aux.v` (and an unqualified name only an attached database has) up
+     in that database's catalog and expands the view with every name in
+     its body bound to its own database (`Expander::att_source`, the
+     pin's `DbFixer` binding; nested views and CTEs included); the
+     view's columns answer to `aux.v.c` and its `*` expands as the
+     pin's `aux.v.c` (`SELECT * FROM v, aux.v` answers). Before, such
+     a statement was refused, and `aux.v` beside a main table read
+     *main's* view `v` when main had one (a silent wrong answer).
+   - *A write of an attached table reading a same-named table of
+     another database by an unqualified name* (`UPDATE aux.m SET y =
+     (SELECT y FROM m)`: main's `m`): the router writes that
+     database's qualifier into the text it hands the attached database
+     (`ext_on`, `edit`), so the two `m`s stay apart there.
+   - *Three-part names of another database inside such a write*
+     (`UPDATE aux.t SET b = bb.t.b FROM bb.t WHERE bb.t.a = aux.t.a`,
+     `main.m.y`): an external source answers to its own database's name
+     (`ExtTab::dbname`, `SourceDesc::dbname`; the column resolver now
+     looks every schema name up there first, `main` / `temp`
+     included), and the attached database's own three-part names keep
+     their qualifier (its sources answer to its alias), so `aux.m.x`
+     beside main's `m` stays the outer row. `UPDATE aux.m ... FROM
+     main.m` is no repeat of the target (`foreign_from`; it was "target
+     object/alias may not appear in FROM clause").
+4. **Item 3 — TEMP writes reading other databases.** A TEMP UPDATE /
+   DELETE / INSERT VALUES (RETURNING, upsert, UPDATE ... FROM, inside
+   transactions and savepoints) that reads main or attached tables runs
+   on the temp database with those tables handed over as external
+   sources, as a write of an attached database does (`AttPlan` with
+   `TEMP_DB`; `run_routed` / `width_on` shared by both; EXPLAIN QUERY
+   PLAN requalified `temp`). Works with or without ATTACH (the
+   `attach` leaf only: without it such a write stays `Unsupported`).
+   INSERT ... SELECT / CTAS keep the TEMP feed.
+
+**Not closed (honest gaps, below).** Items 1 and 2 (TEMP triggers on a
+main or attached table; TEMP triggers writing a schema-qualified table
+of another database) and item 5 (index access paths into attached /
+TEMP tables). Both need what the per-database `Connection` model does
+not have, and neither fits this wave's size line:
+- A trigger program runs as statements of the connection that fires it
+  (`trigger::run_step`, planned on `self`); the TEMP database and each
+  attached database are child connections of main with no route back
+  to it, so a program fired in one cannot reach another. Running TEMP
+  programs through main's router would need their `NEW.` / `OLD.`
+  values written into routed text (`TrigValue` carries affinity and
+  collation) and — the larger part — statement-level transactions
+  spanning databases: a main statement whose TEMP trigger writes `aux`
+  must join `aux` to its statement journal and commit both through the
+  super-journal (or roll both back on ABORT), which today happens only
+  for explicit transactions. Probed: the pin fires `CREATE TEMP
+  TRIGGER tr AFTER INSERT ON m BEGIN INSERT INTO aux.t ...; END` and
+  `... ON aux.t BEGIN INSERT INTO main.m ...; UPDATE aux.u ...; DELETE
+  FROM m ...; END`; hipp still refuses both at CREATE (`Unsupported`),
+  and a TEMP trigger on a TEMP table whose body names a main table
+  fails when it fires ("no such table"), as before.
+- Another database's table is read whole into main as an external
+  source (`scan_ext`); index and rowid seeks into it need the planner's
+  access paths and the join planner over another connection's pager
+  and catalog. Probed: the pin plans `SEARCH aux.t USING INTEGER
+  PRIMARY KEY (rowid=?)` / `USING COVERING INDEX tb (b=?)` for a
+  correlated lookup and a join, and `SCAN tt` / `SEARCH m USING
+  INTEGER PRIMARY KEY` for a TEMP table joined with main (driving the
+  join from the TEMP table); hipp shows `SCAN aux.t` and keeps FROM
+  order (rows equal; unordered join rows can come in another order).
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin;
+`.dbconfig defensive off` for the corrupt files): `'aux'.t`,
+`aux.'t'`, `'aux'.'t'.c`, `"aux".t.c`, `PRAGMA 'main'.user_version`,
+`FROM 't'`, `t AS 'x'` / `'x'.a` all parse; `'nosuch'.t` is "no such
+table: nosuch.t". Unqualified `integrity_check` over main + two
+attached copies of a file with a NOT NULL / CHECK violation and a
+missing index row: the six messages (`NULL value in t.x`, `CHECK
+constraint failed in t`, `row 1 missing from index ti`, twice);
+`integrity_check(3)` stops after three; `quick_check` skips the index
+rows; `integrity_check(t)` checks the first `t` the search order finds
+(aux) only; `PRAGMA main.integrity_check` is `ok`; `pragma_integrity_check`
+as a table-valued function answers there (hipp: `Unsupported`, the
+v0.16 PRAGMA unit's gap); `pragma_quick_check(2)` is "no such table:
+2". Unqualified `foreign_key_check` lists main's violations only (aux's
+`c2` and TEMP's `tc` need their name or qualifier). `SELECT * FROM v,
+aux.v` answers (`main.v.w`, `aux.v.w` differ); `FROM t, t` and `FROM
+(...) AS v, (...) AS v` are "ambiguous column name" on both. `UPDATE
+aux.m SET y = (SELECT y FROM m WHERE m.x = aux.m.x)`: inner `m` is
+main's, `aux.m.x` the target row. `UPDATE aux.m ... FROM main.m` and
+`UPDATE aux.t ... FROM bb.t` run. TEMP `UPDATE tt SET v = (SELECT b
+FROM aux.t WHERE a = k) || (SELECT y FROM m WHERE x = k)`, `DELETE ...
+IN (SELECT x FROM main.m)`, `INSERT INTO tt VALUES ((SELECT max(a) FROM
+aux.t), ...) RETURNING`, upserts and `UPDATE tt ... FROM aux.t` run, as
+without ATTACH. A view `aux.only AS SELECT b FROM aux.t` (own
+qualifier) is stored, but the shell then cannot open `a.db` on its own
+("malformed database schema ... cannot reference objects in database
+aux").
+
+**Tests.** `tests/attach_v17.rs` (8 tests; every script on both
+engines in twin directories: rows, failing statements, and the pin's
+integrity check and `.dump` of every file): string-literal names (two
+scripts), TEMP writes reading main / attached tables (with and without
+ATTACH, transactions, savepoints, DETACH), views and same-named tables
+across three databases, the integrity check over every database (two
+corrupt attached files made by the pin, limits, quick_check, a table
+argument, qualified forms, DETACH locks) and `foreign_key_check`, the
+regressions below, the refusals left, and a generated corpus
+(xorshift64: same-named tables in main and `a`, views in `a`, TEMP
+writes, three-part and string qualifiers, transactions; 24 scripts by
+default, `HIPP_ATTACH_CORPUS=300` ran clean, and the v16 corpus at 200).
+`hipp-cli/tests/cli_v17_attach.rs` (3 tests, one-shot and stdin
+byte-identical). Updated against the pin: `tests/attach_v16.rs`
+`documented_refusals` and `tests/temp_v16.rs` `both_databases_meet`
+(the TEMP writes and the attached view beside main now answer; the
+former keeps the trigger refusals). No new multi-database *write*
+path: a TEMP write writes only the TEMP database (memory), an attached
+write only its own, so `tests/crash.rs` is unchanged (it passes).
+
+**Regressions found while building it.** `aux.v` beside a main table
+read main's view `v` when main had one; `INSERT INTO aux.'z'` became
+`INSERT INTO 'z'` after the router's cut and did not parse; cutting an
+attached database's own three-part names (`aux.m.x` → `m.x`) made them
+read a same-named table of another database; `UPDATE aux.m ... FROM
+main.m` was "target ... may not appear in FROM clause"; the TEMP
+database's handed-over tables were cleared by its own `prepare`; a
+first cut awaited `temp_conn()` (the TEMP database's open) inside
+`prepare_att`, which grew every statement's `prepare` future enough to
+overflow `tests/depth_tiny_v16.rs`'s 512 KiB thread under `vm` (the
+route exists only while the TEMP database does, so it now uses it
+directly). `tests/depth_v16.rs`, `triggers_v16.rs` and
+`depth_tiny_v16.rs` were run with debug info on; no `STACK_*`
+constant needed re-measuring.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed (fmt, clippy on every feature set, workspace tests, the `vm`
+suites, no_std builds, all four size gates).
+
+**Size Δ.** tiny 0 (76,928); full 0 (490,396); max +5,008 (976,692 →
+981,700); xl +7,216 (1,077,632 → 1,084,848). Ratchets raised to the
+measured figures (`ci/size-ratchet.toml`): the integrity check's walk
+over the other databases (≈1.4 KB), the router's TEMP route and
+qualifier insertion (≈1.2 KB), the shared `run_routed` / `width_on`
+instantiated for the TEMP database (≈1.2 KB), the expander's attached
+views (≈0.8 KB); on xl `Statement::step` inlines the larger `step_att`
+(+2 KB of the xl figure). Offsets taken: `collect_on` dropped for `run_routed`
+(-160 B), `foreign_from` reduced to the qualifier test (-384 B); an
+out-of-line `att_source` and one boxed future per database measured no
+smaller and were not kept.
+
+**Honest gaps.**
+- (open: items 1 and 2) TEMP triggers on main or attached tables, and
+  TEMP triggers writing another database's table (qualified or not),
+  are refused (`Unsupported`) or fail when they fire; see "Not closed"
+  above. Non-TEMP triggers' qualified writes are the pin's error
+  ("qualified table names are not allowed ...", unchanged).
+- (open: item 5) No index or rowid access path into attached or TEMP
+  tables (read whole once per execution, scanned per outer row); EXPLAIN
+  QUERY PLAN shows `SCAN`, and a join with such a table keeps FROM
+  order.
+- A write of an attached (or the TEMP) database reading *another*
+  database's view is refused (`Unsupported`): external sources are
+  tables only (a view's rows would need its column affinities there).
+  Reads on main (queries, INSERT into main) expand such views.
+- A three-part name of another database whose table the statement
+  does not read (`UPDATE aux.t SET b = main.m.y`) is refused, where the
+  pin reports "no such column".
+- (closed in v0.17: attach review fixes) `UPDATE 't' SET 'a' = 5` (a
+  string as a SET column name) does not parse (found along the way; not
+  a qualifier).
+- `pragma_integrity_check` / `pragma_quick_check` as table-valued
+  functions are refused (the v0.16 PRAGMA unit's gap, unchanged).
+- With a TEMP database every INSERT / UPDATE / DELETE is parsed once
+  more by the ATTACH router (to find a TEMP write reading main).
+
+**Review fixes (2026-11-18).** Eight findings, each reproduced on the
+live pin first; seven fixed at the root, one (a CTE-first WITH write)
+had three more instances found and fixed with it.
+1. **A WITH-prefixed write wrote the wrong database** (findings 1-4,
+   high). `route_attach` took the first name `ast_names` lists as the
+   write target, but a WITH clause lists its CTEs' names first. So
+   `WITH c AS (SELECT y FROM temp.t) DELETE FROM main.m ...` was homed
+   on TEMP and deleted `temp.m` (a regression of the unit: without
+   ATTACH too, since every write goes through the router while a TEMP
+   database exists), the same with `UPDATE aux.m` (the new `TEMP_DB`
+   route wrote `temp.m`; it was refused at base), `WITH c AS (... FROM
+   temp.t) UPDATE m ...` failed with "no such table" (worked at base),
+   and `WITH c AS (SELECT v FROM aux.n) DELETE FROM main.m` deleted
+   `aux.m`'s rows (pre-existing). Fix: the target is the ref whose token
+   is the AST's target name (`target_tok`), and a CTE name never hides
+   it (`WITH m AS (...) DELETE FROM m` writes table `m`, as on the
+   pin). The `temp_reads` route asks the same target.
+2. **Item 3's WITH form** (finding 6): `WITH c AS (SELECT x FROM m)
+   UPDATE t ...` / `DELETE FROM t ...` with `t` a TEMP table now runs,
+   by finding 1's fix. Searching the same pattern found the TEMP
+   router's feed taking only a plain INSERT ... SELECT: a WITH-prefixed,
+   upsert or RETURNING TEMP INSERT ... SELECT reading main was
+   `Unsupported` (pin: runs). Those now take the `TEMP_DB` route too.
+3. **`PRAGMA aux.integrity_check` over a B-tree-corrupt attached file
+   printed no rows** (finding 5, pre-existing): `step_att` returned the
+   routed statement's error before keeping the rows it gave. Now the
+   rows are served first and the error follows (`Statement::deferred`),
+   as on the database itself, for every routed statement.
+4. **String names in the remaining `nm` positions** (finding 7):
+   `CREATE TRIGGER 'tr'` (and `aux.'tr'`), `UPDATE OF 'b'`, `WITH
+   'c'('y')`, `SET 'a' = 5` (UPDATE and upsert), and a constraint's
+   column list (`UNIQUE('b')`, `PRIMARY KEY('a')`, `FOREIGN KEY('x')
+   REFERENCES p('id')`) take a string, gated on `attach` as the rest of
+   item 7. Probed beside them and already the pin's: `INDEXED BY 'i'`,
+   `WINDOW 'w'`, `ALTER TABLE t RENAME 'b' TO 'c'`, `SAVEPOINT 'sp'`,
+   `ALTER TABLE ... ADD / DROP COLUMN 'c'`, `CREATE VIEW v('x', 'y')`.
+5. **An unqualified integrity_check opens the TEMP database** (finding
+   8, pre-existing): the pin's loop calls `sqlite3CodeVerifySchema` for
+   `i == 1`, so `PRAGMA database_list` lists `temp` afterwards; with a
+   table argument too (`PRAGMA quick_check(x)`), not after `PRAGMA
+   main.integrity_check`. `integrity_rest` now opens it.
+
+Oracle-probing notes: every repro above on the 3.54.1 pin, plus a
+generated corpus (scratch, 1,100 scripts: WITH-prefixed and plain
+DELETE / UPDATE / INSERT VALUES / INSERT ... SELECT / RETURNING over
+same-named `m` in main, temp and `aux`, CTEs reading each) that hipp
+now matches. `PRAGMA aux.quick_check(2)` over the corrupt file stops
+after two rows with no error on the pin (rc 0), as now in hipp.
+`CREATE TRIGGER 'tr' ... ON aux.m` is the pin's "cannot reference
+objects in database aux" (hipp: `CrossDatabaseReference`).
+
+Tests: `tests/attach_v17.rs` 3 more tests (11): `with_prefixed_writes`
+(the four findings' scripts, item 3's WITH and RETURNING forms, the
+same-named CTE, the string-name positions), `generated_with_writes`
+(xorshift64: WITH-prefixed and plain writes over main / temp / `aux`
+with same-named tables, 24 scripts, `HIPP_ATTACH_CORPUS=200` ran
+clean), `integrity_check_rows_and_temp` (a B-tree-corrupt attached file
+made by the pin; `database_list` after the check). `same_rows` splits
+a value with newlines into the shell's lines.
+`hipp-cli/tests/cli_v17_attach.rs` 2 more tests (5): the WITH writes
+and string names byte-identical one-shot and over stdin, and the
+corrupt file's report over stdin. No new multi-database write path
+(the fixed route writes the database the statement names, through the
+existing attached / TEMP routes), so `tests/crash.rs` is unchanged; it
+passes.
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed.
+`tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info on: pass (the TEMP open in
+`integrity_rest` is a boxed future). Found on the way, not this unit's:
+with debug info *and* `--features vm` (CI's `test_vm` job),
+`depth_tiny_v16`'s `column_counts_match_the_oracle` overflows its
+512 KiB thread here, at the unit's commit c5cd9b4 and at base 1b49982
+alike (the gates' run without debug info passes it).
+
+Size Δ of the review fixes: tiny 0 (76,928); full 0 (494,292); max
+-688 (986,160 → 985,472; ratchet lowered); xl +432 (1,088,300 →
+1,088,732; ratchet raised, layout: the same code shrinks max).
+
+Honest gaps the review fixes leave:
+- `PRAGMA integrity_check(nosuch)` fails at prepare in hipp, before the
+  TEMP database is opened; the pin opens it anyway (its error is a
+  prepare error too), so a later `database_list` lacks `temp`.
+
 ### Parity: values_chain — VALUES chains, lazy collations, inert aggregates (2026-11-17)
 
 Wave 18's second unit (owner decision 2026-11-17: close the
@@ -192,10 +848,11 @@ a shared `late` helper measured +104 B and was not kept.
   fixes — `inert_aggregates_on_the_vm` runs on the VM).
 - Item 7's scan of the older honest gaps found the alias push-down
   (fixed, item 7); left as recorded: a GROUP BY over a co-routine's
-  order and its partial ORDER BY match, a subquery's `ORDER BY 1
-  COLLATE BINARY` as column 1, a WITHOUT ROWID natural scan's ORDER BY
-  (`order_offset`'s gaps, planner work), and the push-down without
-  `planner` (by design, ADR 0004).
+  order (closed in v0.17: result_gaps) and its partial ORDER BY match,
+  a subquery's `ORDER BY 1 COLLATE BINARY` as column 1 (closed in
+  v0.17: result_gaps), a WITHOUT ROWID natural scan's ORDER BY (closed
+  in v0.17: result_gaps), and the push-down without `planner` (by
+  design, ADR 0004).
 
 **Review fixes (2026-11-17).** Eleven findings, each reproduced on the
 live pin first; all ungated fixes on claimed paths (`sql`, the
@@ -305,14 +962,14 @@ the VM); `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
 Size Δ of the review fixes: tiny 0 (76,928); full +2,992 (487,404 → 490,396); max +184 (976,508 → 976,692); xl +3,008 (1,074,624 → 1,077,632). Ratchets raised to the measured figures with a reason each; no offsetting saving found (`#[inline(never)]` on the new helpers measured +8 B on full and was dropped). max grows less than full: layout.
 
 Honest gaps the review fixes leave (new or found on the way):
-- A VALUES chain of a few thousand non-constant rows exhausts the
+- (closed in v0.17: result_gaps) A VALUES chain of a few thousand non-constant rows exhausts the
   default statement arena (`Config::stmt_max`; each row is a compound
   core now) where the pin reads it; the CLI's larger arena reads them.
-- A CTE whose body is a SELECT compound is copied per reference into
+- (closed in v0.17: result_gaps) A CTE whose body is a SELECT compound is copied per reference into
   the expansion's 1,000-SELECT limit (`MAX_COPIES`), so three uses of a
   450-arm CTE are "nested too deep" in hipp and read on the pin
   (pre-existing).
-- A TEMP CREATE TABLE ... AS inserts through the temp connection, so a
+- (closed in v0.17: result_gaps) A TEMP CREATE TABLE ... AS inserts through the temp connection, so a
   FLEXNUM column's REAL is stored as NUMERIC there (`2` for `2.0`).
 - A push-down through a merged body that the splice then gives up
   (hipp's own restrictions) loses the term in the arms, as before.
@@ -537,7 +1194,7 @@ every DISTINCT check, `dedup_compound_rows` and `stream::rowid_order`
 removed.
 
 **Honest gaps.**
-- A GROUP BY over a co-routine's order: the pin's `wherePathMatchSubqueryOB`
+- (closed in v0.17: result_gaps) A GROUP BY over a co-routine's order: the pin's `wherePathMatchSubqueryOB`
   also delivers a GROUP BY (direction ignored), so its groups come in
   the subquery's order (`SELECT x, group_concat(n) FROM (SELECT c AS
   x, n FROM t ORDER BY 1 DESC) GROUP BY x` is C, b, A, NULL); hipp
@@ -548,19 +1205,19 @@ removed.
   ORDER BY (rows differ only if the reader's collation splits the
   subquery's runs differently; EQP differs). A co-routine in a join
   delivers nothing in hipp (it keeps FROM order, pre-existing).
-- A subquery's `ORDER BY 1 COLLATE BINARY` is result column 1 on the
+- (closed in v0.17: result_gaps) A subquery's `ORDER BY 1 COLLATE BINARY` is result column 1 on the
   pin (the COLLATE of an integer term is stripped before
   `iOrderByCol`); hipp's resolved term is a COLLATE expression, so a
   reader's `ORDER BY x` is sorted again (rows in the reader's
   collation).
-- A WITHOUT ROWID table read in its own order (no access path, `SCAN
+- (closed in v0.17: result_gaps) A WITHOUT ROWID table read in its own order (no access path, `SCAN
   w`): `ORDER BY k, abs(..)` answers on the pin when the columns the
   pin walks past the key are NOT NULL, and fails in hipp — the plan
   (EXPLAIN QUERY PLAN) now matches, but the executor keeps no
   delivered order for a natural scan (it has no access path to carry
   it). Through an access path (`WHERE k > 0`, `k IN (..)`, DESC) it
   matches (review fix 7).
-- A sorter under a LIMIT computes every row's result columns in hipp;
+- (closed in v0.17: result_gaps) A sorter under a LIMIT computes every row's result columns in hipp;
   the pin's top-N sorter (select.c `pushOntoSorter` with
   `pDeferredRowLoad`, for SRT_Output / co-routine / scalar
   destinations, not a materialized one, no DISTINCT) computes the
@@ -571,7 +1228,7 @@ removed.
   a window query's outer ORDER BY ... LIMIT and a grouped one (review
   finding 5; pre-existing, a separate mechanism from the OFFSET and
   delivered orders this unit fixes, recorded rather than built).
-- A subquery's ORDER BY alias under a COLLATE (`(SELECT c AS x, n FROM
+- (closed in v0.17: result_gaps) A subquery's ORDER BY alias under a COLLATE (`(SELECT c AS x, n FROM
   t ORDER BY x COLLATE NOCASE LIMIT 10) ORDER BY x`) is the same as
   `ORDER BY 1 COLLATE BINARY` above: the pin's term is result column
   1, so the reader keeps the subquery's NOCASE order (`NULL, 1, A, a,
@@ -582,7 +1239,7 @@ removed.
 - The omission is not applied under a window function's reader (the
   pin's rewrite moves the FROM clause into a subquery that keeps or
   drops the ORDER BY by its own rules), nor for UPDATE ... FROM.
-- Without `sql` (the `query`-only builds) the synchronous projection
+- (closed in v0.17: result_gaps) Without `sql` (the `query`-only builds) the synchronous projection
   still computes an OFFSET row's columns.
 - The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) keeps its
   own OFFSET handling (it computes a skipped row's columns and skips a
@@ -13000,8 +13657,8 @@ points (boxed futures).
 
 **Honest gaps:**
 
-- External sources are read whole, in rowid / key order, with no
-  index access path: an unordered query whose pin plan walks an index
+- (still open in v0.17: `attach` unit, item 5) External sources are
+  read whole, in rowid / key order, with no index access path: an unordered query whose pin plan walks an index
   of an attached table (or an `INSERT ... SELECT` without ORDER BY
   feeding one) can list rows in another order. `INDEXED BY` on such a
   source is not checked there.
@@ -13011,22 +13668,29 @@ points (boxed futures).
   scan stays linear per outer row (the review's 3000 x 3000 lookup:
   about 10 s in a debug build, where the pin seeks its rowid).
 - Refused (`Unsupported`) where the pin answers: an attached database's
-  view read together with another database's table; a TEMP trigger on
+  view read together with another database's table (closed in v0.17:
+  `attach` — on main; a write of another database reading it is still
+  refused); a TEMP trigger on
   a main or attached table (the TEMP unit's gap), or one writing a
   schema-qualified table (`INSERT INTO main.m ...` / `a.t`: a trigger
   program runs inside the database that fires it, with no router to
-  the others); a TEMP UPDATE / DELETE / INSERT VALUES reading
+  the others) (still open in v0.17: `attach` unit, items 1 and 2); a
+  TEMP UPDATE / DELETE / INSERT VALUES reading
   another database (only `INSERT ... SELECT` / CTAS feed the temp
-  database); a three-part name of another database inside a write of
-  an attached table; an unqualified name meaning a table of another
+  database) (closed in v0.17: `attach`); a three-part name of another
+  database inside a write of
+  an attached table (closed in v0.17: `attach`); an unqualified name
+  meaning a table of another
   database in a statement that also names the same-named table of the
-  attached database it writes; attaching a file the connection already
-  has open.
+  attached database it writes (closed in v0.17: `attach`); attaching a
+  file the connection already has open.
 - An unqualified `PRAGMA integrity_check` / `quick_check` /
   `foreign_key_check` checks main only (the pin checks every
-  database); `PRAGMA aux.x` checks aux.
+  database); `PRAGMA aux.x` checks aux. (closed in v0.17: `attach` —
+  integrity_check / quick_check check every database; the pin's
+  unqualified `foreign_key_check` checks main only, as hipp's does.)
 - A string-literal schema qualifier (`'aux'.t`) does not parse
-  (`"aux".t` does).
+  (`"aux".t` does). (closed in v0.17: `attach`)
 - A super-journal whose writing was cut before any journal pointed at
   it stays behind (as on the pin). Below `v16` (tiny, the lower
   rungs) recovery still rolls back every hot journal, so a pin-made

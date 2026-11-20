@@ -1200,6 +1200,13 @@ pub struct SubPlan {
     /// (`SelectStmt::vchain`; v0.17 review fix, `sql`).
     #[cfg(feature = "sql")]
     pub vchain: bool,
+    /// The result columns an ORDER BY term written as an ordinal or
+    /// an alias under COLLATE names (v0.17, `sql`): the pin's
+    /// `resolveOrderGroupBy` strips the COLLATE before it sets
+    /// `iOrderByCol`, so the term is that column for a reader's
+    /// `wherePathMatchSubqueryOB` (`ORDER BY 1 COLLATE BINARY`).
+    #[cfg(feature = "sql")]
+    pub ob_refs: AVec<usize>,
     /// The pin's select number of this core (v0.16, `explain`;
     /// `SelectStmt::sel`), what EXPLAIN QUERY PLAN prints.
     #[cfg(feature = "explain")]
@@ -2081,9 +2088,9 @@ pub type SubPlanner<'p, E> =
 /// left alone, as are IN subqueries and derived tables.
 ///
 /// Without a LIMIT of its own the subquery gets the pin's
-/// implicit integer `LIMIT 1`, which is what lets a UNION
-/// compound take the pin's first-row shortcut
-/// (`session::union_first_row`; v0.16, CI against the pin).
+/// implicit integer `LIMIT 1` (its UNION-with-LIMIT-1 shortcut is
+/// the parser's `union_limit_one`; v0.16, CI against the
+/// pin).
 #[cfg(feature = "sql")]
 fn first_row_limit(mut plan: SubPlan) -> SubPlan {
     plan.limit = Some(match plan.limit.take() {
@@ -2209,7 +2216,9 @@ fn resolve_node<E>(
             // `attach`).
             #[cfg(feature = "attach")]
             let db = match schema {
-                Some(sc) if db == 3 => {
+                // (v0.17: any name, `main` / `temp` included: a source
+                // another database handed over is reached by its own.)
+                Some(sc) => {
                     let n = handle_bytes(arena, *sc);
                     core::iter::once(cur)
                         .chain(enclosing.iter())
@@ -3931,6 +3940,21 @@ pub fn mark_exists_inert(p: &mut SubPlan) {
     core(p);
     for (_, t) in p.compound.as_mut_slice() {
         core(t);
+    }
+    // The pin drops an EXISTS's ORDER BY and DISTINCT
+    // (`IgnorableOrderby`, v0.17); a core with only UNION ALL to its
+    // right computes no column (`Statement::dest`). Its UNIONs are
+    // UNION ALL only under the LIMIT-1 shortcut (the parser's
+    // `union_limit_one`; v0.17 review fix: with another LIMIT or an
+    // OFFSET the pin merges, deduplicating every core's values).
+    fn drop_order(p: &mut SubPlan) {
+        p.order_by.clear();
+        p.distinct = false;
+    }
+    drop_order(p);
+    p.comp_order.clear();
+    for (_, t) in p.compound.as_mut_slice() {
+        drop_order(t);
     }
 }
 

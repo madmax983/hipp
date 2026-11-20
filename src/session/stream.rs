@@ -110,8 +110,9 @@ enum Mode {
     Agg(Box<AggRun>),
     /// Keep it for the grouping projection at the end.
     Buffer(AVec<RowData>),
-    /// Project it and its ORDER BY keys for the sort at the end.
-    Sort(AVec<Produced>),
+    /// Project it and its ORDER BY keys for the sort at the end, the
+    /// columns only of a row the top-N sorter keeps (`TopN`).
+    Sort(AVec<Produced>, TopN),
 }
 
 /// A streamed aggregate query's state: each aggregate of the
@@ -323,7 +324,16 @@ impl<S: Storage> Statement<'_, S> {
                     .first()
                     .is_some_and(|s| order_delivered(s, (0, 0), qp.order_by.as_slice())))
         {
-            Mode::Sort(AVec::new())
+            let top = pre_skip(
+                qp.items.as_slice(),
+                &[],
+                qp.order_by.as_slice(),
+                qp.sources.as_slice(),
+                (qp.distinct, false),
+                (0, 0),
+                (window.0, window.0.saturating_add(window.1)),
+            );
+            Mode::Sort(AVec::new(), TopN::new(top.2))
         } else if qp.distinct {
             Mode::Distinct(AVec::new())
         } else {
@@ -370,7 +380,7 @@ impl<S: Storage> Statement<'_, S> {
             )?;
         let capped = match mode {
             Mode::Distinct(_) | Mode::Buffer(_) => true,
-            Mode::Sort(_) => qp.distinct || window.1 == usize::MAX,
+            Mode::Sort(..) => qp.distinct || window.1 == usize::MAX,
             _ => false,
         };
         self.conn.stream_left = Some((jm, fm));
@@ -405,7 +415,9 @@ impl<S: Storage> Statement<'_, S> {
             if matches!(s.mode, Mode::Plain | Mode::Distinct(_)) && s.take == 0 {
                 return Ok(false);
             }
-            if !self.join_next(s).await? {
+            // (A partly delivered ORDER BY ends the loop at a prefix
+            // group past its LIMIT: `TopN::part`.)
+            if matches!(&s.mode, Mode::Sort(_, top) if top.done) || !self.join_next(s).await? {
                 self.stream_finish(s).await?;
                 return Ok(false);
             }
@@ -460,19 +472,28 @@ impl<S: Storage> Statement<'_, S> {
                     rows.push(s.acc.clone());
                     s.pinned = self.side_len();
                 }
-                Mode::Sort(out) => {
-                    let vals = self.stream_items(s.qp.items.as_slice(), &s.acc).await?;
-                    let mut keys = AVec::new();
-                    for (e, _) in s.qp.order_by.iter() {
-                        keys.push(self.eval_row_sub(e, &s.acc).await?);
-                    }
-                    shown_keys(keys.as_mut_slice(), s.cols.as_slice(), vals.as_slice());
+                Mode::Sort(out, top) => {
+                    let order = s.qp.order_by.as_slice();
+                    let got = self
+                        .keyed(
+                            s.qp.items.as_slice(),
+                            order,
+                            s.cols.as_slice(),
+                            None,
+                            &s.acc,
+                            top,
+                            out.as_slice(),
+                        )
+                        .await?;
                     self.side_drop(s.row_side, s.pinned);
+                    let Some((vals, keys)) = got else { continue };
                     out.push(Produced {
                         out: vals,
                         keys,
                         rowid,
                     });
+                    let enc = self.conn.pager.text_enc();
+                    top.push(out.as_slice(), s.qp.order_by.as_slice(), enc);
                     // An ORDER BY with a LIMIT keeps the rows it may
                     // still return (the pin's sorter does): sorted
                     // stably, so the earliest of equal rows stay.
@@ -488,6 +509,11 @@ impl<S: Storage> Statement<'_, S> {
                             )
                         });
                         out.truncate(k);
+                        // (Sorted, the rows kept are a max-heap read
+                        // backwards.)
+                        if top.lim != usize::MAX {
+                            top.heap = (0..out.len()).rev().collect();
+                        }
                     }
                 }
             }
@@ -1047,6 +1073,7 @@ impl<S: Storage> Statement<'_, S> {
                     s.qp.order_by.as_slice(),
                     s.qp.sources.as_slice(),
                     s.window,
+                    0,
                 );
                 let pre = pre_skip(
                     s.qp.items.as_slice(),
@@ -1060,7 +1087,7 @@ impl<S: Storage> Statement<'_, S> {
                 self.project_qp_async(&s.qp, rows.as_slice(), cap, pre)
                     .await?
             }
-            Mode::Sort(out) => core::mem::take(out),
+            Mode::Sort(out, _) => core::mem::take(out),
         };
         self.finish_produced(&s.qp, produced, s.window);
         Ok(())

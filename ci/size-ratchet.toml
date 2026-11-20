@@ -111,7 +111,20 @@ justify_over = 4096
 # uncoded for table_info / ALTER, count(*)-of-view depth refusal, FLEXNUM
 # CTAS columns, trigger rowid affinity, the 500-SELECT exemption after a
 # chain. No offsetting saving found (#[inline(never)] tried: +8 B).
-ratchet = 490396
+# 490,396 -> 494,292 (v0.17 result_gaps, ungated correctness; STATUS.md):
+# +3,896 B. The pin's top-N sorter (`TopN` heap, keys before columns in
+# one `keyed` helper, `arm_keys` for UNION ALL merge cores), EXISTS cores
+# left uncomputed, co-routine GROUP BY delivery, `ob_refs`, TEMP CTAS
+# FLEXNUM. Offsets: `count_selects` and `shown_keys` removed, the
+# projections' key/column loops shared (`keyed`, -640 B; boxed, +136 B,
+# which keeps the projections' futures, and a debug step's stack, small).
+# 494,292 -> 495,060 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +768 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+ratchet = 495060
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -195,7 +208,23 @@ justify_over = 16384
 # 976,508 -> 976,692 (v0.17 values_chain review fixes, ungated correctness;
 # STATUS.md): +184 B, the `full` fixes plus the push-down through merged
 # bodies and `SELECT *` arms (`planner`), net of layout.
-ratchet = 976692
+# 976,692 -> 981,700 (v0.17 attach, `attach` leaf; STATUS.md): +5,008 B.
+# ATTACH parity: the integrity check over every database, the router's
+# TEMP-write route and qualifier insertion, `run_routed` / `width_on` for
+# the TEMP database, attached views in the expander, string names.
+# Offsets: `collect_on` folded into `run_routed`, `foreign_from` cut down.
+# 981,700 -> 986,160 (v0.17 result_gaps, ungated correctness; STATUS.md):
+# +4,460 B, the `full` growth plus the WITHOUT ROWID natural order's
+# access path and the co-routine GROUP BY plan line (`explain`).
+# 986,160 -> 985,472 (v0.17 attach review fixes, `attach` leaf; STATUS.md):
+# -688 B. The router finds the write target by its token (one lookup).
+# 985,472 -> 986,232 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +760 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+ratchet = 986232
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -272,7 +301,21 @@ justify_over = 32768
 # correctness; STATUS.md): +936 B, the `max` fixes.
 # 1,074,624 -> 1,077,632 (v0.17 values_chain review fixes, ungated
 # correctness; STATUS.md): +3,008 B, the `max` fixes.
-ratchet = 1077632
+# 1,077,632 -> 1,084,848 (v0.17 attach, `attach` leaf; STATUS.md):
+# +7,216 B, the `max` growth plus `Statement::step` inlining the larger
+# `step_att` (+2 KB; boxing its TEMP branch measured larger).
+# 1,084,848 -> 1,088,300 (v0.17 result_gaps, ungated correctness;
+# STATUS.md): +3,452 B, the `max` growth net of layout.
+# 1,088,300 -> 1,088,732 (v0.17 attach review fixes, `attach` leaf;
+# STATUS.md): +432 B, layout/inlining (max shrank 688 B): WITH-target
+# routing, routed rows before an error, temp opened by integrity_check.
+# 1,088,732 -> 1,089,500 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +768 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+ratchet = 1089500
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

@@ -1170,9 +1170,11 @@ pub fn ctas_sql(tname: &[u8], cols: &[(AVec<u8>, Affinity)]) -> AVec<u8> {
 /// also a derived table's and a view's) unique the pin's way
 /// (`sqlite3ColumnsFromExprList`): a name equal (ignoring
 /// case) to an earlier one loses any `:digits` suffix and takes
-/// `:1`, `:2`, ... until unique. Past three attempts the pin
-/// switches to a random suffix, which hipp cannot reproduce:
-/// `Error::Unsupported` then.
+/// `:1`, `:2`, ... until unique. Past the fourth attempt the pin
+/// switches to a random suffix (`sqlite3_randomness` once `cnt > 3`,
+/// after `:4` is formed), which hipp cannot reproduce:
+/// `Error::Unsupported` then (v0.17 fix: a fifth equal name, `:4`,
+/// was refused).
 pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
     for i in 0..names.len() {
         let mut cnt = 0u32;
@@ -1182,7 +1184,7 @@ pub fn unique_names<E>(names: &mut [AVec<u8>]) -> Result<(), E> {
             if !done.iter().any(|d| eq_ci(d.as_slice(), cur.as_slice())) {
                 break;
             }
-            if cnt >= 3 {
+            if cnt >= 4 {
                 return Err(Error::Unsupported);
             }
             cnt += 1;

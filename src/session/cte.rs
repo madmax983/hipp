@@ -42,12 +42,20 @@ use crate::sql::{
     CompoundOp, Cte, CteUse, FromSource, JoinKind, M10d, RecMark, UpsertAction, With,
 };
 
-/// How many SELECTs the expansion of one statement may copy out of
-/// view and CTE bodies before a CTE reference is refused (the pin's
-/// "VIEWs and/or subqueries nested too deep", `NestedTooDeep`:
-/// probed, a chain of 999 CTEs reads and 1000 do not; the copies of
-/// views read before count as well). It also bounds the work of a
-/// CTE whose references double at each level.
+/// The count past which a CTE reference is refused (the pin's
+/// "VIEWs and/or subqueries nested too deep", `NestedTooDeep`).
+/// Probed on the pin (v0.17 review fix): the count is its cursor
+/// numbers (`Parse.nTab`) when a CTE reference is expanded — one for
+/// every FROM item (table, view, CTE reference, FROM subquery,
+/// table-valued function) a select's expansion assigns before its
+/// expressions are walked (its FROM subqueries' items with it), one
+/// for an UPDATE / DELETE target and each of its indexes, and for
+/// UPDATE ... FROM one more plus two per FROM item — and only a CTE
+/// reference checks it: 999 `(SELECT x FROM c)` read and 1,000 do
+/// not, 998 under `FROM u` (999 under a table-less select), 997 with
+/// two indexes on a DELETE's target; 1,500 views or FROM subqueries
+/// without a CTE read. It also bounds the work of a CTE whose
+/// references double at each level.
 const MAX_COPIES: usize = 1000;
 
 /// What a reference to a CTE means while that CTE's own body is
@@ -128,8 +136,11 @@ struct Expander<'c> {
     /// The connection's parser limits (`Config::limits`), for view
     /// bodies re-parsed here.
     lim: crate::sql::parser::Limits,
-    /// SELECTs copied out of view and CTE bodies so far.
+    /// The pin's cursor numbers assigned so far (`MAX_COPIES`).
     copies: usize,
+    /// The next select is a FROM subquery whose last core's items its
+    /// reader counted (`count_from`).
+    precounted: bool,
     /// The pin's name-resolution depth at this point
     /// (`Parse.nHeight`, v0.16 review fix): the heights of the
     /// expressions the select being walked sits in, summed over
@@ -164,6 +175,18 @@ struct Expander<'c> {
     /// fix, `planner`; see `cte`).
     #[cfg(feature = "planner")]
     in_rhs: bool,
+    /// The attached databases' names and catalogs, and the TEMP
+    /// database's catalog (v0.17, `attach`): a view of an attached
+    /// database read by a statement of main is expanded here with
+    /// its names bound to its own database.
+    #[cfg(feature = "attach")]
+    att: AVec<(&'c [u8], &'c Catalog, &'c Arena)>,
+    #[cfg(feature = "attach")]
+    tmp: Option<(&'c Catalog, &'c Arena)>,
+    /// Walking the body of attached database `db`'s view (`catalog`
+    /// and `ca` are that database's then).
+    #[cfg(feature = "attach")]
+    db: Option<usize>,
 }
 
 fn schema_err<E>(kind: SchemaKind) -> Error<E> {
@@ -185,6 +208,7 @@ impl<S: Storage> Connection<S> {
             max_nest: self.cfg.max_nesting,
             lim: self.cfg.limits(),
             copies: 0,
+            precounted: false,
             ctx: 0,
             fixing: false,
             #[cfg(feature = "explain")]
@@ -197,6 +221,16 @@ impl<S: Storage> Connection<S> {
             fix_main: false,
             #[cfg(feature = "planner")]
             in_rhs: false,
+            #[cfg(feature = "attach")]
+            att: self
+                .attached
+                .iter()
+                .map(|a| (a.name.as_slice(), &a.conn.catalog, &a.conn.catalog_arena))
+                .collect(),
+            #[cfg(feature = "attach")]
+            tmp: self.temp.as_deref().map(|c| (&c.catalog, &c.catalog_arena)),
+            #[cfg(feature = "attach")]
+            db: None,
         }
     }
 
@@ -352,7 +386,37 @@ impl<S: Storage> Connection<S> {
     }
 }
 
+/// The cursors the pin's `selectExpander` assigns to FROM items `from`
+/// (`sqlite3SrcListAssignCursors`, `MAX_COPIES`): one each, and a
+/// written FROM subquery's last core's items with it. A recursive
+/// reference is counted where it is resolved.
+fn count_from(from: &[FromSource]) -> usize {
+    from.iter().fold(0usize, |n, f| {
+        let inner = match (&f.derived, &f.cte) {
+            (_, Some(_)) => return n,
+            (Some(d), None) => count_from(
+                d.compound
+                    .as_slice()
+                    .last()
+                    .map_or(d.from.as_slice(), |(_, c)| c.from.as_slice()),
+            ),
+            (None, None) => 0,
+        };
+        n.saturating_add(1).saturating_add(inner)
+    })
+}
+
 impl Expander<'_> {
+    /// An UPDATE / DELETE target's cursors: the table's and one per
+    /// index (`MAX_COPIES`).
+    fn target_cursors(&self, table: ABytes) -> usize {
+        let t = handle_bytes(self.arena, table);
+        self.catalog
+            .indexes_for(self.ca, t)
+            .count()
+            .saturating_add(1)
+    }
+
     fn ast<E>(&mut self, ast: &mut Ast) -> Result<(), E> {
         match ast {
             Ast::Select(s) => self.select::<E>(s)?,
@@ -398,12 +462,23 @@ impl Expander<'_> {
                 self.returning_items::<E>(returning.as_mut_slice())?;
             }
             Ast::Update {
+                table,
                 assignments,
                 from,
                 filter,
                 returning,
                 ..
             } => {
+                // (The target's cursors, and UPDATE ... FROM's join:
+                // `MAX_COPIES`.)
+                let mut n = self.target_cursors(*table);
+                if !from.is_empty() {
+                    n = n
+                        .saturating_add(1)
+                        .saturating_add(from.len())
+                        .saturating_add(count_from(from.as_slice()));
+                }
+                self.copies = self.copies.saturating_add(n);
                 for (_, e) in assignments.as_mut_slice() {
                     self.expr::<E>(e)?;
                 }
@@ -420,8 +495,13 @@ impl Expander<'_> {
                 self.returning_items::<E>(returning.as_mut_slice())?;
             }
             Ast::Delete {
-                filter, returning, ..
+                table,
+                filter,
+                returning,
+                ..
             } => {
+                let n = self.target_cursors(*table);
+                self.copies = self.copies.saturating_add(n);
                 if let Some(f) = filter {
                     self.expr::<E>(f)?;
                 }
@@ -554,7 +634,8 @@ impl Expander<'_> {
                 .iter()
                 .any(|(op, _)| *op != crate::sql::CompoundOp::UnionAll);
         head.omit |= n > 0 && merged && !core_win(s) && !order_reqd(s, self.arena);
-        self.core::<E>(s, &head)?;
+        let pre = core::mem::take(&mut self.precounted);
+        self.core::<E>(s, &head, pre && n == 0)?;
         let (order, limit) = (!s.order_by.is_empty(), s.limit.is_some() || implicit);
         for (k, (_, c)) in s.compound.as_mut_slice().iter_mut().enumerate() {
             let mut o = outer_of(c, false, true, self.arena);
@@ -565,7 +646,7 @@ impl Expander<'_> {
                 o.order = order;
                 o.limit = limit;
             }
-            self.core::<E>(c, &o)?;
+            self.core::<E>(c, &o, pre && k + 1 == n)?;
         }
         self.tail::<E>(s)
     }
@@ -584,8 +665,15 @@ impl Expander<'_> {
         Ok(())
     }
 
-    /// One core's own clauses.
-    fn core<E>(&mut self, s: &mut SelectStmt, o: &Outer) -> Result<(), E> {
+    /// One core's own clauses: its FROM items first, as the pin's
+    /// `selectExpander` assigns their cursors and expands its views
+    /// and CTE references before the walk reaches its expressions
+    /// (`counted`: a FROM subquery's last core, which its reader
+    /// counted).
+    fn core<E>(&mut self, s: &mut SelectStmt, o: &Outer, counted: bool) -> Result<(), E> {
+        if !self.fixing && !counted {
+            self.copies = self.copies.saturating_add(count_from(s.from.as_slice()));
+        }
         if self.fixing {
             self.share_views(s, o);
         } else {
@@ -598,8 +686,8 @@ impl Expander<'_> {
                 s.sel = super::eqp::VIEW_SEL.saturating_add(self.view_sel);
             }
         }
-        self.items::<E>(s.items.as_mut_slice())?;
         self.sources::<E>(s.from.as_mut_slice(), o)?;
+        self.items::<E>(s.items.as_mut_slice())?;
         if let Some(f) = &mut s.filter {
             self.expr::<E>(f)?;
         }
@@ -836,6 +924,7 @@ impl Expander<'_> {
             return Ok(());
         }
         if let Some(d) = &mut f.derived {
+            self.precounted = true;
             self.select::<E>(d)?;
             // Under RETURNING, a FROM subquery is computed once for
             // the statement.
@@ -900,6 +989,10 @@ impl Expander<'_> {
                     m.0 = M10d::Yes;
                 }
             }
+            return Ok(());
+        }
+        #[cfg(feature = "attach")]
+        if self.att_source::<E>(f, name.as_slice())? {
             return Ok(());
         }
         if self.fix_main {
@@ -1001,6 +1094,59 @@ impl Expander<'_> {
         }
     }
 
+    /// A FROM name of an attached database on main (v0.17, `attach`;
+    /// `true`: settled here). `aux.v`, an unqualified name only an
+    /// attached database has, and every name in the body of such a
+    /// database's view (bound to that database, as the pin's
+    /// `DbFixer` binds a stored view's names) are looked up in its
+    /// catalog: a view is expanded there, a table is left to the
+    /// planner as that database's (`ext_source`), its schema named.
+    /// Before, `aux.v` read main's view `v` when main had one, and
+    /// a view of another database read beside main's tables was
+    /// refused.
+    #[cfg(feature = "attach")]
+    fn att_source<E>(&mut self, f: &mut FromSource, name: &[u8]) -> Result<bool, E> {
+        let q = f.schema.map(|h| handle_bytes(self.arena, h));
+        let i = match (self.db, q) {
+            (Some(i), _) => i,
+            (None, Some(q)) => {
+                if eq_ci(q, b"main") || eq_ci(q, b"temp") {
+                    return Ok(false);
+                }
+                match self.att.iter().position(|a| eq_ci(a.0, q)) {
+                    Some(i) => i,
+                    None => return Ok(true),
+                }
+            }
+            (None, None) => {
+                let mine = |c: &Catalog, a: &Arena| c.taken(a, name) == Some(false);
+                if self.fix_main
+                    || mine(self.catalog, self.ca)
+                    || self.tmp.is_some_and(|(c, a)| mine(c, a))
+                {
+                    return Ok(false);
+                }
+                match self.att.iter().position(|a| mine(a.1, a.2)) {
+                    Some(i) => i,
+                    None => return Ok(false),
+                }
+            }
+        };
+        let Some(&(an, cat, ca)) = self.att.as_slice().get(i) else {
+            return Ok(true);
+        };
+        if let Some(v) = cat.find_view(ca, name) {
+            let saved = (self.catalog, self.ca, self.db);
+            (self.catalog, self.ca, self.db) = (cat, ca, Some(i));
+            let r = self.view::<E>(f, v);
+            (self.catalog, self.ca, self.db) = saved;
+            r?;
+        }
+        // (A view's columns answer to its database's name too.)
+        f.schema = Some(self.arena.alloc_copy_handle(an)?);
+        Ok(true)
+    }
+
     /// Rewrite `f` into the derived table of view `v`.
     fn view<E>(&mut self, f: &mut FromSource, v: &crate::schema::ViewDef) -> Result<(), E> {
         let name = handle_bytes(self.ca, v.name);
@@ -1023,7 +1169,6 @@ impl Expander<'_> {
             self.nest -= 1;
             return Err(e);
         }
-        self.copies = self.copies.saturating_add(count_selects(&select));
         // A view's body sees no CTE of the query that reads it.
         let vis = core::mem::take(&mut self.vis);
         self.views.push(copy_vec(name));
@@ -1078,7 +1223,6 @@ impl Expander<'_> {
             Busy::Circular => return Err(schema_err(SchemaKind::CircularReference)),
             Busy::MultiRec => return Err(schema_err(SchemaKind::RecursiveReferences)),
         }
-        self.copies = self.copies.saturating_add(count_selects(&cte.select));
         if self.copies >= MAX_COPIES {
             return Err(schema_err(SchemaKind::NestedTooDeep));
         }
@@ -1192,6 +1336,12 @@ impl Expander<'_> {
                 }
                 for s in core.from.as_mut_slice() {
                     if is_ref(s, name, self.arena) {
+                        // (The pin resolves the recursive reference as a
+                        // CTE reference: it counts too, v0.17.)
+                        self.copies = self.copies.saturating_add(1);
+                        if self.copies >= MAX_COPIES {
+                            return Err(schema_err(SchemaKind::NestedTooDeep));
+                        }
                         s.cte = Some(Box::new(CteUse {
                             columns: AVec::new(),
                             rec: RecMark::Ref { id },
@@ -1238,13 +1388,13 @@ impl Expander<'_> {
         let r = (|| {
             let n = body.compound.len();
             let head = outer_of(body, false, true, self.arena);
-            self.core::<E>(body, &head)?;
+            self.core::<E>(body, &head, false)?;
             for (k, (_, c)) in body.compound.as_mut_slice().iter_mut().enumerate() {
                 if k + 1 == split {
                     self.set_busy(fi, ci, Busy::MultiRec);
                 }
                 let o = outer_of(c, false, n > 0, self.arena);
-                self.core::<E>(c, &o)?;
+                self.core::<E>(c, &o, false)?;
             }
             self.set_busy(fi, ci, Busy::MultiRec);
             self.tail::<E>(body)
@@ -1636,71 +1786,6 @@ fn conjuncts<'e>(e: &'e Expr, out: &mut AVec<&'e Expr>) {
         }
         _ => out.push(e),
     }
-}
-
-/// How many SELECTs `s` holds: its cores, and those of its derived
-/// tables, subqueries and WITH clause.
-fn count_selects(s: &SelectStmt) -> usize {
-    let mut n = 0usize;
-    count_into(s, &mut n);
-    n
-}
-
-fn count_into(s: &SelectStmt, n: &mut usize) {
-    count_core(s, n);
-    // (The rows of a VALUES chain are one SELECT here, as before the
-    // chain was read row by row: v0.17 review fix, the pin reads a CTE
-    // of 3,000 chained rows.)
-    for (_, c) in s.compound.iter() {
-        if c.values.is_empty() {
-            count_core(c, n);
-        }
-    }
-    for (e, _) in s.order_by.iter() {
-        count_expr(e, n);
-    }
-    if let Some(w) = &s.with {
-        for c in w.ctes.iter() {
-            count_into(&c.select, n);
-        }
-    }
-}
-
-fn count_core(s: &SelectStmt, n: &mut usize) {
-    *n = n.saturating_add(1);
-    for it in s.items.iter() {
-        if let SelectItem::Expr(e, ..) = it {
-            count_expr(e, n);
-        }
-    }
-    for f in s.from.iter() {
-        if let Some(d) = &f.derived {
-            count_into(d, n);
-        }
-        if let Some(on) = &f.on {
-            count_expr(on, n);
-        }
-    }
-    for e in s
-        .filter
-        .iter()
-        .chain(s.having.iter())
-        .chain(s.group_by.iter())
-    {
-        count_expr(e, n);
-    }
-}
-
-fn count_expr(e: &Expr, n: &mut usize) {
-    crate::rules::expr_any(e, &mut |x| {
-        match x {
-            Expr::ScalarSubquery(s) | Expr::ExistsSubquery(s) | Expr::InSubquery(_, s, _) => {
-                count_into(s, n)
-            }
-            _ => {}
-        }
-        false
-    });
 }
 
 /// Whether FROM source `s` is a direct (recursive) reference to
@@ -2170,7 +2255,7 @@ impl<S: Storage> Statement<'_, S> {
             let mut r = Ok(());
             for step in steps.iter() {
                 match self
-                    .exec_subplan_core(step, outer, None, None, (0, usize::MAX))
+                    .exec_subplan_core(step, outer, None, None, (0, usize::MAX, usize::MAX))
                     .await
                 {
                     Ok(produced) => {

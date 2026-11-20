@@ -630,28 +630,6 @@ impl<'a> Walk<'a> {
         // than UNION ALL (all of it under an ORDER BY), as hipp's
         // executor does (`session::run_compound`); the UNION ALL
         // members after that are appended.
-        // The pin's UNION-with-LIMIT-1 shortcut reads the members as
-        // UNION ALL ones until a row is found (`union_first_row`).
-        if s.comp_order == 0
-            && s.offset.is_none()
-            && matches!(s.limit, Some(RExpr::Literal(OwnedValue::Integer(1))))
-            && s.cores
-                .iter()
-                .skip(1)
-                .all(|(op, _)| *op == CompoundOp::Union)
-        {
-            let mut all = Sel {
-                cores: AVec::new(),
-                comp_order: 0,
-                limit: None,
-                offset: None,
-            };
-            for (_, c) in s.cores.iter() {
-                all.cores.push((CompoundOp::UnionAll, c.clone()));
-            }
-            self.chain(&all, n - 1, 0, parent);
-            return;
-        }
         let last = if s.comp_order > 0 {
             n - 1
         } else {
@@ -1228,7 +1206,10 @@ impl<'a> Walk<'a> {
             let grouped = acc.is_some_and(|a| a.groups);
             #[cfg(not(feature = "expr_index"))]
             let grouped = false;
-            let grouped = grouped || self.natural(first) >= c.group_by.len();
+            // (Or a lone FROM subquery's order delivers it: v0.17.)
+            let grouped = grouped
+                || self.natural(first) >= c.group_by.len()
+                || first.is_some_and(|s| groups_adjacent(c.sources, c.group_by, s.eqp.base));
             if !grouped {
                 self.add(parent, &[b"USE TEMP B-TREE FOR GROUP BY"]);
             }
@@ -1284,7 +1265,12 @@ impl<'a> Walk<'a> {
             // does not deliver it (v0.17 review fix).
             let single = c.has_agg && c.group_by.is_empty();
             let same_group = !c.group_by.is_empty()
-                && crate::session::groups_sorted(c.group_by, c.order_by, c.sources);
+                && crate::session::groups_sorted_at(
+                    c.group_by,
+                    c.order_by,
+                    c.sources,
+                    first.map_or(usize::MAX, |s| s.eqp.base),
+                );
             let k = c.order_by.len();
             let done = if c.group_by.is_empty() && (!c.distinct || !c.has_agg) {
                 delivered.min(k)
@@ -2575,6 +2561,16 @@ impl<S: Storage> Statement<'_, S> {
         if let Plan::Att(p) = &self.plan {
             let (db, t) = (p.db, text(p.sql.as_slice()));
             let tabs = self.conn.ext_tabs(p.ext.as_slice())?;
+            // A TEMP write reading other databases (v0.17).
+            if db == super::attach::TEMP_DB {
+                let Some(c) = self.conn.temp.as_deref_mut() else {
+                    return Err(Error::Unsupported);
+                };
+                *c.ext.borrow_mut() = tabs;
+                let r = collect(c, t.as_slice()).await.map_err(temp::mem_err);
+                c.ext.borrow_mut().clear();
+                return r;
+            }
             let Some(a) = self.conn.attached.as_mut_slice().get_mut(db) else {
                 return Err(Error::Schema {
                     kind: SchemaKind::NoSuchDatabase,

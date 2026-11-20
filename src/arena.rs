@@ -227,16 +227,18 @@ impl Arena {
             new_cap = len + ALIGN;
         }
         if inner.capacity + new_cap > self.max {
-            // A dedicated chunk of exactly the need might still fit
-            // where the geometric one did not.
-            let exact = len + ALIGN;
-            if inner.capacity + exact > self.max {
+            // The rest of the budget as one last chunk might still fit
+            // where the geometric one did not (v0.17: a chunk of exactly
+            // the need left every later allocation a chunk of its own,
+            // each wasting its alignment, and a rewound arena could not
+            // reuse them).
+            new_cap = self.max.saturating_sub(inner.capacity);
+            if new_cap < len + ALIGN {
                 return Err(ArenaError {
                     scope: self.scope,
                     needed: len,
                 });
             }
-            new_cap = exact;
         }
         let raw: *mut [u8] = Box::into_raw(alloc::vec![0u8; new_cap].into_boxed_slice());
         let ptr = raw.cast::<u8>();
@@ -270,6 +272,44 @@ impl Arena {
             pos: pos as u32,
             len: data.len() as u32,
         })
+    }
+
+    /// The handle of `data` when it already lies in this arena (a
+    /// slice of bytes it handed out, such as the statement text the
+    /// lexer reads), else a copy's (v0.17 review fix: a statement's
+    /// names and string literals cost no arena beyond its text). Only
+    /// addresses are compared; stored bytes are never written again.
+    /// (The tiny profile, no `query`, copies: its statements are
+    /// short, and the lookup would cost it code.)
+    pub fn handle_or_copy(&self, data: &[u8]) -> Result<ABytes, ArenaError> {
+        #[cfg(feature = "query")]
+        if let Some(h) = self.handle_of(data) {
+            return Ok(h);
+        }
+        self.alloc_copy_handle(data)
+    }
+
+    /// `handle_or_copy`'s lookup.
+    #[cfg(feature = "query")]
+    fn handle_of(&self, data: &[u8]) -> Option<ABytes> {
+        let inner = unsafe { &*self.inner.get() };
+        let at = data.as_ptr() as usize;
+        let mut base = 0usize;
+        for (c, used) in inner.chunks.iter().zip(inner.offs.iter()) {
+            let start = c.ptr as usize;
+            if at >= start
+                && let Some(off) = at.checked_sub(start)
+                && off.checked_add(data.len()).is_some_and(|e| e <= *used)
+                && let (Ok(pos), Ok(len)) = (
+                    u32::try_from(base.saturating_add(off)),
+                    u32::try_from(data.len()),
+                )
+            {
+                return Some(ABytes { pos, len });
+            }
+            base = base.saturating_add(*used);
+        }
+        None
     }
 
     /// Consume `bytes` of budget without retaining a slice (used to

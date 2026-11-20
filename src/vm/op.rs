@@ -651,14 +651,13 @@ pub(crate) enum SubKind {
 
 /// A compound's combination (`P4::Comp`): `session::run_compound`'s
 /// operators (one per tail core), the cores' column collations (head
-/// first), the compound ORDER BY, and the UNION-with-LIMIT-1
-/// shortcut (`union_first_row`).
+/// first) and the compound ORDER BY (the UNION-with-LIMIT-1
+/// shortcut's UNIONs are UNION ALL ones: `parser::union_limit_one`).
 #[cfg(feature = "sql")]
 pub(crate) struct CompInfo {
     pub(crate) ops: AVec<crate::sql::CompoundOp>,
     pub(crate) cores: AVec<AVec<Option<crate::record::Coll>>>,
     pub(crate) order: AVec<(usize, crate::sql::SortOrder)>,
-    pub(crate) first_row: bool,
 }
 
 /// A recursive CTE's queue (`P4::Queue`): its ORDER BY (none: first
