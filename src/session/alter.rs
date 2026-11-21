@@ -637,7 +637,7 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         };
         let expanded = self.expand_parsed_view(arena, name, select)?;
-        self.plan_subquery(&expanded, arena, &[])?;
+        self.plan_uncoded(&expanded, arena, true)?;
         Ok(())
     }
 
@@ -664,7 +664,7 @@ impl<S: Storage> Connection<S> {
         self.alter_trace = Some(tr.clone());
         let r = (|| -> Result<(), S::Error> {
             let expanded = self.expand_parsed_view(arena, name, select.clone())?;
-            self.plan_subquery(&expanded, arena, &[])?;
+            self.plan_uncoded(&expanded, arena, true)?;
             // Each CTE of the view's WITH clause, read on its own.
             if let Some(w) = &select.with {
                 for c in w.ctes.iter() {
@@ -699,7 +699,7 @@ impl<S: Storage> Connection<S> {
                     probe.compound = AVec::new();
                     probe.values = AVec::new();
                     if let Ok(e) = self.expand_parsed_view(arena, name, probe) {
-                        let _ = self.plan_subquery(&e, arena, &[]);
+                        let _ = self.plan_uncoded(&e, arena, true);
                     }
                 }
             }
@@ -893,7 +893,7 @@ impl<S: Storage> Connection<S> {
                 self.trig.fix_main.set(fixed);
                 let expanded = expanded?;
                 if let Some(Ast::Select(s)) = expanded.as_ref().or(Some(&wrapped)) {
-                    self.plan_subquery(s, arena, &[])?;
+                    self.plan_uncoded(s, arena, true)?;
                 }
                 Ok(())
             })();
@@ -1412,7 +1412,7 @@ impl<'c, S: Storage> Statement<'c, S> {
             {
                 let v = v.clone();
                 let (select, _) = self.conn.expand_view(&arena, &v)?;
-                self.conn.plan_subquery(&select, &arena, &[])?;
+                self.conn.plan_uncoded(&select, &arena, true)?;
             }
             arena.rewind(ckpt);
         }

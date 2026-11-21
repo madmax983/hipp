@@ -1032,6 +1032,14 @@ fn lex_inner<E>(
                 i += 1;
             }
             b'.' if !(i + 1 < n && sql[i + 1].is_ascii_digit()) => {
+                // v0.17 (`attach`): a string literal before a dot is a
+                // name (`'aux'.t`), the pin's `nm ::= STRING`.
+                #[cfg(feature = "attach")]
+                if let Some(t) = toks.as_mut_slice().last_mut()
+                    && let Tok::Text(h) = t.tok
+                {
+                    t.tok = Tok::Ident(h, true);
+                }
                 toks.push(Token {
                     tok: Tok::Dot,
                     offset: off,
@@ -1059,9 +1067,26 @@ fn lex_inner<E>(
                         i += 1;
                     }
                 }
-                let h = arena.alloc_copy_handle(buf.as_slice())?;
+                // (Without an escape the literal is its own text.)
+                #[cfg(feature = "query")]
+                let lit = match sql.get(off.saturating_add(1)..i.saturating_sub(1)) {
+                    Some(raw) if raw == buf.as_slice() => raw,
+                    _ => buf.as_slice(),
+                };
+                #[cfg(not(feature = "query"))]
+                let lit = buf.as_slice();
+                let h = arena.handle_or_copy(lit)?;
+                // ... and so is one after a dot (`aux.'t'`).
+                #[cfg(feature = "attach")]
+                let after_dot = matches!(toks.as_slice().last(), Some(Token { tok: Tok::Dot, .. }));
+                #[cfg(not(feature = "attach"))]
+                let after_dot = false;
                 toks.push(Token {
-                    tok: Tok::Text(h),
+                    tok: if after_dot {
+                        Tok::Ident(h, true)
+                    } else {
+                        Tok::Text(h)
+                    },
                     offset: off,
                 });
             }
@@ -1101,7 +1126,7 @@ fn lex_inner<E>(
                 if i >= n {
                     return Err(perr(off, ParseKind::UnexpectedEof));
                 }
-                let h = arena.alloc_copy_handle(&sql[start..i])?;
+                let h = arena.handle_or_copy(&sql[start..i])?;
                 i += 1;
                 toks.push(Token {
                     tok: Tok::Ident(h, true),
@@ -1223,7 +1248,7 @@ fn lex_inner<E>(
                 while i < n && is_ident_char(sql[i]) {
                     i += 1;
                 }
-                let h = arena.alloc_copy_handle(&sql[start..i])?;
+                let h = arena.handle_or_copy(&sql[start..i])?;
                 toks.push(Token {
                     tok: Tok::Ident(h, false),
                     offset: off,

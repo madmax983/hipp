@@ -259,58 +259,7 @@ impl WinCall {
 // ---------------------------------------------------------------
 // Walking the Win nodes of an expression.
 
-/// Call `f` on every direct child of `e` that evaluates against the
-/// same row (subquery plans are other cores and are not entered).
-pub(crate) fn each_child<'x>(e: &'x RExpr, f: &mut dyn FnMut(&'x RExpr)) {
-    match e {
-        RExpr::Literal(_)
-        | RExpr::AffLiteral(..)
-        | RExpr::Column(..)
-        | RExpr::Rowid(_)
-        | RExpr::Raise(_)
-        | RExpr::SubScalar(_)
-        | RExpr::SubExists(_) => {}
-        RExpr::InSub(x, ..)
-        | RExpr::Neg(x)
-        | RExpr::Pos(x)
-        | RExpr::Not(x)
-        | RExpr::IsNull(x, _)
-        | RExpr::Cast(x, _)
-        | RExpr::Collate(x, _) => f(x),
-        RExpr::Binary(_, a, b) | RExpr::Like(a, b, _) => {
-            f(a);
-            f(b);
-        }
-        RExpr::InList(x, l, ..) => {
-            f(x);
-            l.iter().for_each(f);
-        }
-        RExpr::Between(x, a, b, _) => {
-            f(x);
-            f(a);
-            f(b);
-        }
-        RExpr::Case {
-            base,
-            whens,
-            otherwise,
-        } => {
-            if let Some(b) = base {
-                f(b);
-            }
-            for (w, t) in whens.iter() {
-                f(w);
-                f(t);
-            }
-            if let Some(o) = otherwise {
-                f(o);
-            }
-        }
-        RExpr::Scalar(_, args) | RExpr::Agg { args, .. } | RExpr::Win(_, args) => {
-            args.iter().for_each(f)
-        }
-    }
-}
+pub(crate) use crate::query::each_child;
 
 /// `each_child` over mutable children.
 fn each_child_mut(e: &mut RExpr, f: &mut dyn FnMut(&mut RExpr)) {

@@ -88,11 +88,46 @@ justify_over = 4096
 # `compound_affinity` made non-generic and out of line (-2,237 B).
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-# +456 B (Bolt): prepare lexes each statement once for the TEMP /
-# ATTACH routers and the parse (prepare -18.8% instructions on
-# bolt_workload). Measured after merging main (PR #31); +640 B
-# on the pre-merge base.
-ratchet = 481520
+# +2,720 B (v0.17 order_offset, ungated fixes): the OFFSET skips rows
+# before their result columns (pre_skip / arm_bounds, UNION ALL chain
+# caps), the omitted FROM-subquery ORDER BY (cte.rs), the co-routine
+# order (sub_delivers), the delivered-ORDER-BY trim and the UNION ALL
+# ORDER BY merge; offsets taken: shared arm_bounds, the skipped group's
+# aggregates in the existing finalize loop (-440 B).
+# 483,784 -> 486,884 (v0.17 values_chain, ungated correctness; STATUS.md):
+# +3,100 B. Unknown collations looked up only where the pin does
+# (`coll_misses`, `key_coll`, `lead_colls`), VALUES parsed as the pin's
+# chain / co-routine segments with the later chain's wrapper, VALUES
+# column names from a first-row column; `chain_reals` removed.
+# 486,884 -> 487,404 (v0.17 order_offset review fixes, ungated correctness;
+# STATUS.md): +520 B. A delivered ORDER BY (COLLATE'd / multi-term rowid
+# lead, a correlated scope's own rowid) skips its OFFSET and stops at its
+# LIMIT; DISTINCT cores and groups count distinct rows under a LIMIT.
+# Offsets: one `dup_row` for every DISTINCT check, `dedup_compound_rows`
+# and stream's `rowid_order` removed.
+# 487,404 -> 490,396 (v0.17 values_chain review fixes, ungated correctness;
+# STATUS.md): +2,992 B. CHECKs under an unknown collation refused only by
+# the statements that code them (TableRules::coded), views resolved
+# uncoded for table_info / ALTER, count(*)-of-view depth refusal, FLEXNUM
+# CTAS columns, trigger rowid affinity, the 500-SELECT exemption after a
+# chain. No offsetting saving found (#[inline(never)] tried: +8 B).
+# 490,396 -> 494,292 (v0.17 result_gaps, ungated correctness; STATUS.md):
+# +3,896 B. The pin's top-N sorter (`TopN` heap, keys before columns in
+# one `keyed` helper, `arm_keys` for UNION ALL merge cores), EXISTS cores
+# left uncomputed, co-routine GROUP BY delivery, `ob_refs`, TEMP CTAS
+# FLEXNUM. Offsets: `count_selects` and `shown_keys` removed, the
+# projections' key/column loops shared (`keyed`, -640 B; boxed, +136 B,
+# which keeps the projections' futures, and a debug step's stack, small).
+# 494,292 -> 495,060 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +768 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+# +400 B (Bolt): prepare lexes each statement once for the TEMP /
+# ATTACH routers and the parse (prepare -17.7% instructions on
+# bolt_workload). Measured on main at 8ce2df6.
+ratchet = 495460
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -165,11 +200,37 @@ justify_over = 16384
 # +24 B (Bolt, measured after merging main into v0.17 wave 17; +16 B on
 # main): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-# +464 B (Bolt): prepare lexes each statement once for the TEMP /
-# ATTACH routers and the parse (prepare -18.8% instructions on
-# bolt_workload). Measured after merging main (PR #31); +448 B
-# on the pre-merge base.
-ratchet = 968936
+# +3,504 B (v0.17 order_offset): full's fixes plus the planner's
+# isOrderDistinct rule (xplan::order_sat, the UNSAT cost case).
+# 971,976 -> 975,540 (v0.17 values_chain, ungated correctness; STATUS.md):
+# +3,564 B, the `full` growth plus the chain plan lines (`explain`);
+# `window::each_child` shared with `coll_misses` (-232 B).
+# 975,540 -> 976,508 (v0.17 order_offset review fixes, ungated correctness;
+# STATUS.md): +968 B, the `full` fixes plus windows stopping at their
+# LIMIT and isOrderDistinct over IN terms and WITHOUT ROWID columns.
+# 976,508 -> 976,692 (v0.17 values_chain review fixes, ungated correctness;
+# STATUS.md): +184 B, the `full` fixes plus the push-down through merged
+# bodies and `SELECT *` arms (`planner`), net of layout.
+# 976,692 -> 981,700 (v0.17 attach, `attach` leaf; STATUS.md): +5,008 B.
+# ATTACH parity: the integrity check over every database, the router's
+# TEMP-write route and qualifier insertion, `run_routed` / `width_on` for
+# the TEMP database, attached views in the expander, string names.
+# Offsets: `collect_on` folded into `run_routed`, `foreign_from` cut down.
+# 981,700 -> 986,160 (v0.17 result_gaps, ungated correctness; STATUS.md):
+# +4,460 B, the `full` growth plus the WITHOUT ROWID natural order's
+# access path and the co-routine GROUP BY plan line (`explain`).
+# 986,160 -> 985,472 (v0.17 attach review fixes, `attach` leaf; STATUS.md):
+# -688 B. The router finds the write target by its token (one lookup).
+# 985,472 -> 986,232 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +760 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+# +632 B (Bolt): prepare lexes each statement once for the TEMP /
+# ATTACH routers and the parse (prepare -17.7% instructions on
+# bolt_workload). Measured on main at 8ce2df6.
+ratchet = 986864
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -237,11 +298,33 @@ justify_over = 32768
 # JOIN's constant ON term. Same offset.
 # +16 B (Bolt): leaf_cells_meta reserves its cell table once
 # (dhat bytes -20.2% on bolt_workload).
-# +560 B (Bolt): prepare lexes each statement once for the TEMP /
-# ATTACH routers and the parse (prepare -18.8% instructions on
-# bolt_workload). Measured after merging main (PR #31); +600 B
-# on the pre-merge base.
-ratchet = 1067276
+# +3,456 B (v0.17 order_offset): max's fixes plus the join path's
+# orderDistinctMask terms (xjoin::path_order od, join.rs drop).
+# 1,070,172 -> 1,073,688 (v0.17 values_chain, ungated correctness;
+# STATUS.md): +3,516 B, the `max` growth plus the chain push-down rule
+# and the result aliases kept for the flattener (`planner`).
+# 1,073,688 -> 1,074,624 (v0.17 order_offset review fixes, ungated
+# correctness; STATUS.md): +936 B, the `max` fixes.
+# 1,074,624 -> 1,077,632 (v0.17 values_chain review fixes, ungated
+# correctness; STATUS.md): +3,008 B, the `max` fixes.
+# 1,077,632 -> 1,084,848 (v0.17 attach, `attach` leaf; STATUS.md):
+# +7,216 B, the `max` growth plus `Statement::step` inlining the larger
+# `step_att` (+2 KB; boxing its TEMP branch measured larger).
+# 1,084,848 -> 1,088,300 (v0.17 result_gaps, ungated correctness;
+# STATUS.md): +3,452 B, the `max` growth net of layout.
+# 1,088,300 -> 1,088,732 (v0.17 attach review fixes, `attach` leaf;
+# STATUS.md): +432 B, layout/inlining (max shrank 688 B): WITH-target
+# routing, routed rows before an error, temp opened by integrity_check.
+# 1,088,732 -> 1,089,500 (v0.17 result_gaps review fixes, ungated correctness; STATUS.md):
+# +768 B. EXISTS over a UNION with a LIMIT merges again (one parser rule
+# for the UNION-with-LIMIT-1 shortcut replaced three executor / EQP
+# special cases), co-routine GROUP BY + ORDER BY order, the partly
+# delivered ORDER BY's LIMIT stop, names as text handles, the CTE
+# limit's cursor count.
+# +632 B (Bolt): prepare lexes each statement once for the TEMP /
+# ATTACH routers and the parse (prepare -17.7% instructions on
+# bolt_workload). Measured on main at 8ce2df6.
+ratchet = 1090132
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

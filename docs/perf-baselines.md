@@ -528,3 +528,23 @@ below 5% and not claimed as the win.
 
 Size gates: tiny unchanged; full +640 B, max +448 B, xl +600 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+### Re-measured on main at 8ce2df6 (after PRs #33 / #35)
+
+Main now lexes from the arena copy of the text and rewinds the
+statement arena past the routers' token copies (`mark`). The shared
+lex sits before `mark`, so the rewinds keep its tokens and handles.
+Workload checksums identical (176089 / 657610 / 4083309).
+
+| n    | main total    | merged total  | Δ total | main prepare | merged prepare | Δ prepare |
+|------|---------------|---------------|---------|--------------|----------------|-----------|
+| 500  | 183,157,068   | 175,063,936   | -4.42%  | 47,747,141   | 39,338,652     | -17.61%   |
+| 1000 | 433,774,893   | 417,604,509   | -3.73%  | 95,097,022   | 78,228,635     | -17.74%   |
+| 2000 | 1,097,949,736 | 1,063,272,983 | -3.16%  | 193,616,622  | 157,639,394    | -18.58%   |
+
+n=1000: `lex_inner` inclusive 23,671,745 -> 8,527,423 (-63.98%).
+dhat (n=1000): 429,827 -> 411,365 blocks (-4.30%), 106,617,844 ->
+103,345,965 bytes (-3.07%); t-gmax unchanged at 853,148 B.
+
+Size gates on that base: tiny unchanged; full +400 B, max +632 B,
+xl +632 B; ratchets set to the measured figures.

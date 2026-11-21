@@ -5,6 +5,176 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Result-level gaps of wave 18 (wave 19, unit `result_gaps`)
+
+- Fixes (ungated): the pin's top-N sorter — under an ORDER BY the loop
+  does not deliver, with a LIMIT and no DISTINCT, a row's ORDER BY key
+  is computed first and a row whose key is not below the largest of
+  the OFFSET + LIMIT rows held is skipped with no result column
+  computed (top level, streamed rows, FROM / IN subqueries, views and
+  CTEs read once, groups, windows, joins, each UNION ALL core of a
+  compound's merge; not a scalar subquery, an INSERT's SELECT, a
+  materialized CTE or an ORDER BY an index delivers in part). Every
+  projection computes the ORDER BY key before the result columns and
+  takes a column the key repeats from it.
+- A WITHOUT ROWID table read in its own order keeps its delivering
+  loop, so `ORDER BY k, abs(-9223372036854775808)` answers.
+- A lone FROM subquery's order delivers its reader's GROUP BY (either
+  direction): groups in its order, a group ending at the next key.
+- A subquery's ORDER BY ordinal or alias under COLLATE is that result
+  column for its reader (`SubPlan::ob_refs`).
+- An EXISTS computes no result column, ORDER BY or DISTINCT of its
+  UNION / UNION ALL cores; its aggregates, HAVING and windows still run.
+- A TEMP CREATE TABLE ... AS reading main keeps a FLEXNUM column's REAL.
+- A CTE reference counts one toward the "nested too deep" limit, plus
+  one per view or FROM subquery that expanded references
+  (`count_selects` removed).
+- The statement arena: the routers' token copies are rewound when a
+  statement stays on main, and an arena's last chunk takes its whole
+  remaining budget (was one exact chunk per allocation), so a VALUES
+  list of 3,400 non-constant rows reads under the default 64 KiB.
+- Without `sql`, the synchronous executor skips the OFFSET's rows and
+  the top-N sorter's before their columns.
+- Found on the way: a derived table's fifth equal column name is `:4`, as
+  on the pin (hipp refused it).
+- Sizes: tiny unchanged; full +3,896 B, max +4,460 B, xl +3,452 B.
+- Review fixes (ungated): an EXISTS over a UNION with a LIMIT other
+  than 1 or an OFFSET merges and deduplicates as on the pin (the unit
+  had made every UNION there a UNION ALL); the pin's
+  UNION-with-LIMIT-1 shortcut is now one parser rule
+  (`union_limit_one`: the trailing run of UNION / UNION ALL operators,
+  written `LIMIT 1` with any signs, the implicit or bare-`1` LIMIT of
+  a scalar / EXISTS subquery), replacing three executor and EQP
+  special cases; a co-routine's collated order that delivers the GROUP
+  BY also delivers an equal ORDER BY; a partly index-delivered ORDER
+  BY under a LIMIT ends its loop at the first row of the prefix group
+  past OFFSET + LIMIT (`TopN::part`); lexer names and unescaped string
+  literals are handles into the statement's stored text
+  (`Arena::handle_or_copy`), so the default 64 KiB arena holds a
+  statement of nearly its size; the CTE "nested too deep" limit counts
+  the pin's cursors (`count_from`, `target_cursors`).
+
+### ATTACH parity (wave 19, unit `attach`, leaf `attach`)
+
+- A string literal is a name where the pin's grammar takes one
+  (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `INSERT INTO 'aux'.t`, `PRAGMA
+  'aux'.x`, `FROM 't'`, `t AS 'x'`).
+- An unqualified `PRAGMA integrity_check` / `quick_check` checks main,
+  the TEMP database and every attached database in order under one
+  error limit, `ok` only when none reports anything; a B-tree message
+  of an attached database names it (`*** in database aux ***`).
+- An attached database's view is read on main with its names bound to
+  its own database (beside main's tables, in joins, subqueries, CTEs,
+  compounds, INSERT ... SELECT into main; `SELECT * FROM v, aux.v`).
+  Fix: `aux.v` beside a main table read main's view `v` when main had
+  one.
+- A TEMP UPDATE / DELETE / INSERT VALUES (RETURNING, upsert, UPDATE ...
+  FROM) reading main or attached tables runs (on the TEMP database,
+  the tables handed over as external sources).
+- A write of an attached table reads another database's same-named
+  table by an unqualified name (`UPDATE aux.m SET y = (SELECT y FROM
+  m)`), other databases' tables by three-part names (`main.m.y`), and
+  `UPDATE aux.m ... FROM main.m` is no repeat of its target.
+- Still refused: TEMP triggers on main or attached tables or writing
+  another database, a write of an attached / TEMP table reading
+  another database's view; attached and TEMP tables have no index
+  access paths yet.
+- Sizes: tiny and full unchanged; max +5,008 B, xl +7,216 B.
+- Review fixes: a WITH-prefixed INSERT / UPDATE / DELETE is routed by
+  its target, not by the first table its CTEs read (it wrote a
+  same-named table of temp or an attached database, or failed with "no
+  such table"); a WITH-prefixed, upsert or RETURNING TEMP INSERT ...
+  SELECT reads main; `PRAGMA aux.integrity_check` prints its report
+  before the error; an unqualified integrity check opens the TEMP
+  database (`database_list` lists it); string names in CTE, trigger,
+  `UPDATE OF`, SET and constraint column positions. Sizes: tiny and
+  full unchanged; max -688 B, xl +432 B.
+
+### VALUES chains, lazy collations, inert aggregates (wave 18, unit `values_chain`)
+
+- Fixes (ungated): a multi-row VALUES is parsed as the pin's
+  `sqlite3MultiValues` builds it, row by row — a co-routine, or a
+  UNION ALL chain of one-row selects after a WITH clause, in a view's
+  or a trigger's text, for a non-constant row (a column, a subquery,
+  a non-deterministic or aggregate / window call) or after a one-row
+  select that is not constant or has an affinity, a later constant row
+  starting a co-routine again; a later chain is the pin's `SELECT *
+  FROM (chain)`. A reader's WHERE term is pushed into each chained
+  row with its own affinity, into a later chain's wrapper with the
+  chain's column affinity (whose REAL column reads every integer as a
+  real), never into a chain of one-row selects throughout; plans show
+  `SCAN CONSTANT ROW`, `SCAN n CONSTANT ROWS`, `0-ROW VALUES CLAUSE`
+  and a FROM-less core's WHERE subqueries. A VALUES column a first-row
+  column reference fills is named by that column (`(VALUES (t.r),
+  (2))` has `r`). An unknown collation (`Coll::Unknown`) is looked up
+  only where the pin does — comparisons, an IN list's left operand,
+  min / max / nullif, ORDER BY / GROUP BY / DISTINCT / merge / window
+  / aggregate keys, a FROM subquery's or CREATE TABLE AS's columns —
+  so `SELECT 1 COLLATE bogus` runs and a CHECK naming one fails only
+  the write that codes it. An enclosing query's aggregate in a dropped
+  ORDER BY or an EXISTS result list steps in its aggregate owner; a
+  nested window query's ORDER BY inside a dropped term raises no
+  code-generation error; a view column read through a compound FROM
+  subquery takes its type from the rightmost core (`INT`, `REAL`,
+  `NUM`); a result alias in a WHERE term is pushed down as the item it
+  names (`planner`).
+- Review fixes (ungated): a later VALUES arm is the pin's `SELECT *
+  FROM (chain)` again, so a correlated chain's named column (`(t.i)`)
+  no longer fails as "no such column", and a pushed WHERE term reaches
+  a `SELECT * FROM (...)` arm by column name; a WHERE term reaches a
+  compound through a merged `SELECT ... FROM (compound)` subquery or
+  view (a view's VALUES chain included), each arm comparing with its
+  own affinity; a trigger's `new.rowid` keeps its INTEGER affinity as a
+  result item; a VALUES co-routine begun after 500+ chained rows is
+  exempt from the compound limit and a CTE's chained rows count as one
+  SELECT; `SELECT count(*) FROM (compound)` of 1,000+ arms fails as
+  "Expression tree is too large" (the pin's `countOfViewOptimization`);
+  a CHECK under an unknown collation fails ADD COLUMN when it verifies
+  the rows, an UPDATE only when it reads a changed column, a foreign
+  key action only when it reads the child key, and `integrity_check`;
+  PRAGMA table_info and ALTER TABLE resolve views without coding them
+  (only a view's column collations are looked up, by table_info);
+  CREATE TABLE ... AS keeps a REAL in a FLEXNUM (`NUM`) column.
+- Tests: `tests/values_chain_v17.rs` (rows and plans against the live
+  pin, generated corpora; one suite on the frozen VM under `vm`),
+  `hipp-cli/tests/cli_v17_values_chain.rs`.
+- Size: tiny 0, full +3,100 B, max +3,564 B, xl +3,516 B (ratchets
+  raised to the measured figures); review fixes: full +2,992 B, max +184 B, xl +3,008 B.
+
+### ORDER BY / OFFSET parity (wave 18, unit `order_offset`)
+
+- Fixes (ungated): the OFFSET skips a row before its result columns
+  are computed — FROM-less cores, subqueries, views, CTEs, UNION ALL
+  chains (whose plain cores also stop at the LIMIT), window queries,
+  aggregates (their aggregates still step) and delivered ORDER BYs —
+  as the pin's `selectInnerLoop` does; an ORDER BY whose loop makes the
+  rows distinct (the rowid, a UNIQUE NOT NULL key, a NOT NULL WITHOUT
+  ROWID key, a join's distinct loops) delivers its later
+  table-reading or constant terms uncomputed (`isOrderDistinct`), and
+  any other later term sorts the whole ORDER BY; a FROM subquery's
+  ORDER BY is dropped where the pin's `SQLITE_OmitOrderBy` drops it
+  (kept under a LIMIT, an order-sensitive aggregate, a window or a
+  MATERIALIZED CTE); a lone co-routine's ORDER BY or compound merge key
+  delivers the reader's ORDER BY by column number
+  (`SQLITE_OrderBySubq`); a DISTINCT subquery under a LIMIT stops at
+  it; a UNION ALL compound's ORDER BY keeps ties in core order.
+- Review fixes (ungated): an ORDER BY the loop delivers under a
+  COLLATE or with later plain columns (`ORDER BY rowid, b`, an INTEGER
+  PRIMARY KEY `a COLLATE NOCASE`) skips its OFFSET and stops at its
+  LIMIT, in correlated subqueries too, where an enclosing query's
+  rowid no longer reads as the subquery's own order; isOrderDistinct
+  counts an IN equality as `=` and walks a WITHOUT ROWID index's
+  columns past its key (NOT NULL each) — rows and EXPLAIN QUERY PLAN
+  as the pin's; a single-row aggregate's DISTINCT / ORDER BY no longer
+  makes its OFFSET row computed; window queries, DISTINCT UNION ALL
+  cores and DISTINCT groupings stop at their LIMIT; a DISTINCT
+  subquery under a LIMIT deduplicates once (back to base speed).
+- Tests: `tests/order_offset_v17.rs` (rows and EQP against the live
+  pin, generated corpora), `hipp-cli/tests/cli_v17_order_offset.rs`.
+- Size: tiny 0, full +2,720 B, max +3,504 B, xl +3,456 B (ratchets
+  raised to the measured figures); review fixes: tiny 0, full +520 B,
+  max +968 B, xl +936 B.
+
 ### Planner and CLI parity (wave 17, unit `gaps_plan_cli`)
 
 - Fixes (ungated): `INDEXED BY` an index of another table (or of a

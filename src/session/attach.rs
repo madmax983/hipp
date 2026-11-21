@@ -28,10 +28,22 @@
 //!   database) when the statement runs. Nothing the statement does can
 //!   change those databases (a trigger or foreign-key action stays in
 //!   its own database), so the rows read at the start are the rows.
+//!   v0.17: an unqualified name of another database that the
+//!   statement also names in its own gets that database's qualifier
+//!   in the handed-over text, and a three-part name of another
+//!   database reaches its external source by that database's name
+//!   (`SourceDesc::dbname`). A write of a TEMP table that reads main
+//!   or attached tables runs on the TEMP database the same way
+//!   (`TEMP_DB`).
 //! - Any other statement naming an attached object (a query or a
 //!   write of main reading attached tables) runs on main, where
 //!   `ext_source` makes each attached table such a source, read from
-//!   its database when the statement scans it.
+//!   its database when the statement scans it; an attached database's
+//!   view is expanded there with its names bound to its own database
+//!   (`Expander::att_source`, v0.17).
+//! - An unqualified `PRAGMA integrity_check` / `quick_check` checks
+//!   main, the TEMP database and each attached database in turn under
+//!   one error limit (`Statement::integrity_rest`, v0.17).
 //! - BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / ROLLBACK TO
 //!   apply to every database (a database attached inside a
 //!   transaction joins it). A COMMIT that wrote more than one
@@ -84,6 +96,10 @@ pub(super) struct ExtTab {
     rowid_alias: Option<usize>,
     has_rowid: bool,
     rows: Option<Rows>,
+    /// Its database's name (`main`, `temp` or the attached name): a
+    /// three-part name reaches it by that on the database it is
+    /// handed to (v0.17).
+    dbname: AVec<u8>,
 }
 
 /// A table the main connection hands an attached database's
@@ -235,6 +251,24 @@ fn schema_tok(t: &[Token], i: usize) -> Option<usize> {
     }
 }
 
+/// `src` with each `(a, b, with)` edit applied: bytes `a..b` replaced
+/// by `with` (an insertion when `a == b`).
+fn edit(src: &[u8], edits: &mut AVec<(usize, usize, AVec<u8>)>) -> AVec<u8> {
+    crate::arena::sort_by(edits.as_mut_slice(), &mut |a, b| a.0.cmp(&b.0));
+    let mut out = AVec::new();
+    let mut pos = 0usize;
+    for (a, b, w) in edits.iter() {
+        if *a < pos || *b > src.len() {
+            continue;
+        }
+        out.extend_from_slice(src.get(pos..*a).unwrap_or_default());
+        out.extend_from_slice(w.as_slice());
+        pos = *b;
+    }
+    out.extend_from_slice(src.get(pos..).unwrap_or_default());
+    out
+}
+
 /// `o` as a list of none or one.
 fn opt_vec(o: Option<usize>) -> AVec<usize> {
     let mut v = AVec::new();
@@ -286,6 +320,7 @@ fn table_meta<T: Storage>(c: &Connection<T>, name: &[u8]) -> Option<ExtTab> {
         rowid_alias: t.rowid_alias,
         has_rowid: t.has_rowid(),
         rows: None,
+        dbname: AVec::new(),
     })
 }
 
@@ -343,6 +378,29 @@ async fn run_on<T: Storage>(c: &mut Connection<T>, sql: &[u8]) -> Result<(), T::
         let step: Boxed<'_, Result<Step, T::Error>> = Box::pin(st.step());
         if step.await? == Step::Done {
             return Ok(());
+        }
+    }
+}
+
+/// The error budget one integrity-check row spends: each message of
+/// a B-tree row (`*** in database x ***` and a line per message),
+/// one for any other row; nothing for a lone `ok`.
+fn ic_spent(v: &OwnedValue) -> i64 {
+    match v {
+        OwnedValue::Text(t) if t.as_slice() == b"ok" => 0,
+        OwnedValue::Text(t) if t.as_slice().starts_with(b"*** in database ") => {
+            t.iter().filter(|&&b| b == b'\n').count() as i64
+        }
+        _ => 1,
+    }
+}
+
+/// Keep the integrity-check rows of `rows` that report something (not
+/// a lone `ok`).
+fn ic_keep(out: &mut super::pragma::Rows, rows: super::pragma::Rows) {
+    for r in rows {
+        if r.as_slice().first().is_some_and(|v| ic_spent(v) > 0) {
+            out.push(r);
         }
     }
 }
@@ -471,10 +529,16 @@ impl<S: Storage> Connection<S> {
             matches!(t.get(i + 1).map(|x| x.tok), Some(Tok::Dot))
                 && ident(t, i, arena).is_some_and(|n| !eq_ci(n, b"main") && !eq_ci(n, b"temp"))
         });
-        if self.attached.is_empty() && !foreign {
+        let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
+        // v0.17: a write of a TEMP table may read main's tables (run
+        // on the temp database, handed them as external sources).
+        let temp_write = self.temp.is_some()
+            && [&b"INSERT"[..], b"UPDATE", b"DELETE", b"REPLACE", b"WITH"]
+                .iter()
+                .any(|w| word(0, w));
+        if self.attached.is_empty() && !foreign && !temp_write {
             return Ok(None);
         }
-        let word = |i: usize, w: &[u8]| matches!(t.get(i).map(|x| x.tok), Some(Tok::Ident(h, false)) if eq_ci(handle_bytes(arena, h), w));
         let temp_kw = word(0, b"CREATE") && (word(1, b"TEMP") || word(1, b"TEMPORARY"));
         // The statement without its TEMP keyword (as the TEMP router
         // reads it).
@@ -663,6 +727,23 @@ impl<S: Storage> Connection<S> {
             }
             _ => {}
         }
+        // The statement's target (written database) and its token:
+        // a WITH clause lists its CTEs' names before it (review fix:
+        // the first name was taken as the target).
+        let target = match body {
+            Ast::Insert { table, .. }
+            | Ast::Update { table, .. }
+            | Ast::Delete { table, .. }
+            | Ast::AlterAddColumn { table, .. }
+            | Ast::AlterRename { table, .. }
+            | Ast::AlterRenameColumn { table, .. }
+            | Ast::AlterDropColumn { table, .. } => Some(*table),
+            Ast::DropTable { name, .. }
+            | Ast::DropView { name, .. }
+            | Ast::DropIndex { name, .. } => Some(*name),
+            _ => None,
+        };
+        let target_tok = target.and_then(|h| tok_index(t, h));
         // Every table / view / index name of the statement.
         let mut names = AVec::new();
         let mut ctes = AVec::new();
@@ -688,7 +769,11 @@ impl<S: Storage> Connection<S> {
             }
             let sk = i.and_then(|i| schema_tok(t, i));
             let schema = sk.and_then(|k| ident(t, k, arena));
-            if schema.is_none() && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n)) {
+            // A CTE name never names the target.
+            if schema.is_none()
+                && i != target_tok
+                && ctes.iter().any(|c| eq_ci(handle_bytes(arena, *c), n))
+            {
                 continue;
             }
             // A table-valued pragma function is main's, whatever its
@@ -813,25 +898,23 @@ impl<S: Storage> Connection<S> {
         let any_att = refs.iter().any(|r| matches!(r.loc, Loc::Att(_)))
             || matches!(created_loc, Some(Loc::Att(_)))
             || three.iter().any(|x| matches!(x.1, Loc::Att(_)));
-        if !any_att {
+        let target_ref = target_tok.and_then(|k| refs.iter().find(|r| r.tok == Some(k)));
+        // v0.17: a TEMP write reading main that the TEMP router does
+        // not feed (it feeds a plain INSERT ... SELECT and CTAS):
+        // UPDATE, DELETE, INSERT VALUES, and a WITH-prefixed, upsert
+        // or RETURNING INSERT ... SELECT (review fix).
+        let with = matches!(ast, Ast::With { .. });
+        let temp_reads = match body {
+            Ast::Update { .. } | Ast::Delete { .. } | Ast::Insert { select: None, .. } => true,
+            Ast::Insert {
+                upsert, returning, ..
+            } => with || upsert.is_some() || !returning.is_empty(),
+            _ => false,
+        } && target_ref.is_some_and(|r| r.loc == Loc::Temp)
+            && refs.iter().any(|r| r.loc == Loc::Main);
+        if !any_att && !temp_reads {
             return Ok(None);
         }
-        // The statement's target (written database) and home.
-        let target: Option<&[u8]> = match body {
-            Ast::Insert { table, .. }
-            | Ast::Update { table, .. }
-            | Ast::Delete { table, .. }
-            | Ast::AlterAddColumn { table, .. }
-            | Ast::AlterRename { table, .. }
-            | Ast::AlterRenameColumn { table, .. }
-            | Ast::AlterDropColumn { table, .. } => Some(handle_bytes(arena, *table)),
-            Ast::DropTable { name, .. }
-            | Ast::DropView { name, .. }
-            | Ast::DropIndex { name, .. } => Some(handle_bytes(arena, *name)),
-            _ => None,
-        };
-        // The target is the first name `ast_names` lists.
-        let target_ref = target.and_then(|_| refs.as_slice().first());
         let home = match (created_loc, target_ref, body) {
             (Some(l), _, _) => l,
             (None, Some(r), _) => r.loc,
@@ -847,6 +930,82 @@ impl<S: Storage> Connection<S> {
                 }
             }
             _ => return Ok(None),
+        };
+        // Run on database `db` (`own`, an attached one or TEMP_DB):
+        // its own names lose their qualifier (`created` too), the
+        // other databases' tables are handed over as external
+        // sources. A view elsewhere is not. v0.17: an unqualified name
+        // of another database that the statement also names in its own
+        // gets that database's qualifier, and a three-part name of
+        // another database reaches its external source
+        // (`SourceDesc::dbname`).
+        let ext_on = |db: usize, own: Loc, mut ks: AVec<usize>| {
+            let mine = |r: &Ref| r.loc == own || r.loc == Loc::Nowhere;
+            for r in refs.iter() {
+                if r.loc == own
+                    && let Some(k) = r.schema_tok
+                {
+                    ks.push(k);
+                }
+            }
+            // Its own three-part names keep their schema: its sources
+            // answer to its name there (`own_dbname`), and a cut one
+            // could name another database's same-named table.
+            let mut cuts = AVec::new();
+            for &k in ks.iter() {
+                if let (Some(a), Some(b)) = (t.get(k), t.get(k + 2)) {
+                    cuts.push((a.offset, b.offset, AVec::new()));
+                }
+            }
+            let mut ext = AVec::new();
+            for r in refs.iter().filter(|r| !mine(r)) {
+                if self.is_view_in(r.loc, r.name.as_slice()) {
+                    return Err(Error::Unsupported);
+                }
+                let (db, label) = match r.loc {
+                    Loc::Main => (0, &b"main"[..]),
+                    Loc::Temp => (1, &b"temp"[..]),
+                    Loc::Att(j) => (
+                        u8::try_from(j + 2).unwrap_or(u8::MAX),
+                        att_name(j).unwrap_or_default(),
+                    ),
+                    Loc::Nowhere => continue,
+                };
+                let mut schema = r.schema.clone();
+                if schema.is_none()
+                    && refs
+                        .iter()
+                        .any(|o| o.loc == own && eq_ci(o.name.as_slice(), r.name.as_slice()))
+                {
+                    let Some(at) = r.tok.and_then(|k| t.get(k)).map(|x| x.offset) else {
+                        return Err(Error::Unsupported);
+                    };
+                    let mut q = copy_vec(b"\"");
+                    for &c in label {
+                        q.push(c);
+                        if c == b'"' {
+                            q.push(c);
+                        }
+                    }
+                    q.extend_from_slice(b"\".");
+                    cuts.push((at, at, q));
+                    schema = Some(copy_vec(label));
+                }
+                ext.push(ExtReq {
+                    schema,
+                    name: r.name.clone(),
+                    db,
+                });
+            }
+            // A three-part name of a database the statement reads no
+            // table of is not modelled.
+            if three
+                .iter()
+                .any(|x| x.1 != own && x.1 != Loc::Nowhere && !refs.iter().any(|r| r.loc == x.1))
+            {
+                return Err(Error::Unsupported);
+            }
+            on(db, edit(src, &mut cuts), ext)
         };
         match home {
             Loc::Main | Loc::Nowhere => {
@@ -883,6 +1042,19 @@ impl<S: Storage> Connection<S> {
                     Some(f) => Ok(Some(AttRoute::Temp(super::temp::Route::TempFed(Box::new(
                         f,
                     ))))),
+                    // v0.17: a TEMP write reading other databases runs on
+                    // the temp database with their tables handed over.
+                    None if created.is_none()
+                        && matches!(
+                            body,
+                            Ast::Insert { .. } | Ast::Update { .. } | Ast::Delete { .. }
+                        )
+                        && !refs
+                            .iter()
+                            .any(|r| self.is_view_in(r.loc, r.name.as_slice())) =>
+                    {
+                        ext_on(TEMP_DB, Loc::Temp, opt_vec(None))
+                    }
                     None => Err(Error::Unsupported),
                 }
             }
@@ -892,7 +1064,6 @@ impl<S: Storage> Connection<S> {
                         kind: SchemaKind::UnknownDatabase,
                     });
                 }
-                let own = |r: &Ref| r.loc == Loc::Att(i) || r.loc == Loc::Nowhere;
                 match body {
                     Ast::CreateView { .. } => {
                         // Its names bind to its own database; a
@@ -921,63 +1092,7 @@ impl<S: Storage> Connection<S> {
                     }
                     _ => {}
                 }
-                // The qualifiers to cut: every `aux.` of a name of this
-                // database, and of a three-part name.
-                let mut ks: AVec<usize> = opt_vec(created_tok);
-                for r in refs.iter() {
-                    if r.loc == Loc::Att(i)
-                        && let Some(k) = r.schema_tok
-                    {
-                        ks.push(k);
-                    }
-                }
-                // This database's three-part names lose their schema
-                // there (its sources are its own); one of an unknown
-                // schema stays, and fails there as on the pin.
-                for x in three.iter() {
-                    if x.1 == Loc::Att(i) {
-                        ks.push(x.0);
-                    }
-                }
-                let foreign3 = three
-                    .iter()
-                    .any(|x| x.1 != Loc::Att(i) && x.1 != Loc::Nowhere);
-                if refs.iter().all(own) && !foreign3 {
-                    return on(i, cut(ks.as_slice()), AVec::new());
-                }
-                // Reads of other databases: handed over as external
-                // sources. A three-part name of another database, a
-                // view elsewhere, or an unqualified name that is both
-                // this database's and another's are not modelled.
-                if foreign3 {
-                    return Err(Error::Unsupported);
-                }
-                let mut ext = AVec::new();
-                for r in refs.iter().filter(|r| !own(r)) {
-                    if self.is_view_in(r.loc, r.name.as_slice()) {
-                        return Err(Error::Unsupported);
-                    }
-                    if r.schema.is_none()
-                        && refs.iter().any(|o| {
-                            o.loc == Loc::Att(i) && eq_ci(o.name.as_slice(), r.name.as_slice())
-                        })
-                    {
-                        return Err(Error::Unsupported);
-                    }
-                    let db = match r.loc {
-                        Loc::Main => 0,
-                        Loc::Temp => 1,
-                        Loc::Att(j) => u8::try_from(j + 2).unwrap_or(u8::MAX),
-                        Loc::Nowhere => continue,
-                    };
-                    let _ = r.tok;
-                    ext.push(ExtReq {
-                        schema: r.schema.clone(),
-                        name: r.name.clone(),
-                        db,
-                    });
-                }
-                on(i, cut(ks.as_slice()), ext)
+                ext_on(i, Loc::Att(i), opt_vec(created_tok))
             }
         }
     }
@@ -1096,6 +1211,15 @@ impl<S: Storage> Connection<S> {
             };
             m.schema = r.schema.clone();
             m.db = r.db;
+            m.dbname = copy_vec(match r.db {
+                0 => &b"main"[..],
+                1 => b"temp",
+                d => self
+                    .attached
+                    .as_slice()
+                    .get(usize::from(d).saturating_sub(2))
+                    .map_or(&[][..], |a| a.name.as_slice()),
+            });
             out.push(m);
         }
         Ok(out)
@@ -1224,6 +1348,16 @@ impl<S: Storage> Connection<S> {
         Ok(Some(ext.len() - 1))
     }
 
+    /// Whether FROM name `s` is another database's table (v0.17): one
+    /// qualified with another database's name. (On an attached or the
+    /// TEMP database the router cut this database's own qualifiers and
+    /// qualified another's same-named table.)
+    pub(super) fn foreign_from(&self, s: &crate::sql::FromSource, arena: &Arena) -> bool {
+        let own = self.alias.is_none() && !self.is_temp;
+        s.schema
+            .is_some_and(|q| !own || !eq_ci(handle_bytes(arena, q), b"main"))
+    }
+
     /// Plan external source `k` (`ext_source`) as a FROM source.
     pub(super) fn plan_ext_source(
         &self,
@@ -1249,11 +1383,18 @@ impl<S: Storage> Connection<S> {
         desc.colls = e.colls.clone();
         // A three-part name reaches an attached database's table on
         // main by that database's name.
-        if self.alias.is_none() && e.db >= 2 {
-            desc.db = e.db.saturating_add(2);
-            if let Some(a) = self.attached.as_slice().get(usize::from(e.db) - 2) {
-                desc.dbname = a.name.clone();
+        if self.alias.is_none() && !self.is_temp {
+            if e.db >= 2 {
+                desc.db = e.db.saturating_add(2);
+                if let Some(a) = self.attached.as_slice().get(usize::from(e.db) - 2) {
+                    desc.dbname = a.name.clone();
+                }
             }
+        } else {
+            // Handed over by main (v0.17): reached by its database's
+            // name, never by this database's own.
+            desc.db = e.db.saturating_add(4);
+            desc.dbname = e.dbname.clone();
         }
         descs.push(desc);
         let mut affs = AVec::new();
@@ -1645,17 +1786,20 @@ impl<S: Storage> Connection<S> {
         let Ok(text) = core::str::from_utf8(sql.as_slice()) else {
             return Err(Error::Unsupported);
         };
-        let Some(a) = self.attached.as_mut_slice().get_mut(db) else {
-            return Err(Error::Unsupported);
+        let width = if db == TEMP_DB {
+            self.sync_temp();
+            // (The route exists only while the TEMP database does.)
+            let Some(c) = self.temp.as_deref_mut() else {
+                return Err(Error::Unsupported);
+            };
+            width_on(c, tabs, text).await.map_err(super::temp::mem_err)
+        } else {
+            let Some(a) = self.attached.as_mut_slice().get_mut(db) else {
+                return Err(Error::Unsupported);
+            };
+            let f: Boxed<'_, Result<usize, S::Error>> = Box::pin(width_on(&mut a.conn, tabs, text));
+            f.await
         };
-        *a.conn.ext.borrow_mut() = tabs;
-        let width = {
-            let prep: Boxed<'_, Result<Statement<'_, S>, S::Error>> =
-                Box::pin(a.conn.prepare(text));
-            let r = prep.await;
-            r.map(|st| st.column_count())
-        };
-        a.conn.ext.borrow_mut().clear();
         Ok(Plan::Att(Box::new(AttPlan {
             db,
             sql,
@@ -1666,8 +1810,90 @@ impl<S: Storage> Connection<S> {
     }
 }
 
+/// `Plan::Att`'s database `db` for the TEMP database (v0.17: a TEMP
+/// write reading other databases runs there, handed their tables).
+pub(super) const TEMP_DB: usize = usize::MAX;
+
+/// The result width of `text` prepared on `c` with external sources
+/// `tabs`.
+async fn width_on<T: Storage>(
+    c: &mut Connection<T>,
+    tabs: AVec<ExtTab>,
+    text: &str,
+) -> Result<usize, T::Error> {
+    *c.ext.borrow_mut() = tabs;
+    let r = {
+        let prep: Boxed<'_, Result<Statement<'_, T>, T::Error>> = Box::pin(c.prepare(text));
+        prep.await.map(|st| st.column_count())
+    };
+    c.ext.borrow_mut().clear();
+    r
+}
+
+/// What a routed statement left: its rows and rowids, the
+/// connection's `last_insert_rowid()` / `changes()`, the changes it
+/// added to `total_changes()`, and whether it ended the database's
+/// transaction.
+struct Ran {
+    rows: AVec<AVec<OwnedValue>>,
+    rowids: AVec<Option<i64>>,
+    last: i64,
+    changes: i64,
+    added: i64,
+    ended: bool,
+}
+
+/// Run `text` to its end on `c` with external sources `tabs` (rows
+/// read) and bindings `binds`, starting from the main connection's
+/// `last` / `changes`.
+async fn run_routed<T: Storage>(
+    c: &mut Connection<T>,
+    text: &str,
+    tabs: AVec<ExtTab>,
+    binds: &[OwnedValue],
+    last: i64,
+    changes: i64,
+) -> (Ran, Result<(), T::Error>) {
+    let in_txn = c.explicit_txn;
+    c.env.last_rowid.set(last);
+    c.env.changes.set(changes);
+    let before = c.env.total_changes.get();
+    *c.ext.borrow_mut() = tabs;
+    let mut rows = AVec::new();
+    let mut rowids = AVec::new();
+    let r = async {
+        let prep: Boxed<'_, Result<Statement<'_, T>, T::Error>> = Box::pin(c.prepare(text));
+        let mut st = prep.await?;
+        #[cfg(feature = "params")]
+        for (i, v) in binds.iter().enumerate() {
+            st.bind_value(i + 1, v.as_value())?;
+        }
+        let _ = binds;
+        loop {
+            let step: Boxed<'_, Result<Step, T::Error>> = Box::pin(st.step());
+            if step.await? == Step::Done {
+                return Ok::<(), Error<T::Error>>(());
+            }
+            rows.push(st.current.clone());
+            rowids.push(st.current_rowid);
+        }
+    }
+    .await;
+    c.ext.borrow_mut().clear();
+    let ran = Ran {
+        rows,
+        rowids,
+        last: c.env.last_rowid.get(),
+        changes: c.env.changes.get(),
+        added: c.env.total_changes.get().saturating_sub(before),
+        ended: in_txn && !c.explicit_txn,
+    };
+    (ran, r)
+}
+
 impl<S: Storage> Statement<'_, S> {
-    /// Run a statement routed to an attached database: all of it at
+    /// Run a statement routed to an attached database (or, v0.17, to
+    /// the TEMP database with other databases' tables): all of it at
     /// the first step, its rows kept to serve (as `step_temp`).
     pub(super) async fn step_att(&mut self) -> Result<Step, S::Error> {
         if self.phase == Phase::Done {
@@ -1686,6 +1912,8 @@ impl<S: Storage> Statement<'_, S> {
             }
             #[cfg(feature = "params")]
             let binds = self.binds.values.clone();
+            #[cfg(not(feature = "params"))]
+            let binds: AVec<OwnedValue> = AVec::new();
             self.conn.sync_att();
             let conn = &mut *self.conn;
             let (last, changes, total) = (
@@ -1693,72 +1921,68 @@ impl<S: Storage> Statement<'_, S> {
                 conn.env.changes.get(),
                 conn.env.total_changes.get(),
             );
-            let in_main_txn = conn.explicit_txn;
-            let Some(a) = conn.attached.as_mut_slice().get_mut(db) else {
-                return Err(Error::Schema {
-                    kind: SchemaKind::NoSuchDatabase,
-                });
-            };
-            if in_main_txn && lock {
-                a.used.set(true);
-            }
-            let c = &mut a.conn;
-            let in_txn = c.explicit_txn;
-            c.env.last_rowid.set(last);
-            c.env.changes.set(changes);
-            let before = c.env.total_changes.get();
-            *c.ext.borrow_mut() = tabs;
             let Ok(text) = core::str::from_utf8(sql.as_slice()) else {
                 return Err(Error::Unsupported);
             };
-            let mut rows = AVec::new();
-            let mut rowids = AVec::new();
-            let r = async {
-                let prep: Boxed<'_, Result<Statement<'_, S>, S::Error>> = Box::pin(c.prepare(text));
-                let mut st = prep.await?;
-                #[cfg(feature = "params")]
-                for (i, v) in binds.iter().enumerate() {
-                    st.bind_value(i + 1, v.as_value())?;
+            let (ran, r) = if db == TEMP_DB {
+                conn.sync_temp();
+                let Some(c) = conn.temp.as_deref_mut() else {
+                    return Err(Error::Unsupported);
+                };
+                let (ran, r) = run_routed(c, text, tabs, binds.as_slice(), last, changes).await;
+                (ran, r.map_err(super::temp::mem_err))
+            } else {
+                let in_main_txn = conn.explicit_txn;
+                let Some(a) = conn.attached.as_mut_slice().get_mut(db) else {
+                    return Err(Error::Schema {
+                        kind: SchemaKind::NoSuchDatabase,
+                    });
+                };
+                if in_main_txn && lock {
+                    a.used.set(true);
                 }
-                loop {
-                    let step: Boxed<'_, Result<Step, S::Error>> = Box::pin(st.step());
-                    if step.await? == Step::Done {
-                        return Ok::<(), Error<S::Error>>(());
-                    }
-                    rows.push(st.current.clone());
-                    rowids.push(st.current_rowid);
-                }
-            }
-            .await;
-            c.ext.borrow_mut().clear();
-            let (l2, c2, t2) = (
-                c.env.last_rowid.get(),
-                c.env.changes.get(),
-                c.env.total_changes.get(),
-            );
-            let ended = in_txn && !c.explicit_txn;
+                let f: Boxed<'_, (Ran, Result<(), S::Error>)> = Box::pin(run_routed(
+                    &mut a.conn,
+                    text,
+                    tabs,
+                    binds.as_slice(),
+                    last,
+                    changes,
+                ));
+                f.await
+            };
             let env = &self.conn.env;
-            env.last_rowid.set(l2);
-            env.changes.set(c2);
-            env.total_changes
-                .set(total.saturating_add(t2.saturating_sub(before)));
+            env.last_rowid.set(ran.last);
+            env.changes.set(ran.changes);
+            env.total_changes.set(total.saturating_add(ran.added));
             // A failure that ended the attached database's transaction
             // (OR ROLLBACK, an I/O-class error) ends every database's.
-            if r.is_err() && ended && self.conn.explicit_txn {
+            if r.is_err() && ran.ended && self.conn.explicit_txn {
                 let _ = self.conn.pager.rollback().await;
                 self.conn.explicit_txn = false;
                 self.conn.mirror_temp(b"ROLLBACK").await;
                 self.conn.mirror_att(b"ROLLBACK").await;
             }
-            r?;
-            self.query_rows = rows;
-            self.query_rowids = rowids;
+            // The rows it gave before an error are served first, as
+            // on its own database (review fix: `PRAGMA
+            // aux.integrity_check` over a corrupt page lost its report).
+            if let Err(e) = r {
+                if ran.rows.is_empty() {
+                    return Err(e);
+                }
+                self.deferred = Some(e);
+            }
+            self.query_rows = ran.rows;
+            self.query_rowids = ran.rowids;
             self.query_loaded = true;
             self.query_pos = 0;
         }
         if self.query_pos >= self.query_rows.len() {
             self.phase = Phase::Done;
             self.current_rowid = None;
+            if let Some(e) = self.deferred.take() {
+                return Err(e);
+            }
             return Ok(Step::Done);
         }
         self.current = self.query_rows.as_slice()[self.query_pos].clone();
@@ -1802,6 +2026,94 @@ impl<S: Storage> Statement<'_, S> {
         }
         self.phase = Phase::Done;
         Ok(Step::Done)
+    }
+
+    /// An unqualified `integrity_check` / `quick_check` (v0.17): main
+    /// checked (`rows`), the pin goes on to the temp database and each
+    /// attached one in order, under one error budget, and answers `ok`
+    /// only when none reported anything. A table argument checks the
+    /// one table found (routed there); `PRAGMA x.integrity_check` one
+    /// database.
+    pub(super) async fn integrity_rest(
+        &mut self,
+        p: &super::pragma::PragmaPlan,
+        quick: bool,
+        rows: super::pragma::Rows,
+    ) -> Result<super::pragma::Rows, S::Error> {
+        // Unqualified, the pin's check opens the temp database, a
+        // table's check too (review fix: `PRAGMA database_list`
+        // lacked it afterwards).
+        if self.conn.alias.is_none() && !self.conn.is_temp {
+            let open: Boxed<'_, Result<_, S::Error>> = Box::pin(self.conn.temp_conn());
+            open.await?;
+        }
+        let mut mx: i64 = 100;
+        if let Some(a) = &p.arg {
+            let s = a.as_slice();
+            match super::pragma::get_int32(s.strip_prefix(b"-").unwrap_or(s)) {
+                Some(n) if p.numeric => mx = if n <= 0 { 100 } else { i64::from(n) },
+                _ => return Ok(rows),
+            }
+        }
+        if self.deferred.is_some() || self.conn.alias.is_some() || self.conn.is_temp {
+            return Ok(rows);
+        }
+        let mut out = AVec::new();
+        ic_keep(&mut out, rows);
+        let mut sql = copy_vec(if quick {
+            &b"PRAGMA quick_check("[..]
+        } else {
+            b"PRAGMA integrity_check("
+        });
+        let n = sql.len();
+        let explicit = self.conn.explicit_txn;
+        // 0: the temp database, then each attached one.
+        for d in 0..=self.conn.attached.len() {
+            let left = mx
+                - out
+                    .iter()
+                    .filter_map(|r| r.as_slice().first())
+                    .map(ic_spent)
+                    .sum::<i64>();
+            if left <= 0 {
+                break;
+            }
+            sql.truncate(n);
+            super::pragma::dec(left, &mut sql);
+            sql.push(b')');
+            let text = core::str::from_utf8(sql.as_slice()).unwrap_or_default();
+            let (ran, r) = match d.checked_sub(1) {
+                None => match self.conn.temp.as_deref_mut() {
+                    Some(c) => {
+                        let (ran, r) = run_routed(c, text, AVec::new(), &[], 0, 0).await;
+                        (ran, r.map_err(super::temp::mem_err))
+                    }
+                    None => continue,
+                },
+                Some(i) => match self.conn.attached.as_mut_slice().get_mut(i) {
+                    Some(a) => {
+                        if explicit {
+                            a.used.set(true);
+                        }
+                        let f: Boxed<'_, (Ran, Result<(), S::Error>)> =
+                            Box::pin(run_routed(&mut a.conn, text, AVec::new(), &[], 0, 0));
+                        f.await
+                    }
+                    None => continue,
+                },
+            };
+            ic_keep(&mut out, ran.rows);
+            if let Err(e) = r {
+                self.deferred = Some(e);
+                break;
+            }
+        }
+        if out.is_empty() && self.deferred.is_none() {
+            let mut r = AVec::new();
+            r.push(OwnedValue::Text(copy_vec(b"ok")));
+            out.push(r);
+        }
+        Ok(out)
     }
 
     /// The rows of external source `sp.ext` (`ext_source`): the ones

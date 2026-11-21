@@ -347,7 +347,7 @@ impl PragmaPlan {
     }
 }
 
-type Rows = AVec<AVec<OwnedValue>>;
+pub(super) type Rows = AVec<AVec<OwnedValue>>;
 
 /// A table the integrity check visits: name, root, and its
 /// indexes' (name, root) in the pin's order.
@@ -408,7 +408,7 @@ pub(super) fn dec(mut v: i64, out: &mut AVec<u8>) {
 /// (`0x...`, at most 8 digits, no sign bit) or decimal number
 /// read to its first non-digit; `None` without a digit or on
 /// overflow.
-fn get_int32(z: &[u8]) -> Option<i32> {
+pub(super) fn get_int32(z: &[u8]) -> Option<i32> {
     let mut i = 0usize;
     let mut neg = false;
     match z.first() {
@@ -592,6 +592,8 @@ fn shown_type(decl: &[u8]) -> AVec<u8> {
 
 fn coll_name(c: crate::record::Coll) -> &'static [u8] {
     match c {
+        #[cfg(feature = "sql")]
+        crate::record::Coll::Unknown => b"BINARY",
         crate::record::Coll::Binary => b"BINARY",
         crate::record::Coll::NoCase => b"NOCASE",
         crate::record::Coll::Rtrim => b"RTRIM",
@@ -1148,7 +1150,7 @@ impl<S: Storage> Connection<S> {
         let ckpt = arena.checkpoint();
         let r = (|| -> Result<AVec<AVec<u8>>, S::Error> {
             let (select, _) = self.expand_view(arena, v)?;
-            let plan = self.plan_subquery(&select, arena, &[])?;
+            let plan = self.plan_uncoded(&select, arena, false)?;
             let mut types = AVec::new();
             let w = plan.width();
             for i in 0..w {
@@ -1206,6 +1208,12 @@ impl<S: Storage> Connection<S> {
                             return None;
                         }
                         if let Some(d) = &sp.derived {
+                            // A compound's select is its rightmost
+                            // core on the pin (`pSel` of the FROM
+                            // item), whose item `columnType` reads
+                            // (v0.17: `(SELECT a ... UNION ALL SELECT
+                            // 2.5)` names no type, so `INT`).
+                            let d = d.compound.as_slice().last().map_or(&**d, |(_, c)| &**c);
                             let it = d.items.as_slice().get(k).or_else(|| {
                                 d.values
                                     .as_slice()
@@ -1940,7 +1948,19 @@ impl<S: Storage> Statement<'_, S> {
             return Ok(AVec::new());
         };
         if matches!(prag, Prag::IntegrityCheck | Prag::QuickCheck) {
-            return self.integrity(&p, prag == Prag::QuickCheck).await;
+            let quick = prag == Prag::QuickCheck;
+            // v0.17 (`attach`): unqualified, the pin goes on to the
+            // temp and attached databases.
+            #[cfg(feature = "attach")]
+            {
+                let rows = self.integrity(&p, quick).await?;
+                if p.main_only {
+                    return Ok(rows);
+                }
+                return self.integrity_rest(&p, quick, rows).await;
+            }
+            #[cfg(not(feature = "attach"))]
+            return self.integrity(&p, quick).await;
         }
         #[cfg(feature = "foreign_keys")]
         if prag == Prag::ForeignKeyCheck {
@@ -2329,6 +2349,14 @@ impl<S: Storage> Statement<'_, S> {
         }
         if !ck.msgs.is_empty() {
             let mut m: AVec<u8> = AVec::new();
+            // v0.17 (`attach`): an attached database's own name.
+            #[cfg(feature = "attach")]
+            {
+                m.extend_from_slice(b"*** in database ");
+                m.extend_from_slice(self.conn.schema_label());
+                m.extend_from_slice(b" ***\n");
+            }
+            #[cfg(not(feature = "attach"))]
             m.extend_from_slice(b"*** in database main ***\n");
             m.extend_from_slice(ck.msgs.as_slice());
             let mut r = AVec::new();
@@ -2481,6 +2509,10 @@ impl<S: Storage> Statement<'_, S> {
             cols.push(m);
         }
         let rules = self.conn.table_rules(&self.arena, t)?;
+        // (The check codes every CHECK: v0.17 review fix.)
+        if let Some(r) = rules.as_deref() {
+            r.coded::<S::Error>(None)?;
+        }
         // Plans and names both in the pin's `pIndex` order (newest
         // first: `write_index_plans` and `table_indexes` each reverse
         // the catalog's), zipped position by position below (v0.17

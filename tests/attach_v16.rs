@@ -1390,10 +1390,10 @@ fn bound_attach_operands() {
 }
 
 /// What hipp refuses cleanly where the pin answers (STATUS.md's
-/// honest gaps): a TEMP write other than INSERT ... SELECT reading an
-/// attached table, an attached view read together with another
-/// database's table, a TEMP trigger on an attached table or writing a
-/// schema-qualified table.
+/// honest gaps): a TEMP trigger on an attached table or writing a
+/// schema-qualified table. (v0.17: a TEMP write reading an attached
+/// table and an attached view read together with another database's
+/// table now run; `tests/attach_v17.rs` compares them with the pin.)
 #[test]
 fn documented_refusals() {
     let d = fresh_dir("refusals");
@@ -1415,9 +1415,6 @@ fn documented_refusals() {
         .await;
         assert!(errs.is_empty(), "{errs:?}");
         for sql in [
-            "UPDATE temp.tt SET z = (SELECT max(x) FROM a.t)",
-            "DELETE FROM tt WHERE z IN (SELECT x FROM a.t)",
-            "SELECT * FROM a.v, m",
             "CREATE TEMP TRIGGER tg AFTER INSERT ON a.t BEGIN SELECT 1; END",
             // A TEMP trigger writing a schema-qualified table (review
             // fix: it was reported as the pin's "qualified table names

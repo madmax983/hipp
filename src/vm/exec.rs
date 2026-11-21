@@ -1491,17 +1491,13 @@ impl Vm {
                 for (k, o) in c.ops.iter().enumerate() {
                     tails.push((*o, rows_of(&mut self.curs, (k as u32).saturating_add(1))?));
                 }
-                let rows = if c.first_row {
-                    crate::session::first_core_row(head, tails.as_slice())
-                } else {
-                    crate::session::run_compound(
-                        head,
-                        tails.as_slice(),
-                        c.cores.as_slice(),
-                        c.order.as_slice(),
-                        enc,
-                    )
-                };
+                let rows = crate::session::run_compound(
+                    head,
+                    tails.as_slice(),
+                    c.cores.as_slice(),
+                    c.order.as_slice(),
+                    enc,
+                );
                 let e = eph(&mut self.curs, op.p1)?;
                 e.clear();
                 for r in rows {

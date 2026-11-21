@@ -134,9 +134,7 @@ impl G<'_, '_> {
         let mut found: AVec<RExpr> = AVec::new();
         let base = self.b.preset.len();
         let _ = crate::query::walk_aggs_mut(&mut e2, 0, &mut |a, d| {
-            if let RExpr::Agg {
-                lvl, inert: false, ..
-            } = a
+            if let RExpr::Agg { lvl, .. } = a
                 && *lvl == d
                 && d > 0
             {
@@ -573,6 +571,7 @@ fn placeholder(id: usize) -> SubPlan {
         rec: None,
         mat: 0,
         real_cols: AVec::new(),
+        ob_refs: AVec::new(),
         vchain: false,
         #[cfg(feature = "explain")]
         sel: 0,
@@ -783,19 +782,12 @@ pub(super) fn compound(
     for (o, _) in qp.compound.iter() {
         ops.push(*o);
     }
-    let first_row = matches!(
-        qp.limit,
-        Some(RExpr::Literal(crate::record::OwnedValue::Integer(1)))
-    ) && qp.offset.is_none()
-        && order.is_empty()
-        && ops.iter().all(|o| *o == CompoundOp::Union);
     let mut ord = AVec::new();
     ord.extend_from_slice(order);
     let k = b.p4(P4::Comp(Box::new(super::super::op::CompInfo {
         ops,
         cores: colls,
         order: ord,
-        first_row,
     })));
     let r = b.cursor();
     b.emit2(Code::EphOpen, r, 0);

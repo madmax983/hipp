@@ -295,7 +295,9 @@ fn never_in_the_file_and_gone_on_close() {
 /// a main statement reads TEMP tables, and a temp INSERT / CREATE
 /// TABLE ... AS is fed by a SELECT over main (`tests/gaps_v16.rs`
 /// compares the results with the pin). A temp UPDATE / DELETE that
-/// reads main is still refused rather than read the wrong table.
+/// reads main is refused rather than read the wrong table without the
+/// `attach` leaf; with it (v0.17) it runs (`tests/attach_v17.rs`
+/// compares it with the pin).
 #[test]
 fn both_databases_meet() {
     let p = common::temp_db("v16tm-mixed");
@@ -320,6 +322,11 @@ fn both_databases_meet() {
             "UPDATE x SET a = (SELECT max(a) FROM m)",
             "DELETE FROM x WHERE a IN (SELECT a FROM m)",
         ] {
+            if cfg!(feature = "attach") {
+                let mut q = db.prepare(sql).await.expect(sql);
+                while q.step().await.expect(sql) == Step::Row {}
+                continue;
+            }
             let r = db.prepare(sql).await.map(|_| ());
             assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
         }

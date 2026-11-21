@@ -31,10 +31,10 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 | profile | build | size | budget |
 |---|---|---|---|
-| `tiny` | `--no-default-features` | 76,904 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 481,048 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 968,448 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,066,700 B | 1.25 MiB |
+| `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
+| `full` | `--no-default-features --features full` | 495,060 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 986,232 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,089,500 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,99 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **Result-level gaps of wave 18** (unit `result_gaps`, ungated
+  fixes). The pin's top-N sorter: under an ORDER BY with a LIMIT and
+  no DISTINCT a row's ORDER BY key is computed first, and a row whose
+  key sorts at or past the largest of the OFFSET + LIMIT rows held is
+  skipped with no result column computed — at the top level, in FROM
+  / IN subqueries, views and CTEs read once, over groups and windows,
+  and in each UNION ALL core of a compound's merge (not in a scalar
+  subquery, an INSERT's SELECT or a materialized CTE); a result
+  column the ORDER BY repeats is computed once. A WITHOUT ROWID
+  table's own order delivers its ORDER BY tail; a FROM subquery's
+  order delivers its reader's GROUP BY (groups in its order, split
+  where the next key differs); a subquery's `ORDER BY 1 COLLATE
+  BINARY` is result column 1 for its reader; an EXISTS computes no
+  result column, ORDER BY or DISTINCT of its UNION cores; a TEMP
+  CREATE TABLE ... AS keeps FLEXNUM reals; a CTE reference counts one
+  toward the "nested too deep" limit (three reads of a 450-arm CTE
+  run); a VALUES list of a few thousand non-constant rows fits the
+  default statement arena (names are copied once, the arena's last
+  chunk takes its whole remaining budget); the `query`-only executor
+  skips OFFSET rows before their columns. Review fixes: the pin's
+  UNION-with-LIMIT-1 shortcut (the trailing UNIONs of a compound
+  with a LIMIT of exactly 1 and no ORDER BY / OFFSET are UNION ALL,
+  so `a UNION ALL 3 UNION a LIMIT 1` is the first row and an EXISTS
+  over a UNION with another LIMIT deduplicates again); a co-routine's
+  collated order delivers an equal GROUP BY and ORDER BY (no second
+  sort); an ORDER BY an index delivers in part ends the loop at the
+  LIMIT's prefix group; a statement's names and string literals are
+  handles into its stored text (a 4,000-row constant INSERT fits the
+  default arena); the "nested too deep" count is the pin's cursor
+  count (every FROM item, UPDATE / DELETE targets and their indexes).
+- **ATTACH parity** (unit `attach`, leaf `attach`). A string literal
+  names a schema, table or column where the pin's grammar takes a name
+  (`'aux'.t`, `aux.'t'`, `'aux'.'t'.c`, `FROM 't'`, `WITH 'c'`, `SET
+  'a' = 1`, `CREATE TRIGGER 'tr'`, `UNIQUE('b')`); an unqualified
+  `PRAGMA integrity_check` / `quick_check` checks main, temp and every
+  attached database in turn under one error limit (a B-tree message
+  names its own database; a routed check's report comes before its
+  error); a WITH-prefixed write writes its target's database, not its
+  CTE's (review fix: it wrote a same-named table elsewhere); an attached database's view is read beside
+  other databases' tables with its names bound to its own database (and
+  `aux.v` no longer reads main's `v`); a TEMP UPDATE / DELETE / INSERT
+  VALUES, and a WITH-prefixed, upsert or RETURNING TEMP INSERT ...
+  SELECT, reads main and attached tables; a write of an attached table
+  reads another database's same-named table by an unqualified name and
+  other databases' tables by three-part names. Still open (STATUS.md):
+  TEMP triggers on main or attached tables or writing another
+  database, index / rowid access paths into attached and TEMP tables,
+  and an attached or TEMP write reading another database's view.
+- **VALUES chains, lazy collations, inert aggregates** (unit
+  `values_chain`, ungated fixes). A multi-row VALUES is the pin's
+  `sqlite3MultiValues` row by row — a co-routine, or one-row selects
+  chained by UNION ALL after a WITH clause, in a view's or trigger's
+  text, for a non-constant row or after a typed one — so a reader's
+  WHERE term filters each chained row with its own affinity, a later
+  chain through its wrapper's column affinity (a REAL one reads every
+  integer as a real), and a chain of one-row selects throughout not
+  at all; EXPLAIN QUERY PLAN shows `SCAN CONSTANT ROW` per row, `SCAN
+  n CONSTANT ROWS`, `0-ROW VALUES CLAUSE`. A VALUES column a
+  first-row column reference fills is named by that column. An
+  unknown collation is looked up only where the pin does (a
+  comparison, a sort / group / DISTINCT / merge key, min / max /
+  nullif, a subquery's columns), so `SELECT 1 COLLATE bogus` runs;
+  an enclosing query's aggregate in a dropped ORDER BY or an EXISTS
+  result list steps in its owner (its overflow fails, as on the pin);
+  a nested window ORDER BY inside a dropped term raises nothing; a
+  view column read through a compound subquery takes the pin's type
+  name; a result alias in a WHERE term is pushed down as its item.
+  Review fixes: a WHERE term reaches a compound through a merged
+  subquery or view and through a `SELECT * FROM (...)` arm; a
+  correlated chain arm keeps its column names; long VALUES lists and
+  `count(*)` over 1,000+ arms behave as on the pin; a CHECK under an
+  unknown collation fails only the statements that code it (ADD
+  COLUMN's verification, an UPDATE of a column it reads, FK actions,
+  `integrity_check`), and PRAGMA table_info / ALTER TABLE resolve
+  views without coding them; CREATE TABLE ... AS keeps a REAL in a
+  FLEXNUM column.
+- **ORDER BY / OFFSET parity** (unit `order_offset`, ungated fixes).
+  With no sorter or DISTINCT in the way, the OFFSET skips a row before
+  its result columns are computed (FROM-less cores, subqueries,
+  views, CTEs, UNION ALL chains, windows, aggregates — one-row ones
+  under DISTINCT / ORDER BY too — and ORDER BYs the loop delivers,
+  under a COLLATE or with later plain columns), so `SELECT
+  abs(-9223372036854775808) LIMIT 1 OFFSET 1` is no row, and windows,
+  DISTINCT cores and groups stop at their LIMIT; an ORDER BY past the
+  rowid, a UNIQUE NOT NULL key (IN equalities included) or a WITHOUT
+  ROWID key read through an access path never computes its later
+  terms (the pin's `isOrderDistinct`); a FROM subquery's ORDER BY the
+  pin omits (`SQLITE_OmitOrderBy`) is dropped, and a co-routine's own
+  order delivers its reader's ORDER BY by column number
+  (`SQLITE_OrderBySubq`), whatever the reader's collation; a UNION ALL
+  ORDER BY keeps equal rows in core order. (Its open items, the pin's
+  top-N sorter and a WITHOUT ROWID natural scan's ORDER BY tail, were
+  closed by `result_gaps`.)
 - **Planner and CLI parity** (unit `gaps_plan_cli`, ungated fixes).
   `INDEXED BY` names an index of the source's own table on every path
   (a plain scan accepted another table's index); WHERE / ON terms are
@@ -1122,7 +1215,11 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   order (temp, main, then attached in attach order). Not yet: TEMP
   triggers on main or attached tables, or writing schema-qualified
   tables (refused cleanly), and index access paths into another
-  database's tables (they are read whole, once per execution). Each attached
+  database's tables (they are read whole, once per execution). (v0.17
+  `attach` closed the string-literal qualifier, the integrity check
+  over every database, attached views beside other databases' tables,
+  TEMP writes reading other databases and same-named / three-part
+  names in attached writes; see "What v0.17 does".) Each attached
   database is a connection of its own owned by the main one — the
   TEMP database's model made N-ary — so every feature works inside
   it; statements across databases (joins, subqueries, compounds,

@@ -183,6 +183,8 @@ struct Core<'x> {
     has_agg: bool,
     values: &'x [AVec<RExpr>],
     sel: u32,
+    /// A core of a VALUES chain of one-row selects (`SF_MultiValue`).
+    vchain: bool,
 }
 
 /// A select statement: its cores and their compound operators.
@@ -205,6 +207,7 @@ fn core_of_sub(p: &SubPlan) -> Core<'_> {
         has_agg: p.has_agg,
         values: p.values.as_slice(),
         sel: p.sel,
+        vchain: p.vchain,
     }
 }
 
@@ -234,6 +237,7 @@ fn core_of_qp(p: &QueryPlan) -> Core<'_> {
         has_agg: p.has_agg,
         values: p.values.as_slice(),
         sel: p.sel,
+        vchain: p.vchain,
     }
 }
 
@@ -607,32 +611,25 @@ impl<'a> Walk<'a> {
             }
             return;
         }
+        // A VALUES chain of one-row selects throughout is one line
+        // (the pin's `multiSelectValues`, v0.17).
+        if s.cores
+            .iter()
+            .all(|(op, c)| c.vchain && *op == CompoundOp::UnionAll)
+        {
+            self.add_n(parent, b"SCAN ", n as u32, b" CONSTANT ROWS");
+            for (_, c) in s.cores.iter() {
+                self.shown(c.sel);
+                for r in c.values.iter() {
+                    self.exprs(r.as_slice(), parent, &[]);
+                }
+            }
+            return;
+        }
         // The pin merges the compound up to its last operator other
         // than UNION ALL (all of it under an ORDER BY), as hipp's
         // executor does (`session::run_compound`); the UNION ALL
         // members after that are appended.
-        // The pin's UNION-with-LIMIT-1 shortcut reads the members as
-        // UNION ALL ones until a row is found (`union_first_row`).
-        if s.comp_order == 0
-            && s.offset.is_none()
-            && matches!(s.limit, Some(RExpr::Literal(OwnedValue::Integer(1))))
-            && s.cores
-                .iter()
-                .skip(1)
-                .all(|(op, _)| *op == CompoundOp::Union)
-        {
-            let mut all = Sel {
-                cores: AVec::new(),
-                comp_order: 0,
-                limit: None,
-                offset: None,
-            };
-            for (_, c) in s.cores.iter() {
-                all.cores.push((CompoundOp::UnionAll, c.clone()));
-            }
-            self.chain(&all, n - 1, 0, parent);
-            return;
-        }
         let last = if s.comp_order > 0 {
             n - 1
         } else {
@@ -768,6 +765,10 @@ impl<'a> Walk<'a> {
             for r in c.values.iter() {
                 self.exprs(r.as_slice(), parent, &[]);
             }
+            // (A WHERE, a pushed term's, codes before the result.)
+            if let Some(f) = c.filter {
+                self.exprs(core::slice::from_ref(f), parent, &[]);
+            }
             self.exprs(c.items, parent, &[]);
             return;
         }
@@ -816,6 +817,7 @@ impl<'a> Walk<'a> {
             has_agg: c.has_agg,
             values: &[],
             sel: c.sel,
+            vchain: false,
         };
         self.body(&inner, p, false, c);
         // The innermost class's keys, which the loop may deliver.
@@ -1004,7 +1006,7 @@ impl<'a> Walk<'a> {
             let co = d.mat == 0 && at;
             let mut h = AVec::new();
             h.extend_from_slice(if co { b"CO-ROUTINE " } else { b"MATERIALIZE " });
-            self.sub_name(&mut h, sp.eqp.mat.as_slice(), last_sel(d));
+            self.sub_name(&mut h, sp.eqp.mat.as_slice(), d);
             let id = self.add(parent, &[h.as_slice()]);
             match d.rec {
                 Some(r) => {
@@ -1204,7 +1206,10 @@ impl<'a> Walk<'a> {
             let grouped = acc.is_some_and(|a| a.groups);
             #[cfg(not(feature = "expr_index"))]
             let grouped = false;
-            let grouped = grouped || self.natural(first) >= c.group_by.len();
+            // (Or a lone FROM subquery's order delivers it: v0.17.)
+            let grouped = grouped
+                || self.natural(first) >= c.group_by.len()
+                || first.is_some_and(|s| groups_adjacent(c.sources, c.group_by, s.eqp.base));
             if !grouped {
                 self.add(parent, &[b"USE TEMP B-TREE FOR GROUP BY"]);
             }
@@ -1260,7 +1265,12 @@ impl<'a> Walk<'a> {
             // does not deliver it (v0.17 review fix).
             let single = c.has_agg && c.group_by.is_empty();
             let same_group = !c.group_by.is_empty()
-                && crate::session::groups_sorted(c.group_by, c.order_by, c.sources);
+                && crate::session::groups_sorted_at(
+                    c.group_by,
+                    c.order_by,
+                    c.sources,
+                    first.map_or(usize::MAX, |s| s.eqp.base),
+                );
             let k = c.order_by.len();
             let done = if c.group_by.is_empty() && (!c.distinct || !c.has_agg) {
                 delivered.min(k)
@@ -1347,9 +1357,15 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// `name`, or `(subquery-n)` when it is empty.
-    fn sub_name(&mut self, out: &mut AVec<u8>, name: &[u8], sel: u32) {
-        if name.is_empty() {
+    /// `name`, or `(subquery-n)` when it is empty — for a VALUES
+    /// chain of one-row selects the pin's `0-ROW VALUES CLAUSE`
+    /// (v0.17: its `u1.nRow` counts a co-routine's rows only).
+    fn sub_name(&mut self, out: &mut AVec<u8>, name: &[u8], d: &SubPlan) {
+        let sel = last_sel(d);
+        if name.is_empty() && d.vchain && d.compound.iter().all(|(_, c)| c.vchain) {
+            self.shown(sel);
+            out.extend_from_slice(b"0-ROW VALUES CLAUSE");
+        } else if name.is_empty() {
             out.extend_from_slice(b"(subquery-");
             let n = self.shown(sel);
             num(out, u64::from(n), false);
@@ -1360,8 +1376,10 @@ impl<'a> Walk<'a> {
     }
 
     fn scan_name(&mut self, sp: &SubSource, out: &mut AVec<u8>) {
-        let sel = sp.derived.as_deref().map_or(0, last_sel);
-        self.sub_name(out, sp.eqp.scan.as_slice(), sel);
+        match sp.derived.as_deref() {
+            Some(d) => self.sub_name(out, sp.eqp.scan.as_slice(), d),
+            None => out.extend_from_slice(sp.eqp.scan.as_slice()),
+        }
     }
 
     /// The loop over one FROM source.
@@ -1969,6 +1987,7 @@ impl<'a> Walk<'a> {
                 has_agg: false,
                 values: &[],
                 sel: 0,
+                vchain: false,
             };
             self.body(&c, 0, false, &c);
         }
@@ -2140,6 +2159,7 @@ pub(super) fn describe<S: Storage>(
                     has_agg: false,
                     values: &[],
                     sel: 0,
+                    vchain: false,
                 };
                 w.body(&c, 0, false, &c);
                 if let Some(f) = &j.filter {
@@ -2541,6 +2561,16 @@ impl<S: Storage> Statement<'_, S> {
         if let Plan::Att(p) = &self.plan {
             let (db, t) = (p.db, text(p.sql.as_slice()));
             let tabs = self.conn.ext_tabs(p.ext.as_slice())?;
+            // A TEMP write reading other databases (v0.17).
+            if db == super::attach::TEMP_DB {
+                let Some(c) = self.conn.temp.as_deref_mut() else {
+                    return Err(Error::Unsupported);
+                };
+                *c.ext.borrow_mut() = tabs;
+                let r = collect(c, t.as_slice()).await.map_err(temp::mem_err);
+                c.ext.borrow_mut().clear();
+                return r;
+            }
             let Some(a) = self.conn.attached.as_mut_slice().get_mut(db) else {
                 return Err(Error::Schema {
                     kind: SchemaKind::NoSuchDatabase,
