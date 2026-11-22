@@ -1253,6 +1253,21 @@ impl<'a> Walk<'a> {
                     self.exprs(core::slice::from_ref(&b.e), parent, &[]);
                 }
             }
+            // A table-valued function's arguments' subqueries (v0.17
+            // review fix: an IN argument's LIST SUBQUERY was lost).
+            #[cfg(any(feature = "json", feature = "vtab"))]
+            if sp.tvf != 0
+                && let Some(r) = sp
+                    .derived
+                    .as_deref()
+                    .and_then(|d| d.values.as_slice().first())
+            {
+                // (An IN argument's values drive the loop: no Bloom
+                // filter.)
+                self.probing = true;
+                self.exprs(r.as_slice(), parent, &[]);
+                self.probing = false;
+            }
             if let Some(on) = &sp.on {
                 self.exprs(core::slice::from_ref(on), parent, probes.as_slice());
             }

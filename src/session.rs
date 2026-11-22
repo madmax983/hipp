@@ -1541,6 +1541,10 @@ pub struct Connection<S: Storage> {
     /// subqueries' column collations are not looked up either.
     #[cfg(feature = "sql")]
     uncoded: core::cell::Cell<bool>,
+    /// PRAGMA table_list is finding a view's columns (v0.17 review
+    /// fix: a view over `pragma_table_list` listed itself without end).
+    #[cfg(feature = "sql")]
+    listing: core::cell::Cell<bool>,
     /// The recursive CTEs whose recursive SELECTs are being
     /// planned (v0.16, `sql`): each one's id and column shape,
     /// which its recursive reference takes (`plan_rec_ref`). A
@@ -1651,6 +1655,8 @@ impl<S: Storage> Connection<S> {
             flat_from: core::cell::Cell::new(false),
             #[cfg(feature = "sql")]
             uncoded: core::cell::Cell::new(false),
+            #[cfg(feature = "sql")]
+            listing: core::cell::Cell::new(false),
             #[cfg(feature = "sql")]
             rec_scope: core::cell::Cell::new(AVec::new()),
             #[cfg(feature = "query")]

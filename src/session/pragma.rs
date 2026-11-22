@@ -900,7 +900,15 @@ impl<S: Storage> Connection<S> {
                             // for one that cannot be planned, as
                             // on the pin.
                             let n = handle_bytes(ca, v.name);
-                            let ncol = self.view_columns(n).map_or(0, |c| c.len());
+                            // (None while one is being found: a
+                            // view over pragma_table_list.)
+                            let ncol = if self.listing.replace(true) {
+                                0
+                            } else {
+                                let c = self.view_columns(n).map_or(0, |c| c.len());
+                                self.listing.set(false);
+                                c
+                            };
                             (n, n, b"view", ncol, false, false)
                         }
                         Obj::Schema => (

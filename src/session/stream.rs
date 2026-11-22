@@ -747,7 +747,7 @@ impl<S: Storage> Statement<'_, S> {
                 // every outer row, computed once.
                 if !lateral && d > 0 && super::vtab::filters_whole(vt) {
                     if lv.cache.is_none() {
-                        lv.cache = Some(self.vtab_whole(sp, vt, &padded).await?);
+                        lv.cache = Some(self.vtab_rows(sp, vt, &padded, None).await?);
                     }
                     lv.src = Src::Cached(0);
                 } else {

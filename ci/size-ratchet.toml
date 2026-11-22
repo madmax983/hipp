@@ -136,7 +136,10 @@ justify_over = 4096
 # (`lim_signed`), `same_expr` compares CASE / LIKE, a FROM subquery
 # delivers WHERE-fixed ORDER BY columns (`sub_sat`, `where_fixed`).
 # No offsetting saving found.
-ratchet = 496684
+# 496,684 -> 496,692 (v0.17 stmt_txn review fixes, ungated correctness;
+# STATUS.md): +8 B. A view over pragma_table_list no longer lists
+# itself without end (the `listing` guard: a stack overflow).
+ratchet = 496692
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -257,7 +260,16 @@ justify_over = 16384
 # +2,040 B, the `full` growth plus a scalar / EXISTS subquery planned
 # for the pin's LIMIT (`expr_index`) and the IN operator's Bloom filter
 # / VALUES plan lines (`explain`, `Walk::blooms`).
-ratchet = 997308
+# 997,308 -> 1,001,204 (v0.17 stmt_txn review fixes, `attach` / `vtab`
+# correctness; STATUS.md): +3,896 B. IN lists and ORs of `=` on the
+# pragma check tables' and generate_series' arguments loop as the pin's
+# IN does (`VtSrc::in_mask`, `vtab_in`: they read nothing / ignored the
+# list), table-valued functions answered by the database the pin finds
+# their object in (`fn_loc`: attached writes read the attached `m`),
+# the check's schema-table lookup and TEMP open, readers that stop
+# before a deferred error, TVF arguments' subqueries in EXPLAIN QUERY
+# PLAN; `vtab_whole` folded into `vtab_rows` as the offset.
+ratchet = 1001204
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -364,7 +376,9 @@ justify_over = 32768
 # 1,098,688 -> 1,100,792 (v0.17 order_eqp; STATUS.md): +2,104 B, the
 # `max` growth plus the IN operator reading its table's index in place
 # of the subquery (`planner`: `in_index_pick` shared with EQP).
-ratchet = 1100792
+# 1,100,792 -> 1,104,648 (v0.17 stmt_txn review fixes; STATUS.md):
+# +3,856 B, the `max` growth.
+ratchet = 1104648
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

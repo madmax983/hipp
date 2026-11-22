@@ -517,6 +517,36 @@ impl<S: Storage> Connection<S> {
         }
     }
 
+    /// The database whose connection answers the table-valued
+    /// function `n` (its name token `i`) as the pin does (v0.17 review
+    /// fix: one run on an attached database read that database's
+    /// objects): a pragma function's lone text argument's object, found
+    /// in the pin's search order, else main (dbstat and argument-less
+    /// or schema-naming pragma functions read main); `Nowhere` for one
+    /// any database computes alike (and the pragma check tables,
+    /// which main runs).
+    fn fn_loc(&self, t: &[Token], i: Option<usize>, n: &[u8], arena: &Arena) -> Loc {
+        let prag = n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_")) && !super::temp::ic_fn(n);
+        if !prag && !eq_ci(n, b"dbstat") {
+            return Loc::Nowhere;
+        }
+        let arg = i.and_then(|i| match (t.get(i + 2), t.get(i + 3)) {
+            (Some(a), Some(b)) if prag && matches!(b.tok, Tok::RParen) => match a.tok {
+                Tok::Text(h) => Some(handle_bytes(arena, h)),
+                _ => None,
+            },
+            _ => None,
+        });
+        match arg {
+            Some(a) => [false, true]
+                .into_iter()
+                .map(|ix| self.locate(None, a, ix).unwrap_or(Loc::Nowhere))
+                .find(|l| *l != Loc::Nowhere)
+                .unwrap_or(Loc::Nowhere),
+            None => Loc::Main,
+        }
+    }
+
     /// Whether `name` is a view in `loc`.
     fn is_view_in(&self, loc: Loc, name: &[u8]) -> bool {
         match loc {
@@ -785,11 +815,18 @@ impl<S: Storage> Connection<S> {
         let created = ast_names(&ast, &mut names, &mut ctes);
         let mut refs: AVec<Ref> = AVec::new();
         let mut placed: AVec<usize> = AVec::new();
+        // The databases that answer its table-valued functions
+        // (`fn_loc`).
+        let mut fns: AVec<Loc> = AVec::new();
         for (h, kind) in names.iter() {
-            if matches!(kind, Kind::Qual | Kind::Func) {
+            let n = handle_bytes(arena, *h);
+            if *kind == Kind::Func {
+                fns.push(self.fn_loc(t, tok_index(t, *h), n, arena));
                 continue;
             }
-            let n = handle_bytes(arena, *h);
+            if *kind == Kind::Qual {
+                continue;
+            }
             // A name the parser copied (`x IN aux.t`) is found by its
             // text among the qualified names not yet placed.
             let i = tok_index(t, *h).or_else(|| {
@@ -811,11 +848,12 @@ impl<S: Storage> Connection<S> {
             {
                 continue;
             }
-            // A table-valued pragma function is main's, whatever its
-            // qualifier (the pin ignores it).
-            if n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_"))
+            // A table-valued pragma function (or dbstat) is answered as
+            // `fn_loc` says, whatever its qualifier (the pin ignores it).
+            if (n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_")) || eq_ci(n, b"dbstat"))
                 && !self.catalog.taken(&self.catalog_arena, n).is_some()
             {
+                fns.push(self.fn_loc(t, i, n, arena));
                 continue;
             }
             // An attached database has no TEMP schema table.
@@ -989,6 +1027,7 @@ impl<S: Storage> Connection<S> {
                     .iter()
                     .map(|r| r.loc)
                     .chain(three.iter().map(|x| x.1))
+                    .chain(fns.iter().copied())
                     .filter(|l| *l != Loc::Nowhere);
                 match dbs.next() {
                     Some(Loc::Att(i)) if dbs.all(|l| l == Loc::Att(i)) => Loc::Att(i),
@@ -1008,6 +1047,11 @@ impl<S: Storage> Connection<S> {
         // (`SourceDesc::dbname`).
         let ext_on = |db: usize, own: Loc, mut ks: AVec<usize>| {
             let mine = |r: &Ref| r.loc == own || r.loc == Loc::Nowhere;
+            // A table-valued function another database answers is not
+            // handed over (v0.17 review fix: it read this one's).
+            if fns.iter().any(|l| *l != own && *l != Loc::Nowhere) {
+                return Err(Error::Unsupported);
+            }
             for r in refs.iter() {
                 if r.loc == own
                     && let Some(k) = r.schema_tok
@@ -2527,13 +2571,13 @@ impl<S: Storage> Statement<'_, S> {
     /// ("no such table" otherwise; an unknown `schema` is "unknown
     /// database"); with neither, every database is checked under one
     /// error limit. Each row is the result, then `arg` and `schema`;
-    /// `true` when an error waits after them (in `deferred`).
+    /// the error that waits after them comes with them.
     #[cfg(feature = "vtab")]
     pub(super) async fn integrity_tvf(
         &mut self,
         argv: &[OwnedValue],
         quick: bool,
-    ) -> Result<(Rows, bool), S::Error> {
+    ) -> Result<(Rows, Option<Error<S::Error>>), S::Error> {
         let txt = |i: usize| match argv.get(i) {
             None | Some(OwnedValue::Null) => None,
             Some(v) => Some(value_text(v)),
@@ -2543,10 +2587,16 @@ impl<S: Storage> Statement<'_, S> {
         if self.conn.alias.is_some() || self.conn.is_temp {
             return Err(Error::Unsupported);
         }
-        let conn = &*self.conn;
         let mut db = match &schema {
-            None => None,
-            Some(s) => match conn.locate(Some(s.as_slice()), b"", false) {
+            None => {
+                // Unqualified, the pin's lookup opens the temp
+                // database (v0.17 review fix: a main table's check
+                // left it closed).
+                let open: Boxed<'_, Result<_, S::Error>> = Box::pin(self.conn.temp_conn());
+                open.await?;
+                None
+            }
+            Some(s) => match self.conn.locate(Some(s.as_slice()), b"", false) {
                 Ok(l) => Some(l),
                 Err(()) => {
                     return Err(Error::Schema {
@@ -2555,11 +2605,31 @@ impl<S: Storage> Statement<'_, S> {
                 }
             },
         };
+        let conn = &*self.conn;
+        // A view's check reads nothing: `ok`.
+        let mut view = false;
         if let Some(a) = &arg {
             let a = a.as_slice();
+            // The pin's sqlite3FindTable (v0.17 review fix): a table or
+            // view of the catalog, `sqlite_master` / `sqlite_schema` in
+            // every database, the temp schema's other names only there.
+            let has = |l: Loc| {
+                if super::temp::is_temp_schema_name(a) {
+                    l == Loc::Temp
+                } else if l == Loc::Main {
+                    crate::schema::Catalog::is_schema_name(a)
+                        || conn.catalog.taken(&conn.catalog_arena, a) == Some(false)
+                } else {
+                    crate::schema::Catalog::is_schema_name(a) || conn.holds(l, a, false)
+                }
+            };
             let l = match db {
-                None => conn.locate(None, a, false).unwrap_or(Loc::Nowhere),
-                Some(l) if conn.holds(l, a, false) => l,
+                None => [Loc::Temp, Loc::Main]
+                    .into_iter()
+                    .chain((0..conn.attached.len()).map(Loc::Att))
+                    .find(|&l| has(l))
+                    .unwrap_or(Loc::Nowhere),
+                Some(l) if has(l) => l,
                 Some(_) => Loc::Nowhere,
             };
             if l == Loc::Nowhere {
@@ -2567,6 +2637,7 @@ impl<S: Storage> Statement<'_, S> {
                     kind: SchemaKind::UnknownTable,
                 });
             }
+            view = l != Loc::Main && conn.is_view_in(l, a);
             db = Some(l);
         }
         let plan = super::pragma::PragmaPlan {
@@ -2594,6 +2665,12 @@ impl<S: Storage> Statement<'_, S> {
             _ => None,
         };
         let rows = match rows {
+            Ok(_) if view => {
+                let (mut r, mut v) = (AVec::new(), AVec::new());
+                v.push(OwnedValue::Text(copy_vec(b"ok")));
+                r.push(v);
+                Ok(r)
+            }
             Ok(r) if db != Some(Loc::Main) => {
                 let a = arg.as_ref().map(|a| a.as_slice());
                 self.integrity_rest(&plan, quick, r, only.map(|o| (o, a)))
@@ -2615,8 +2692,7 @@ impl<S: Storage> Statement<'_, S> {
             self.deferred = saved;
             return Err(e);
         }
-        let mine = err.is_some();
-        self.deferred = saved.or(err);
+        self.deferred = saved;
         let mut out = AVec::new();
         for (k, r) in rows.into_iter().enumerate() {
             let mut v = r;
@@ -2626,7 +2702,7 @@ impl<S: Storage> Statement<'_, S> {
             }
             out.push((v, i64::try_from(k + 1).ok()));
         }
-        Ok((out, mine))
+        Ok((out, err))
     }
 
     /// The rows of external source `sp.ext` (`ext_source`): the ones

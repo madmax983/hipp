@@ -5,6 +5,30 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Review fixes: reads across databases (wave 21, unit `stmt_txn`)
+
+- A table-valued pragma function (or dbstat) in a statement naming an
+  attached table is answered by the database the pin finds its object
+  in: a query main answers runs on main; an attached / TEMP write that
+  another database answers is refused (it read the attached file's
+  table of the same name).
+- `IN` lists, `IN (SELECT ...)` and ORs of `=` on the
+  `pragma_integrity_check` / `pragma_quick_check` and generate_series
+  arguments run one filter per distinct, sorted value, as the pin's IN
+  loop (no rows / the list ignored before); EXPLAIN QUERY PLAN shows a
+  table-valued function's argument subqueries.
+- The check tables: `sqlite_master` found in every database and the
+  temp schema's names only in temp, TEMP / attached views `ok`, the TEMP
+  database opened by an unqualified check, EXISTS / scalar readers of a
+  corrupt check answered before its error.
+- hipp-cli names the columns of TEMP views the temp database cannot
+  plan from their text (headers were `column1`, ...).
+- Fix (`sql`): a view over `pragma_table_list` no longer recurses
+  until the stack overflows.
+- Sizes: tiny 76,928 (Δ 0); full 496,692 (+8); max 1,001,204 (+3,896);
+  xl 1,104,648 (+3,856). Ratchets raised to the measured figures
+  (owner approval pending).
+
 ### ORDER BY / LIMIT wrong answers and EXPLAIN QUERY PLAN differences (wave 21, unit `order_eqp`)
 
 - DISTINCT under an ORDER BY an index delivers in part stops after the

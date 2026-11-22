@@ -95,6 +95,17 @@ pub(super) fn filters_whole(vt: &VtSrc) -> bool {
     }
 }
 
+/// Rows read whole with the error met after them: a reader that stops
+/// first never meets it (v0.17 review fix: the pin's EXISTS or scalar
+/// subquery over a corrupt check answers); else the error, without
+/// the rows.
+fn whole<E>(rows: VRows, e: Option<Error<E>>, need: Option<usize>) -> Result<VRows, E> {
+    match e {
+        Some(e) if need.is_none_or(|n| rows.len() < n) => Err(e),
+        _ => Ok(rows),
+    }
+}
+
 fn vt_err<E>(kind: SchemaKind) -> Error<E> {
     Error::Schema { kind }
 }
@@ -478,6 +489,7 @@ impl<S: Storage> Connection<S> {
                 idx_num: 0,
                 idx_str: AVec::new(),
                 nargs,
+                in_mask: 0,
                 #[cfg(feature = "fts5")]
                 content_used: true,
                 #[cfg(feature = "fts5")]
@@ -577,6 +589,11 @@ impl<S: Storage> Connection<S> {
                     oterms.push((*x).clone());
                 }
             }
+            let hidden = vt.tab.hidden_cols();
+            #[cfg(feature = "attach")]
+            let in_loops = matches!(vt.tab.module, Module::Series | Module::Pragma { .. });
+            #[cfg(not(feature = "attach"))]
+            let in_loops = vt.tab.module == Module::Series;
             let push_term =
                 |src: u8,
                  k: usize,
@@ -585,6 +602,80 @@ impl<S: Storage> Connection<S> {
                  virt: &mut AVec<(Cons, RExpr, u8, usize)>| {
                     let usable = |r: &RExpr| !expr_refs_range(r, &later);
                     match t {
+                        // `x IN (...)` / `x = a OR x = b ...` on an
+                        // argument column of a module that loops over
+                        // it (`VtSrc::in_mask`; src 4 / 5 for WHERE /
+                        // ON): the pin's IN constraint, an `=`.
+                        RExpr::InList(..) | RExpr::InSub(..) | RExpr::Binary(BinOp::Or, ..)
+                            if in_loops =>
+                        {
+                            let mut items = AVec::new();
+                            let mut col = None;
+                            let rhs = match t {
+                                RExpr::InList(x, l, false, f) => {
+                                    col = col_of(x);
+                                    RExpr::InList(
+                                        Box::new(RExpr::Literal(OwnedValue::Null)),
+                                        l.clone(),
+                                        false,
+                                        *f,
+                                    )
+                                }
+                                RExpr::InSub(x, p, false) => {
+                                    col = col_of(x);
+                                    RExpr::InSub(
+                                        Box::new(RExpr::Literal(OwnedValue::Null)),
+                                        p.clone(),
+                                        false,
+                                    )
+                                }
+                                _ => {
+                                    let mut stack: AVec<&RExpr> = AVec::new();
+                                    stack.push(t);
+                                    while let Some(e) = stack.pop() {
+                                        match e {
+                                            RExpr::Binary(BinOp::Or, l, r) => {
+                                                stack.push(r);
+                                                stack.push(l);
+                                            }
+                                            RExpr::Binary(BinOp::Eq, l, r) => {
+                                                let (c, v) = match (col_of(l), col_of(r)) {
+                                                    (Some(c), None) => (c, r),
+                                                    (None, Some(c)) => (c, l),
+                                                    _ => return,
+                                                };
+                                                if col.is_some_and(|k| k != c) {
+                                                    return;
+                                                }
+                                                col = Some(c);
+                                                items.push((**v).clone());
+                                            }
+                                            _ => return,
+                                        }
+                                    }
+                                    RExpr::InList(
+                                        Box::new(RExpr::Literal(OwnedValue::Null)),
+                                        items,
+                                        false,
+                                        false,
+                                    )
+                                }
+                            };
+                            if let Some(c) = col
+                                && hidden.as_slice().contains(&(c as usize))
+                            {
+                                cands.push((
+                                    Cons {
+                                        col: c,
+                                        op: Op::Eq,
+                                        usable: usable(&rhs),
+                                    },
+                                    rhs,
+                                    src + 4,
+                                    k,
+                                ));
+                            }
+                        }
                         RExpr::Binary(op, l, r) => {
                             let o = match op {
                                 BinOp::Eq => Op::Eq,
@@ -765,7 +856,6 @@ impl<S: Storage> Connection<S> {
             for (k, t) in oterms.iter().enumerate() {
                 push_term(1, k, t, &mut cands, &mut virt);
             }
-            let hidden = vt.tab.hidden_cols();
             if let Some(args) = sp
                 .derived
                 .as_deref()
@@ -849,17 +939,22 @@ impl<S: Storage> Connection<S> {
             let mut drop_w: AVec<usize> = AVec::new();
             let mut drop_o: AVec<usize> = AVec::new();
             let mut between: AVec<(usize, u8)> = AVec::new();
+            let mut in_mask = 0u8;
             for (u, c) in info.usage.iter().zip(cands.iter()) {
                 if u.argv == 0 {
                     continue;
                 }
-                if let Some(slot) = argv.as_mut_slice().get_mut(usize::from(u.argv) - 1) {
+                let j = usize::from(u.argv) - 1;
+                if let Some(slot) = argv.as_mut_slice().get_mut(j) {
                     *slot = c.1.clone();
+                }
+                if c.2 >= 4 {
+                    in_mask |= 1u8.checked_shl(j as u32).unwrap_or(0);
                 }
                 if u.omit {
                     match c.2 {
-                        0 => drop_w.push(c.3),
-                        1 => drop_o.push(c.3),
+                        0 | 4 => drop_w.push(c.3),
+                        1 | 5 => drop_o.push(c.3),
                         3 => match between.as_mut_slice().iter_mut().find(|b| b.0 == c.3) {
                             Some(b) => b.1 += 1,
                             None => between.push((c.3, 1)),
@@ -913,6 +1008,7 @@ impl<S: Storage> Connection<S> {
             if let Some(v) = sp.vt.as_deref_mut() {
                 v.idx_num = info.idx_num;
                 v.idx_str = info.idx_str;
+                v.in_mask = in_mask;
             }
         }
         Ok(consumed)
@@ -1429,8 +1525,125 @@ impl<S: Storage> Statement<'_, S> {
         row: &RowData,
         need: Option<usize>,
     ) -> Result<VRows, S::Error> {
+        if vt.in_mask != 0 {
+            let (rows, e) = Box::pin(self.vtab_in(sp, vt, row, need)).await?;
+            return whole(rows, e, need);
+        }
         let argv = self.vtab_argv(sp, row).await?;
         self.vtab_rows_of(vt, argv, row, need).await
+    }
+
+    /// The rows of source `sp` with IN arguments (`VtSrc::in_mask`):
+    /// one filter per combination of their values, the last
+    /// argument's fastest, the loop stopping at `need` rows; with the
+    /// error a filter met after the rows before it (v0.17 review fix:
+    /// `arg IN ('t')` read nothing).
+    async fn vtab_in(
+        &mut self,
+        sp: &SourcePlan,
+        vt: &VtSrc,
+        row: &RowData,
+        need: Option<usize>,
+    ) -> Result<(VRows, Option<Error<S::Error>>), S::Error> {
+        let mut argv = self.vtab_argv(sp, row).await?;
+        // Each IN argument's distinct non-NULL values, sorted (the
+        // pin's ephemeral IN index), and the one in use.
+        let mut lists: AVec<(usize, AVec<OwnedValue>, usize)> = AVec::new();
+        let args = sp
+            .derived
+            .as_deref()
+            .and_then(|d| d.values.as_slice().first());
+        for (k, e) in args.into_iter().flat_map(|a| a.iter()).enumerate() {
+            if (vt.in_mask >> k.min(7)) & 1 == 0 || k > 7 {
+                continue;
+            }
+            let vals = self.compute_sub_values(e, row).await?;
+            let e2 = crate::query::substitute(e, vals.as_slice(), &mut 0);
+            let RExpr::InList(_, items, _, sub) = &e2 else {
+                return Err(Error::Unsupported);
+            };
+            // (A written one-item list is the pin's `=`: a NULL is
+            // passed.)
+            let one = items.len() == 1 && !sub;
+            let mut vs: AVec<OwnedValue> = AVec::new();
+            for it in items.iter() {
+                // (The argument columns' type `HIDDEN` is NUMERIC
+                // affinity, which the pin's IN index applies.)
+                let v = crate::record::apply_affinity(
+                    crate::query::eval::<S::Error>(it, &Ctx::of(row).with(&self.conn.env))?,
+                    crate::record::Affinity::Numeric,
+                );
+                let cmp =
+                    |a: &OwnedValue| crate::record::compare_values(&a.as_value(), &v.as_value());
+                if (one || v != OwnedValue::Null)
+                    && let Err(at) = vs.as_slice().binary_search_by(cmp)
+                {
+                    vs.insert_at(at, v);
+                }
+            }
+            if vs.is_empty() {
+                return Ok((AVec::new(), None));
+            }
+            lists.push((k, vs, 0));
+        }
+        let mut out = AVec::new();
+        loop {
+            for (k, vs, i) in lists.iter() {
+                if let (Some(s), Some(v)) = (argv.as_mut_slice().get_mut(*k), vs.as_slice().get(*i))
+                {
+                    *s = v.clone();
+                }
+            }
+            let r = match vt.tab.module {
+                #[cfg(feature = "attach")]
+                Module::Pragma { quick } => self.integrity_tvf(argv.as_slice(), quick).await,
+                _ => {
+                    let a = argv.clone();
+                    self.vtab_rows_of(vt, a, row, need).await.map(|r| (r, None))
+                }
+            };
+            match r {
+                Ok((rows, e)) => {
+                    for x in rows {
+                        out.push(x);
+                    }
+                    if e.is_some() {
+                        return Ok((out, e));
+                    }
+                }
+                Err(e) if out.is_empty() => return Err(e),
+                Err(e) => return Ok((out, Some(e))),
+            }
+            if need.is_some_and(|n| out.len() >= n) {
+                return Ok((out, None));
+            }
+            // The next combination.
+            let mut j = lists.len();
+            loop {
+                let Some(l) = j
+                    .checked_sub(1)
+                    .and_then(|i| lists.as_mut_slice().get_mut(i))
+                else {
+                    return Ok((out, None));
+                };
+                j -= 1;
+                l.2 += 1;
+                if l.2 < l.1.len() {
+                    break;
+                }
+                l.2 = 0;
+            }
+        }
+    }
+
+    /// Keep the error `e` to report after a cursor's rows (an earlier
+    /// cursor's comes first): whether one waits.
+    fn defer(&mut self, e: Option<Error<S::Error>>) -> bool {
+        let some = e.is_some();
+        if self.deferred.is_none() {
+            self.deferred = e;
+        }
+        some
     }
 
     /// Source `sp`'s filter arguments (the pin's xFilter `argv`),
@@ -1464,6 +1677,10 @@ impl<S: Storage> Statement<'_, S> {
         row: &RowData,
         need: Option<usize>,
     ) -> Result<VtCur, S::Error> {
+        if vt.in_mask != 0 {
+            let (rows, e) = Box::pin(self.vtab_in(sp, vt, row, need)).await?;
+            return Ok(VtCur::Rows(rows, 0, self.defer(e)));
+        }
         let argv = self.vtab_argv(sp, row).await?;
         Ok(match vt.tab.module {
             Module::Series => VtCur::Series(crate::vtab::SeriesCursor::filter(
@@ -1476,23 +1693,11 @@ impl<S: Storage> Statement<'_, S> {
             }
             #[cfg(feature = "attach")]
             Module::Pragma { quick } => {
-                let (rows, err) = self.integrity_tvf(argv.as_slice(), quick).await?;
-                VtCur::Rows(rows, 0, err)
+                let (rows, e) = self.integrity_tvf(argv.as_slice(), quick).await?;
+                VtCur::Rows(rows, 0, self.defer(e))
             }
             _ => VtCur::Rows(self.vtab_rows_of(vt, argv, row, need).await?, 0, false),
         })
-    }
-
-    /// The rows of a module that computes them at its filter
-    /// (`filters_whole`), for `row`.
-    pub(super) async fn vtab_whole(
-        &mut self,
-        sp: &SourcePlan,
-        vt: &VtSrc,
-        row: &RowData,
-    ) -> Result<VRows, S::Error> {
-        let argv = self.vtab_argv(sp, row).await?;
-        self.vtab_rows_of(vt, argv, row, None).await
     }
 
     /// The cursor's next row appended to `out` (its columns, then its
@@ -1570,12 +1775,11 @@ impl<S: Storage> Statement<'_, S> {
             Module::Fts5 => self.fts5_rows(vt, argv.as_slice(), need).await,
             #[cfg(feature = "fts5")]
             Module::Fts5Vocab => self.vocab_rows(vt).await,
-            // Read whole: the error comes with no rows.
             #[cfg(feature = "attach")]
-            Module::Pragma { quick } => match self.integrity_tvf(argv.as_slice(), quick).await? {
-                (_, true) => Err(self.deferred.take().unwrap_or(Error::Unsupported)),
-                (rows, false) => Ok(rows),
-            },
+            Module::Pragma { quick } => {
+                let (rows, e) = self.integrity_tvf(argv.as_slice(), quick).await?;
+                whole(rows, e, need)
+            }
         }
     }
 

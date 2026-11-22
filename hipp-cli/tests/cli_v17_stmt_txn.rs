@@ -182,3 +182,37 @@ fn without_rowid_tables_of_other_databases() {
     );
     byte_identical("wr", &batch);
 }
+
+/// The headers of TEMP views the temp database cannot plan (over the
+/// pragma check tables, over main's tables) are named from the view's
+/// text, as the pin names them (review fix: `column1`, ...), and the
+/// IN forms of the check tables' arguments (review fix: no rows).
+#[test]
+fn temp_view_headers_and_in_arguments() {
+    let input = "CREATE TABLE t(a); INSERT INTO t VALUES (1);\n\
+         CREATE TABLE u(c, d);\n\
+         .headers on\n\
+         CREATE TEMP VIEW tv AS SELECT * FROM pragma_quick_check;\n\
+         CREATE TEMP VIEW tv2(c1) AS SELECT * FROM pragma_quick_check;\n\
+         CREATE TEMP VIEW tv3 AS SELECT quick_check AS qc FROM pragma_quick_check;\n\
+         CREATE TEMP VIEW tv4 AS SELECT quick_check, arg FROM pragma_quick_check('t');\n\
+         CREATE TEMP VIEW tm AS SELECT a, a + 1 AS b FROM t;\n\
+         CREATE TEMP VIEW tm2 AS SELECT * FROM tm;\n\
+         SELECT * FROM tv;\n\
+         SELECT * FROM tv2;\n\
+         SELECT * FROM tv3;\n\
+         SELECT * FROM tv4;\n\
+         SELECT * FROM tv, tv3;\n\
+         SELECT * FROM (SELECT * FROM tv);\n\
+         SELECT * FROM tm;\n\
+         SELECT * FROM tm2;\n\
+         SELECT * FROM pragma_quick_check WHERE arg IN ('t', 'u');\n\
+         SELECT arg, * FROM pragma_quick_check WHERE arg = 'u' OR arg = 't';\n\
+         SELECT * FROM pragma_quick_check WHERE arg = 't' AND schema IN ('main', 'main');\n";
+    let a = temp_dir("tvh-hipp");
+    let b = temp_dir("tvh-ora");
+    let got = run_stdin(&hipp_bin(), &a, input);
+    let want = run_stdin(&oracle(), &b, input);
+    assert_eq!(got, want);
+    assert!(got.contains("quick_check|arg"), "{got}");
+}

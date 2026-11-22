@@ -409,6 +409,38 @@ where
             };
             return (cols, ipk);
         }
+        // A TEMP view the temp database cannot plan (it reads main's
+        // objects: `PRAGMA temp.table_info` fails) is named from its
+        // text, as the pin names it (v0.17 review fix: `SELECT * FROM
+        // tv` over `pragma_quick_check` was headed `column1`).
+        if schema.is_none_or(|s| eq_ci(s, b"temp")) && self.depth < 64 {
+            let sql = self.db.temp_db().and_then(|t| {
+                t.views()
+                    .iter()
+                    .find(|v| eq_ci(v.name, name))
+                    .map(|v| v.sql.to_vec())
+            });
+            if let Some(sql) = sql {
+                let arena = Arena::new(Scope::Statement, 0, 64 * 1024 * 1024);
+                let lim = hipp::sql::parser::Limits::PIN;
+                if let Ok(Ast::CreateView {
+                    columns, select, ..
+                }) = hipp::sql::parser::parse::<()>(&sql, &arena, lim)
+                {
+                    let mut nm = Namer {
+                        db: &mut *self.db,
+                        arena: &arena,
+                        ctes: Vec::new(),
+                        depth: self.depth + 1,
+                    };
+                    let cols = match &columns {
+                        Some(c) => c.iter().map(|h| nm.bytes(*h)).collect(),
+                        None => nm.select(&select, true),
+                    };
+                    return (cols, None);
+                }
+            }
+        }
         (Vec::new(), None)
     }
 }

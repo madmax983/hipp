@@ -939,3 +939,362 @@ fn limit_under_merged_where() {
     }
     same("limitmerge", &s);
 }
+
+// ---- Review fixes (v0.17 `stmt_txn` review) ----
+
+const FN_SETUP: &str = "
+CREATE TABLE m(x INTEGER PRIMARY KEY, y);
+INSERT INTO m VALUES (1, 'a'), (2, 'b');
+ATTACH '{d}/a.db' AS aux;
+CREATE TABLE aux.m(zz, ww, vv);
+INSERT INTO aux.m VALUES (7, 8, 9);
+CREATE TABLE aux.o(v);
+CREATE TABLE aux.only(k1, k2);
+INSERT INTO aux.only VALUES (1, 2), (3, 4);
+CREATE VIEW aux.av AS SELECT zz FROM m;
+CREATE TEMP TABLE tm(t1);
+CREATE TEMP TABLE o(v);
+";
+
+/// A table-valued pragma function (or dbstat) in a statement that
+/// names an attached table is answered by the database the pin finds
+/// its object in: main runs a query that reads one main answers, and
+/// an attached write whose function another database answers is
+/// refused, not answered from the attached file (review fix: such a
+/// write copied the attached `m`'s columns, a query read them).
+#[test]
+fn pragma_functions_beside_attached_tables() {
+    let q = "
+        SELECT name FROM pragma_table_info('m');
+        SELECT name FROM pragma_table_info('only');
+        SELECT name FROM pragma_table_info('tm');
+        SELECT name, (SELECT count(*) FROM aux.only) FROM pragma_table_info('m');
+        SELECT count(*) FROM aux.only, pragma_table_info('m');
+        SELECT k1, name FROM aux.only JOIN pragma_table_info('m') ORDER BY 1, 2;
+        SELECT name FROM aux.pragma_table_info('m');
+        SELECT * FROM aux.av, pragma_table_info('m');
+        SELECT * FROM aux.av, main.m;
+        SELECT k1 FROM aux.only WHERE 0 < (SELECT count(*) FROM pragma_table_info('m'));
+        SELECT DISTINCT name, (SELECT count(*) FROM aux.o) FROM dbstat ORDER BY 1;
+        SELECT name FROM pragma_database_list, aux.only ORDER BY 1;
+        INSERT INTO aux.o SELECT name FROM pragma_table_info('only');
+        SELECT * FROM aux.o;
+        DELETE FROM aux.o;
+        INSERT INTO aux.o SELECT value FROM generate_series(1, 3);
+        SELECT * FROM aux.o;
+        DELETE FROM aux.o;
+        INSERT INTO aux.o SELECT x FROM m;
+        SELECT * FROM aux.o;
+        DELETE FROM aux.o;
+        INSERT INTO o SELECT name FROM pragma_table_info('m');
+        SELECT * FROM o;
+        UPDATE aux.m SET zz = (SELECT count(*) FROM m);
+        SELECT * FROM aux.m;
+        CREATE VIEW pv AS SELECT name FROM pragma_table_info('m');
+        INSERT INTO aux.o SELECT name FROM pv;
+        SELECT count(*) FROM aux.o;
+    ";
+    let mut s = lines(FN_SETUP);
+    s.extend(lines(q));
+    same("fnatt", &s);
+}
+
+/// The refusals the routing keeps (the pin answers them): an attached
+/// write reading a pragma function or dbstat that main (or TEMP)
+/// answers fails, and writes nothing.
+#[test]
+fn pragma_functions_in_attached_writes_refused() {
+    let mut s = lines(FN_SETUP);
+    let refused = lines(
+        "INSERT INTO aux.o SELECT name FROM pragma_table_info('m');
+         INSERT INTO aux.o SELECT name FROM main.pragma_table_info('m');
+         INSERT INTO aux.o SELECT name FROM pragma_table_info('m', 'main');
+         INSERT INTO aux.o VALUES ((SELECT group_concat(name) FROM pragma_table_info('tm')));
+         INSERT INTO aux.o SELECT name FROM pragma_index_list('m');
+         INSERT INTO aux.o SELECT name FROM pragma_database_list;
+         UPDATE aux.o SET v = (SELECT count(*) FROM pragma_table_info('m'));
+         INSERT INTO aux.o SELECT name FROM dbstat;
+         CREATE TABLE aux.x AS SELECT name FROM pragma_table_info('m');
+         WITH c AS (SELECT name FROM pragma_table_info('m')) INSERT INTO aux.o SELECT * FROM c",
+    );
+    let n = s.len();
+    s.extend(refused.iter().cloned());
+    s.push("SELECT count(*) FROM aux.o".to_string());
+    let (h, o) = answers("fnref", &s);
+    for i in n..n + refused.len() {
+        assert_eq!(h[i], vec!["!".to_string()], "{}", s[i]);
+        assert!(!o[i].contains(&"!".to_string()), "pin answers {}", s[i]);
+    }
+    assert_eq!(h[n + refused.len()], vec!["0".to_string()]);
+}
+
+const IN_SETUP: &str = "
+CREATE TABLE t(a);
+CREATE TABLE u(c, d);
+CREATE INDEX ui ON u(c);
+CREATE VIEW v AS SELECT a FROM t;
+ATTACH '{d}/a.db' AS aux;
+CREATE TABLE aux.w(z);
+";
+
+/// `IN` and an OR of `=` on a table-valued function's arguments: one
+/// filter per distinct, sorted, non-NULL value, as the pin's IN loop
+/// over the argument (review fix: the pragma check tables returned no
+/// rows, generate_series ignored the list).
+#[test]
+fn in_arguments_of_table_functions() {
+    let q = "
+        SELECT * FROM pragma_quick_check WHERE arg IN ('t');
+        SELECT * FROM pragma_quick_check WHERE arg IN ('t', 'u');
+        SELECT * FROM pragma_quick_check WHERE arg = 't' OR arg = 'u';
+        SELECT * FROM pragma_quick_check WHERE arg IN (SELECT 't');
+        SELECT * FROM pragma_quick_check WHERE arg = 't' AND schema IN ('main', 'temp');
+        SELECT * FROM pragma_quick_check WHERE arg IN ('t', 'zz');
+        SELECT * FROM pragma_quick_check WHERE arg IN ('zz', 't');
+        SELECT arg FROM pragma_quick_check WHERE arg IN ('u', 't', 'u');
+        SELECT arg FROM pragma_quick_check WHERE arg = 'u' OR arg = 't';
+        SELECT arg FROM pragma_quick_check WHERE arg IN (SELECT 'u' UNION ALL SELECT 't' UNION ALL SELECT 'u');
+        SELECT arg, schema FROM pragma_quick_check WHERE arg IN ('u', 't') AND schema IN ('main', 'main');
+        SELECT arg, schema FROM pragma_integrity_check WHERE arg IN ('w', 't') AND schema IN ('aux', 'main');
+        SELECT arg FROM pragma_quick_check WHERE arg IN ('u', NULL);
+        SELECT arg, * FROM pragma_quick_check WHERE arg IN (NULL);
+        SELECT arg, * FROM pragma_quick_check WHERE arg IN (NULL, NULL);
+        SELECT arg, * FROM pragma_quick_check WHERE arg IN (SELECT NULL);
+        SELECT value FROM generate_series(1, 3) WHERE step IN (NULL);
+        SELECT step, value FROM generate_series(1, 4) WHERE step IN (3, '2');
+        SELECT arg FROM pragma_quick_check WHERE arg IN ('u', 3, '2', x'74');
+        SELECT step FROM generate_series(1, 4) WHERE step IN (2.0, 1, '1');
+        SELECT arg FROM pragma_quick_check WHERE arg IN (1, 't');
+        SELECT arg FROM pragma_quick_check WHERE arg IN ('u', 't') ORDER BY arg DESC;
+        SELECT a.arg FROM pragma_quick_check a WHERE a.arg IN (SELECT name FROM sqlite_schema);
+        SELECT arg FROM pragma_integrity_check WHERE arg IN ('t', 'u') AND schema = 'main';
+        SELECT arg, schema FROM pragma_integrity_check WHERE schema IN ('main', 'aux');
+        SELECT arg FROM pragma_quick_check WHERE arg IN ();
+        SELECT arg FROM pragma_quick_check WHERE arg NOT IN ('t');
+        SELECT arg FROM pragma_quick_check WHERE arg NOT IN (SELECT 't');
+        SELECT value FROM generate_series(1, 3) WHERE step NOT IN (SELECT 2);
+        SELECT arg FROM pragma_quick_check WHERE arg = 't' OR arg = 'u' OR arg = 't';
+        SELECT arg FROM pragma_quick_check WHERE arg = 't' OR schema = 'main';
+        SELECT arg FROM pragma_quick_check WHERE arg IN ('v', 'w');
+        SELECT x, arg FROM (SELECT 't' x UNION SELECT 'u'), pragma_quick_check WHERE arg IN (x, 'u');
+        SELECT x, arg FROM (SELECT 't' x UNION SELECT 'u') LEFT JOIN pragma_quick_check ON arg IN (x);
+        SELECT count(*) FROM pragma_quick_check WHERE arg IN ('t', 'u');
+        SELECT EXISTS (SELECT 1 FROM pragma_quick_check WHERE arg IN ('t', 'zz'));
+        SELECT (SELECT arg FROM pragma_quick_check WHERE arg IN ('u', 't'));
+        SELECT value, step FROM generate_series(1, 3) WHERE step IN (2, 1, 2);
+        SELECT value FROM generate_series(1, 3) WHERE start IN (1, 2);
+        SELECT value FROM generate_series WHERE start IN (1, 5) AND stop = 6;
+        SELECT value FROM generate_series(1, 3) WHERE step IN (1, 2) AND stop IN (2, 3);
+        SELECT value FROM generate_series(1, 3) WHERE step IN (1, 2) OR value = 2;
+        SELECT value FROM generate_series(1, 3) WHERE step = 1 OR step = 2;
+        SELECT x, value FROM (SELECT 1 x UNION SELECT 2), generate_series(1, 3) WHERE step IN (x, 3);
+        SELECT value FROM generate_series(1, 10) WHERE step IN (3, 4) LIMIT 3;
+        SELECT value FROM generate_series(1, 3) WHERE step IN ('2');
+        SELECT value FROM generate_series(1, 3) WHERE step IN (SELECT 2 UNION SELECT 1);
+        SELECT value FROM generate_series((SELECT 1), 3);
+        SELECT (SELECT 5), value FROM generate_series((SELECT 1), 3) WHERE step IN (SELECT 1);
+    ";
+    let mut s = lines(IN_SETUP);
+    for l in lines(q) {
+        s.push(format!("EXPLAIN QUERY PLAN {l}"));
+        s.push(l);
+    }
+    same("inargs", &s);
+}
+
+/// The IN rule's shapes, generated: lists and ORs of `=` (values,
+/// duplicates, NULLs, unknown tables, numbers) on the pragma check
+/// tables' `arg` / `schema` and generate_series' arguments.
+#[test]
+fn generated_in_arguments() {
+    let mut rng = Rng(0x5eed_0f1e_2026_1122);
+    let vals = [
+        "'t'",
+        "'u'",
+        "'v'",
+        "'w'",
+        "'zz'",
+        "NULL",
+        "1",
+        "'T'",
+        "'sqlite_master'",
+    ];
+    let schemas = ["'main'", "'aux'", "'temp'", "NULL", "'nodb'"];
+    let nums = ["1", "2", "3", "NULL", "'2'", "0"];
+    let list = |rng: &mut Rng, xs: &[&str]| -> String {
+        let n = 1 + rng.int(3);
+        (0..n).map(|_| rng.pick(xs)).collect::<Vec<_>>().join(", ")
+    };
+    let mut s = lines(IN_SETUP);
+    let n = std::env::var("HIPP_STX_CORPUS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60u64);
+    for _ in 0..n {
+        let f = rng.pick(&["pragma_quick_check", "pragma_integrity_check"]);
+        let arg = match rng.int(4) {
+            0 => format!("arg IN ({})", list(&mut rng, &vals)),
+            1 => {
+                let (a, b) = (rng.pick(&vals), rng.pick(&vals));
+                format!("(arg = {a} OR arg = {b})")
+            }
+            2 => format!(
+                "arg IN (SELECT name FROM sqlite_schema WHERE type = {})",
+                rng.pick(&["'table'", "'view'", "'index'"])
+            ),
+            _ => format!("arg = {}", rng.pick(&vals)),
+        };
+        let q = match rng.int(3) {
+            0 => format!("SELECT arg, schema, * FROM {f} WHERE {arg}"),
+            1 => format!(
+                "SELECT arg, schema FROM {f} WHERE {arg} AND schema IN ({})",
+                list(&mut rng, &schemas)
+            ),
+            _ => {
+                let c = rng.pick(&["start", "stop", "step"]);
+                format!(
+                    "SELECT value, start, stop, step FROM generate_series(1, 4) WHERE {c} IN ({})",
+                    list(&mut rng, &nums)
+                )
+            }
+        };
+        s.push(q);
+    }
+    same("genin", &s);
+}
+
+/// The check tables' table argument found as the pin's
+/// sqlite3FindTable finds it: `sqlite_master` / `sqlite_schema` in
+/// every database, the temp schema's other names only there, a
+/// catalog table or view otherwise (review fix: `('sqlite_master',
+/// 'temp')` was "no such table", `('sqlite_temp_master', 'main')` and
+/// `('sqlite_sequence')` were checked).
+#[test]
+fn integrity_tvf_schema_tables() {
+    let mut s = lines(
+        "CREATE TABLE t(a);
+         CREATE VIEW v AS SELECT 1;
+         CREATE INDEX ti ON t(a);
+         CREATE TEMP TABLE tt(b);
+         CREATE TEMP VIEW tv AS SELECT 2;
+         ATTACH '{d}/a.db' AS aux;
+         CREATE TABLE aux.x(c);
+         CREATE VIEW aux.av AS SELECT 3",
+    );
+    for a in [
+        "sqlite_master",
+        "sqlite_schema",
+        "sqlite_temp_master",
+        "sqlite_temp_schema",
+        "SQLITE_MASTER",
+        "sqlite_sequence",
+        "sqlite_stat1",
+        "sqlite_foo",
+        "pragma_foo",
+        "v",
+        "tv",
+        "av",
+        "ti",
+    ] {
+        s.push(format!("SELECT '{a}', * FROM pragma_quick_check('{a}')"));
+        for d in ["main", "temp", "aux"] {
+            s.push(format!(
+                "SELECT '{a} {d}', * FROM pragma_quick_check('{a}', '{d}')"
+            ));
+        }
+    }
+    same("icschema", &s);
+}
+
+/// The check's unqualified lookup opens the TEMP database, a main
+/// table's check too (review fix: `pragma_database_list` lacked it).
+#[test]
+fn integrity_tvf_opens_temp() {
+    for q in [
+        "SELECT * FROM pragma_quick_check('t')",
+        "SELECT * FROM pragma_integrity_check('t')",
+        "SELECT * FROM pragma_quick_check WHERE arg = 't'",
+        "SELECT * FROM pragma_quick_check('x')",
+        "SELECT * FROM pragma_quick_check('zz')",
+        "SELECT * FROM pragma_quick_check('t', 'main')",
+        "SELECT * FROM pragma_quick_check(NULL, 'main')",
+        "SELECT * FROM pragma_quick_check('t', 'nodb')",
+    ] {
+        let mut s = lines(
+            "CREATE TABLE t(a);
+             ATTACH '{d}/a.db' AS aux;
+             CREATE TABLE aux.x(b)",
+        );
+        s.push(q.to_string());
+        s.push("SELECT name FROM pragma_database_list".to_string());
+        same("ictemp", &s);
+    }
+}
+
+/// A corrupt attached file read where the reader stops first: EXISTS
+/// and a scalar subquery take the rows before the error, as the pin's
+/// do (review fix: the error came instead).
+#[test]
+fn integrity_tvf_corrupt_readers_that_stop() {
+    let s = lines(
+        "CREATE TABLE t(a);
+         ATTACH '{d}/a.db' AS aux;
+         SELECT EXISTS (SELECT 1 FROM pragma_quick_check);
+         SELECT (SELECT quick_check FROM pragma_quick_check);
+         SELECT (SELECT quick_check FROM pragma_quick_check LIMIT 1 OFFSET 1);
+         SELECT EXISTS (SELECT 1 FROM pragma_quick_check WHERE quick_check = 'zz');
+         SELECT 1 WHERE 'ok' IN (SELECT * FROM pragma_quick_check);
+         SELECT EXISTS (SELECT 1 FROM pragma_quick_check WHERE arg IN ('t', 'u'));
+         SELECT * FROM pragma_quick_check WHERE arg IN ('t', 'u');
+         SELECT * FROM pragma_quick_check WHERE schema IN ('main', 'aux') AND arg IS NULL;
+         SELECT arg, schema FROM pragma_quick_check WHERE arg IS NULL AND schema IN ('aux', 'main')",
+    );
+    let (h, o) = answers_prep("iccorstop", &s, &corrupt_aux);
+    for (i, (a, b)) in h.iter().zip(o.iter()).enumerate() {
+        assert_eq!(a, b, "statement {}: {}", i + 1, s[i]);
+    }
+}
+
+/// TEMP views over the pragma check tables and over pragma_table_list
+/// (review fix: a view over pragma_table_list listed itself without
+/// end, overflowing the stack).
+#[test]
+fn temp_views_over_pragma_tables() {
+    let s = lines(
+        "CREATE TABLE t(a);
+         CREATE TEMP VIEW tv AS SELECT * FROM pragma_quick_check;
+         CREATE TEMP VIEW tv2(c1) AS SELECT * FROM pragma_quick_check;
+         CREATE TEMP VIEW tv3 AS SELECT quick_check AS qc FROM pragma_quick_check;
+         CREATE TEMP VIEW tv4 AS SELECT quick_check, arg FROM pragma_quick_check('t');
+         CREATE TEMP VIEW tl AS SELECT * FROM pragma_table_list;
+         SELECT * FROM tv;
+         SELECT * FROM tv2;
+         SELECT * FROM tv3;
+         SELECT * FROM tv4;
+         SELECT * FROM tv, tv3;
+         SELECT * FROM tl WHERE name NOT LIKE 'tv%' ORDER BY 1, 2;
+         SELECT name, ncol FROM tl WHERE name = 'tl';
+         SELECT schema, name, ncol FROM pragma_table_list WHERE name IN ('tl', 't') ORDER BY 2",
+    );
+    same("tvprag", &s);
+}
+
+/// The plans of attached and TEMP writes reading another database's
+/// tables directly (a view read so keeps a co-routine, an honest gap:
+/// STATUS.md).
+#[test]
+fn cross_database_write_plans() {
+    let s = lines(
+        "CREATE TABLE m(x INTEGER PRIMARY KEY, y, z);
+         INSERT INTO m VALUES (1, 2, 3), (2, 4, 6), (5, 1, 1);
+         ATTACH '{d}/a.db' AS aux;
+         CREATE TABLE aux.t(a INTEGER PRIMARY KEY, c);
+         INSERT INTO aux.t VALUES (1, 0), (2, 0);
+         EXPLAIN QUERY PLAN INSERT INTO aux.t(c) SELECT y FROM m;
+         EXPLAIN QUERY PLAN UPDATE aux.t SET c = 1 WHERE a = 2;
+         EXPLAIN QUERY PLAN DELETE FROM aux.t WHERE a > 1;
+         INSERT INTO aux.t(c) SELECT y FROM m;
+         SELECT * FROM aux.t",
+    );
+    same("xwplans", &s);
+}

@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 496,684 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 997,308 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,100,792 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 496,692 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,001,204 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,104,648 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -104,7 +104,15 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   statement transaction spanning databases and so TEMP triggers across
   databases (design recorded), writes of attached / TEMP tables
   reading other databases' tables (read whole), a statement CTE named
-  like another database's view it reads.
+  like another database's view it reads. Review fixes: a table-valued
+  pragma function (or dbstat) is answered by the database the pin
+  finds its object in (an attached write read the attached file's
+  `m`; one another database answers is now refused), `IN` / `OR` on the
+  check tables' and generate_series' arguments loop as the pin's IN
+  does (they read nothing / ignored the list), the check's schema-table
+  lookup, its TEMP open and EXISTS / scalar readers over a corrupt
+  check match the pin, the shell names TEMP views over pragma tables,
+  and a view over `pragma_table_list` no longer overflows the stack.
 - **The pin shell's dot-commands and output modes in hipp-cli** (unit
   `shell`, hipp-cli only: no library or size change). `.mode list`,
   `csv`, `column`, `line`, `box`, `markdown`, `table`, `quote`, `json`,

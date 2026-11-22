@@ -11,6 +11,172 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: stmt_txn — review fixes (2026-11-22)
+
+Seven review findings on `stmt_txn` (f259a86), each reproduced and
+probed on the live 3.54.1 pin first; built on `order_eqp` (38e4c53).
+
+**Fixed.**
+1. **Table-valued functions beside attached tables** (wrong answer;
+   `Connection::fn_loc`, `route_attach_at`). A statement routed to an
+   attached (or the TEMP) database ran its pragma functions there, so
+   `INSERT INTO aux.o SELECT name FROM pragma_table_info('m')` (and the
+   same through a main view, newly reachable by `stmt_txn`'s view
+   expansion) wrote `aux.m`'s columns, and `SELECT name, (SELECT
+   count(*) FROM aux.only) FROM pragma_table_info('m')` read them. The
+   router now locates every table-valued pragma function (and dbstat)
+   as the pin's `pragmaVtabFilter` does: a lone text argument's object
+   in temp, main, then attached order; otherwise main. A query counts
+   that database among the ones it reads (main runs it when they
+   differ); a write that runs elsewhere is refused (`Unsupported`)
+   unless its own database answers the function (`pragma_table_info('only')`
+   of `aux.only` still runs on aux). The pattern searched elsewhere:
+   dbstat had the same bug (`INSERT INTO aux.o SELECT name FROM
+   dbstat` listed aux's b-trees), fixed by the same rule.
+2. **IN and OR on the check tables' hidden arguments** (wrong answer;
+   `VtSrc::in_mask`, `Statement::vtab_in`). `arg IN ('t')`, `arg = 't'
+   OR arg = 'u'`, `arg IN (SELECT ...)` and `schema IN (...)` returned
+   no rows. They are now the pin's IN constraint: offered to
+   xBestIndex as `=` and, when the module uses the argument, one filter
+   per value — distinct, sorted, NULLs dropped, NUMERIC affinity (the
+   `HIDDEN` type's) applied, as the pin's ephemeral IN index; a written
+   one-item list is the pin's `=` (`IN (NULL)` checks every database);
+   several IN arguments nest with the first outermost; an OR of `=` on
+   one argument is the pin's OR-to-IN. A later filter's error comes
+   after the earlier rows (`arg = 't' AND schema IN ('main', 'temp')`
+   is `ok`, then "no such table: temp.t"). Same pattern found and fixed
+   for generate_series (`step IN (1, 2)` ignored the list: `1,2,3`
+   where the pin gives `1,2,3,1,3`); the plan's index number now shows
+   the IN argument (`0x7`). EXPLAIN QUERY PLAN also shows the
+   subqueries in a table-valued function's arguments (an IN argument's
+   `LIST SUBQUERY`, without a Bloom filter; `generate_series((SELECT
+   1), 3)`'s `SCALAR SUBQUERY 1`, which hipp never showed).
+3. **TEMP views' column names in hipp-cli** (`names.rs`). A TEMP view
+   the temp database cannot plan — over a pragma check table, or over
+   main's tables — was headed `column1`, ...; the shell now names it
+   from the view's text (column list, aliases, `*` over the function's
+   columns), as the pin does. The EXPLAIN QUERY PLAN difference in the
+   finding (a co-routine where the pin flattens) is the flattener's
+   recorded limit for every table-valued function (`(SELECT * FROM
+   generate_series(1, 3))` too: "bodies over a virtual table,
+   table-valued function ..." in the flattening section), left open.
+4. **Corrupt checks under readers that stop** (`whole`). A check read
+   whole (EXISTS, a scalar subquery, its LIMIT / OFFSET) failed with
+   the corruption error; a reader that has the rows it needs before the
+   error now never meets it, as on the pin (`SELECT EXISTS (SELECT 1
+   FROM pragma_quick_check)` is `1`, the scalar form `*** in database
+   aux ***`). The check returns its error with its rows
+   (`integrity_tvf`'s result), not through `deferred`.
+5. **The check's table lookup** (`integrity_tvf`). The pin's
+   `sqlite3FindTable`: `sqlite_master` / `sqlite_schema` in every
+   database, `sqlite_temp_master` / `sqlite_temp_schema` only in temp,
+   otherwise a catalog table or view. `('sqlite_master', 'temp')` was
+   "no such table" and `('sqlite_temp_master', 'main')`,
+   `('sqlite_sequence')`, `('sqlite_foo')`, `('pragma_foo')` were
+   checked (main's `main_has` takes every `sqlite_` / `pragma_` name);
+   a TEMP or attached view (`('tv')`, `('av')`) is now `ok` as on the
+   pin (it errored: the temp / attached connection's plain PRAGMA
+   refuses a view).
+6. **EXPLAIN QUERY PLAN of attached / TEMP writes reading views**
+   (missing test): not fixed — recorded below, with a test of the plans
+   of such writes that read another database's tables directly.
+7. **The TEMP database opened by an unqualified check**: a main
+   table's check (`pragma_quick_check('t')`), and one naming no table,
+   now open it as the pin's lookup does (`pragma_database_list` lists
+   `temp` afterwards); a `schema` argument still leaves it closed.
+
+**Found while probing (fixed, ungated `sql`).** A view over
+`pragma_table_list` (`CREATE VIEW v2 AS SELECT * FROM
+pragma_table_list; SELECT * FROM v2`, or a TEMP one) overflowed the
+stack: table_list's column count of a view plans the view, which lists
+the tables again. `Connection::listing` breaks the cycle (the inner
+listing's count is 0 and discarded), giving the pin's rows (`v2`
+counts 6 columns).
+
+**Oracle-probing notes** (live pin, one-shot and stdin): with
+`PRAGMA trusted_schema=1` the pin answers `INSERT INTO aux.o SELECT
+name FROM pv` (a main view over `pragma_table_info('m')`) with `x`, `y`;
+its shell's default refuses it ("unsafe use of virtual table"); `aux.
+pragma_table_info('m')` and `main.pragma_table_info('m')` ignore the
+qualifier; `pragma_table_info('only')` finds `aux.only`. IN on the
+check: `pragmaVtabBestIndex` takes any `=` constraint (IN is one) and
+sets no idxNum, so the plan stays `INDEX 0:`; `arg IN ('u', 't', 'u')`
+gives `t`, `u`; `IN ('u', NULL)` gives `u`; `IN (NULL)` gives `||ok`
+(parse.y makes a one-item list `=`), `IN (NULL, NULL)` and `IN (SELECT
+NULL)` nothing; `IN (3, '2')` gives 2 then 3 and `generate_series(1,
+4) WHERE step IN (3, '2')` gives step 2's rows first (`HIDDEN` is a
+type name of NUMERIC affinity); `step IN (1, 2) AND stop IN (2, 3)`
+uses the call's `stop` (the later constraint wins); `IN (1, 't')` is
+"no such table: 1" before `t`'s row. Corrupt file: EXISTS `1`, scalar
+`*** in database aux ***`, `LIMIT 1 OFFSET 1` `wrong # of entries in
+index uy`, all without the error. Schema tables: `('sqlite_master',
+'temp')` ok, `('sqlite_temp_master', 'main')` "no such table:
+main.sqlite_temp_master", `('sqlite_temp_master', 'aux')` "no such
+table: aux.sqlite_temp_master", `('sqlite_sequence')` "no such table";
+`pragma_quick_check('zz')` (no such table) still opens temp; `('t',
+'nodb')` does not. A TEMP view over `pragma_table_list` counts itself
+6 columns.
+
+**Tests.** `tests/stmt_txn_v17.rs` (9 new tests, against the pin):
+`pragma_functions_beside_attached_tables` (28 statements: queries main
+now answers, attached writes their own database answers, dbstat,
+generate_series, TEMP writes), `pragma_functions_in_attached_writes_refused`
+(10 writes: hipp refuses, the pin answers, nothing is written),
+`in_arguments_of_table_functions` (51 queries each with its plan: IN,
+OR, subqueries, NULLs, affinity, duplicates, LEFT JOIN and lateral
+lists, EXISTS / scalar readers, NOT IN, generate_series' three
+arguments), `generated_in_arguments` (xorshift64 corpus of IN / OR /
+`=` lists over `arg`, `schema` and generate_series arguments; 60
+statements, `HIPP_STX_CORPUS=1500` ran clean), `integrity_tvf_schema_tables`
+(13 names x 4 forms), `integrity_tvf_opens_temp` (8 forms),
+`integrity_tvf_corrupt_readers_that_stop` (the corrupt file: EXISTS,
+scalar, OFFSET, IN arguments), `temp_views_over_pragma_tables`
+(including the table_list cycle), `cross_database_write_plans`.
+`hipp-cli/tests/cli_v17_stmt_txn.rs`: `temp_view_headers_and_in_arguments`
+(byte-identical with `.headers on`). Every suite also passes under
+`--features vm`.
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed. `tests/depth_tiny_v16.rs`, `tests/depth_v16.rs` and
+`tests/triggers_v16.rs` with debug info on, with and without
+`--features vm`: pass (the IN loop is a boxed future off
+`vtab_open`'s path).
+
+**Size Δ** (against 38e4c53's ratchets). tiny 0 (76,928); full +8
+(496,684 → 496,692: the `listing` guard); max +3,896 (997,308 →
+1,001,204); xl +3,856 (1,100,792 → 1,104,648). The max growth is the
+IN loop (`vtab_in`, the candidate in `plan_vtab_cons`, `in_mask`),
+`fn_loc`, the check's lookup and TEMP open, `whole` / `defer`, and the
+EXPLAIN argument subqueries. Offset taken: `vtab_whole` folded into
+`vtab_rows` (the IN path made them one); a merged IN / OR candidate
+builder measured 64 B larger and was dropped. Ratchets raised to the
+measured figures with justifications in `ci/size-ratchet.toml`; the
+owner must approve the raises before they are pushed.
+
+**Honest gaps.**
+- An attached or TEMP write reading a pragma function or dbstat that
+  another database answers is refused (the pin answers; the function's
+  rows cannot be handed over as an external source).
+- A TEMP view the temp database cannot plan (over main's tables or a
+  pragma check table) still fails `PRAGMA temp.table_info(tv)` and
+  counts 0 columns in `pragma_table_list` (the pin: its columns); only
+  the shell's headers were fixed.
+- On a corrupt file, a compound arm (`SELECT 'x' UNION ALL SELECT *
+  FROM pragma_quick_check`) or the right side of a RIGHT JOIN reading
+  a check fails without the rows the pin prints before the error.
+- EXPLAIN QUERY PLAN of an attached / TEMP write reading another
+  database's view: the view stays a co-routine over `SCAN main.m` (the
+  written-in qualifier shows, the table is read whole: an external
+  source), so its subqueries are numbered one higher (`CORRELATED
+  SCALAR SUBQUERY 2`) where the pin flattens the view and searches `m`.
+  `EXPLAIN QUERY PLAN` of a TEMP write fed by main (`INSERT INTO tt
+  SELECT x, y FROM m`) prints no plan (v0.16).
+- IN on a visible column of generate_series (`value IN (...)`) and on
+  other modules' arguments (json_each, dbstat, rtree, fts5) is still a
+  filter after the scan (the pin's plan numbers differ, `0x83`; rows
+  agree).
+- The other pragma tables' hidden `arg` / `schema` columns (v0.16).
+
 ### Parity: order_eqp — ORDER BY / LIMIT wrong answers and EXPLAIN QUERY PLAN differences (2026-11-22)
 
 Wave 21's second unit (owner decision 2026-11-22: SQLite 3.54.1
@@ -414,6 +580,11 @@ are pushed.
   body, not the inner one, in EXPLAIN QUERY PLAN.
 - Virtual tables' EXISTS-to-join and join order beside a compound
   subquery (probed above; unchanged for every module).
+- (Review: pragma functions in routed statements, IN / OR on the check
+  tables' arguments, TEMP views' headers, readers that stop before a
+  corrupt check's error, the schema-table lookup and the TEMP open are
+  closed in v0.17: stmt_txn review fixes; the cross-database view
+  writes' plans are recorded there.)
 
 ### Parity: shell — review fixes (2026-11-20)
 

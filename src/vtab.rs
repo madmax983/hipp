@@ -174,6 +174,12 @@ pub struct VtSrc {
     /// Table-valued-function arguments written (they bind to the
     /// hidden columns, in order).
     pub nargs: usize,
+    /// The filter arguments (bit k: argument k) that are an `IN` list
+    /// or subquery, or an OR of `=` on one column (v0.17 review fix,
+    /// `pragma_*_check` and generate_series): one filter per
+    /// combination of their distinct, sorted, non-NULL values, the
+    /// first argument's outermost (the pin's IN loops; were ignored).
+    pub in_mask: u8,
     /// Whether the statement reads the table's content columns (the
     /// pin's `colUsed`; leaf `fts5`: a missing external-content row
     /// is an error only then).
