@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 495,308 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 995,268 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,098,688 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 496,684 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 997,308 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,100,792 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,21 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **ORDER BY / LIMIT answers and plan lines as the pin's** (unit
+  `order_eqp`, ungated; the IN-index read under `planner`). DISTINCT
+  under an ORDER BY an index delivers in part stops at the LIMIT's
+  distinct rows (a DISTINCT ordered by its own result columns is the
+  pin's GROUP BY and sorts every row); `x IN (SELECT col FROM t ORDER
+  BY ...)` reads the rowid or an index of `col` in place of the
+  subquery, never running its ORDER BY; `LIMIT +1` in a scalar /
+  EXISTS subquery takes no UNION-with-LIMIT-1 shortcut, and such a
+  subquery is planned for the LIMIT the pin leaves it (an EXISTS with
+  no ORDER BY); a WHERE `col = x` over a FROM subquery delivers an
+  ORDER BY on `col`; EXPLAIN QUERY PLAN shows the IN operator's Bloom
+  filters where the pin writes the set's rows, a merged VALUES core's
+  sorter and `SCAN 1 CONSTANT ROW` for a chain under a LIMIT. Still
+  open: the compound merge's lazy arms, the LIKE optimisation,
+  compound flattening and co-routine join order (STATUS.md).
 - **Reads across databases hipp refused or read whole** (unit
   `stmt_txn`, leaf `attach`; the pragma tables also need `vtab`).
   `pragma_integrity_check` / `pragma_quick_check` are table-valued

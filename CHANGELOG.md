@@ -5,6 +5,27 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### ORDER BY / LIMIT wrong answers and EXPLAIN QUERY PLAN differences (wave 21, unit `order_eqp`)
+
+- DISTINCT under an ORDER BY an index delivers in part stops after the
+  LIMIT's distinct rows, as the pin's sorter does; a DISTINCT whose
+  ORDER BY repeats its result columns sorts every row (the pin's GROUP
+  BY rewrite). `same_expr` compares CASE and LIKE.
+- `x IN (SELECT col FROM tbl ORDER BY ...)` where the rowid or an
+  index serves `col` no longer runs the subquery's ORDER BY (`planner`;
+  an index loop's probes need a UNIQUE index, as on the pin).
+- A signed `LIMIT +1` in a scalar / EXISTS subquery takes no
+  UNION-with-LIMIT-1 shortcut. A scalar / EXISTS subquery is planned
+  for its implicit LIMIT 1 or a bare written 1, any other LIMIT as
+  none (the pin's `X <> 0`); an EXISTS is planned with no ORDER BY.
+- A lone FROM subquery delivers ORDER BY columns its reader's WHERE
+  fixes (`=`, `IS`, one-item `IN`, `IS NULL`), then its own order.
+- EXPLAIN QUERY PLAN: the IN operator's `CREATE BLOOM FILTER` lines
+  per compound arm, merge output and VALUES chain row, none under a
+  sorter, before a DISTINCT's temp b-tree; a merged VALUES core's
+  sorter; `SCAN 1 CONSTANT ROW` for a chain under a scalar / EXISTS.
+- Sizes: tiny 76,928 (Δ 0); full 496,684 (+1,376); max 997,308 (+2,040); xl 1,100,792 (+2,104). Ratchets raised to the measured figures (no offsetting saving found); the tiny profile holds none of this code.
+
 ### Reads across databases: pragma_integrity_check, views in attached writes, WITHOUT ROWID seeks (wave 21, unit `stmt_txn`)
 
 - `pragma_integrity_check` / `pragma_quick_check` as table-valued

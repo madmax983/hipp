@@ -11,6 +11,191 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: order_eqp — ORDER BY / LIMIT wrong answers and EXPLAIN QUERY PLAN differences (2026-11-22)
+
+Wave 21's second unit (owner decision 2026-11-22: SQLite 3.54.1
+parity continues): the twelve ORDER BY / LIMIT and EXPLAIN QUERY PLAN
+honest gaps `order_offset`, `values_chain`, `result_gaps` and
+`gaps_plan_cli` recorded, each probed on the live pin first (notes
+below). Items 2, 3, 5, 8 (its WHERE half) and 12 are fixed, item 6's
+`ORDER BY b, 1` half was already right; items 1, 4, 6 (IS NOT NULL
+under a LIMIT), 7, 8 (join half), 9, 10 and 11 stay open with the
+evidence below. Ungated fixes on claimed paths (ADR 0001: `sql`, the
+planning-LIMIT rule under `expr_index`, the IN-index read under
+`planner`, the plan lines under `explain`); no new leaf.
+
+**Shipped.**
+1. **DISTINCT under an ORDER BY an index delivers in part stops at its
+   LIMIT** (item 2; `TopN::distinct`, `pre_skip`): the pin's distinct
+   table drops a repeated row before `pushOntoSorter` sees it, so the
+   prefix-group stop (`TopN::part`, `OP_IfNot iLimit`) counts distinct
+   rows; hipp computed every row (`SELECT DISTINCT b, X FROM t WHERE
+   b>=0 ORDER BY b, a LIMIT 2` failed where the pin answers). A
+   DISTINCT whose ORDER BY repeats its result columns in order is the
+   pin's GROUP BY (`sqlite3ExprListCompare(sSort.pOrderBy, pEList)`,
+   direction ignored) and sorts every row: no stop there.
+   `query::same_expr` now compares CASE and LIKE as the pin's
+   `sqlite3ExprCompare` does (an ORDER BY CASE equal to a result
+   column is that column, as `resolveOrderByTermToExprList` matches).
+2. **`x IN (SELECT col FROM tbl ORDER BY ...)` reads the index or the
+   rowid in place of the subquery** (item 3; `planner`:
+   `xindex::in_index_pick`, now shared by EXPLAIN QUERY PLAN's `USING
+   INDEX i FOR IN-OPERATOR` and `SubKind::In`, which carries the left
+   operand): when the pin's `sqlite3FindInIndex` would read the table,
+   the subquery runs without its ORDER BY, which the pin never codes
+   (`2 IN (SELECT c FROM t ORDER BY abs(-9223372036854775808))` over
+   an index on `c` is 1). An index loop's probes (`DEST_PROBE`) need
+   the pin's UNIQUE index of exactly those columns (`mustBeUnique`):
+   `o.rowid IN (SELECT c ...)` over a non-unique index still runs it,
+   and fails, as on the pin.
+3. **A signed LIMIT in a scalar / EXISTS subquery** (item 5; parser
+   `lim_signed`): its UNION-with-LIMIT-1 shortcut wants a bare integer
+   token (decimal or hex, parentheses allowed); `+1`, `++1`, `-(-1)`
+   folded into the literal took it. Such a LIMIT keeps a `+` node.
+   Found on the way: **a scalar / EXISTS subquery is planned for the
+   LIMIT `sqlite3CodeSubselect` leaves it** (`expr_index`): its
+   implicit 1 or a written bare 1 is a constant LIMIT for the planner,
+   any other `X` became `X <> 0`, which is none (hipp planned `LIMIT 2`
+   as 2 and the implicit LIMIT as none, so `SELECT (SELECT a FROM t
+   ORDER BY b, a LIMIT 2)` sorted where the pin reads an index on `b`,
+   and failed where it answers); an EXISTS is planned with no ORDER BY
+   or DISTINCT (`IgnorableOrderby` runs before the planner).
+4. **A WHERE equality on a FROM subquery's column delivers an ORDER BY
+   on it** (item 8, first half; `sub_sat`, `where_fixed`; EXPLAIN
+   QUERY PLAN only, rows were right): the pin's
+   `wherePathSatisfiesOrderBy` marks an ORDER BY column a WHERE term
+   `col = x`, `col IS x`, `col IN (x)` or `col IS NULL` fixes (x
+   reading no column of the source; a subquery or `random()` is fine;
+   the comparison's collation must be the term's), then matches the
+   co-routine's own ORDER BY from the first unfixed term
+   (`wherePathMatchSubqueryOB`): `... WHERE c = 3 ORDER BY c` has no
+   sorter, `ORDER BY c, d` is `LAST TERM OF ORDER BY`, and with the
+   subquery ordered by `d` neither sorts.
+5. **VALUES-chain and IN-operator plan lines** (item 12; `explain`):
+   the IN operator's `CREATE BLOOM FILTER` is shown where the pin's
+   `selectInnerLoop` / merge output routine writes the set's rows
+   (`Walk::blooms`): one per core of a UNION ALL compound (under its
+   arm), two under a UNION / UNION ALL merge and one under INTERSECT /
+   EXCEPT (the merge that writes the set, not one that yields to
+   another), one per row of a VALUES chain, none under a sorter of the
+   subquery's ORDER BY (it was shown) and before a `USE TEMP B-TREE
+   FOR DISTINCT` line; a merged multi-row VALUES core shows its sorter
+   (`USE TEMP B-TREE FOR ORDER BY`, hipp read its width as 0); a
+   VALUES chain under a scalar / EXISTS LIMIT is `SCAN 1 CONSTANT ROW`
+   (`multiSelectValues`'s `bShowAll`).
+
+**Not built (evidence).**
+- Item 1, the compound merge's lazy arms: the pin codes each arm as a
+  co-routine and its output routine stops at the LIMIT
+  (`multiSelectOrderBy`: `OP_DecrJumpZero` in
+  `generateOutputSubroutine`; arms pulled A then B, A<B outputs A,
+  A==B advances A for UNION, EXCEPT / INTERSECT stop at A's end
+  without reading B, a chain of the same operator past three arms is
+  split in the middle by `SQLITE_BalancedMerge`). hipp computes every
+  arm whole: `SELECT b, X FROM t UNION SELECT 9,9 ORDER BY 1 LIMIT 1`
+  over an index on b still fails. Matching it needs a pull-driven
+  merge over arms that stop where their delivered order allows (and
+  rows before an error, which the pin's shell prints); beyond this
+  unit's size line.
+- Item 4: the pin's `sqlite3WalkSelect` visits a compound's cores from
+  the last to the first, assigning their FROM cursors as it goes, so
+  `SELECT 1 WHERE 1 IN (999 refs) UNION ALL SELECT 1 FROM u` fails
+  there only; hipp's expander walks cores first to last and its copy
+  numbering (EXPLAIN QUERY PLAN's select numbers) depends on that
+  order. UPDATE ... RETURNING's extra cursors are unmodelled.
+- Item 6: `ORDER BY b, 1` (`b` result column 1) is `LAST TERM OF ORDER
+  BY` on the pin as in hipp (probed: no gap). `WHERE b IS NOT NULL`
+  is an index range in hipp too; under a LIMIT the cost comparison
+  differs (`... WHERE b IS NOT NULL ORDER BY b, a LIMIT 5`: the pin
+  searches the index, hipp scans; `AND a > 0` the other way) — about
+  one in six generated shapes, EQP and the partial-order stop.
+- Items 7, 8 (join half) and 10: flattening a compound FROM subquery
+  into its reader (`COMPOUND QUERY` / `MERGE` at the top, also with a
+  join in each arm), a co-routine's place in the join order and its
+  automatic index / Bloom filter, and the push-down of a term whose
+  other column constant propagation fixes (`t2.x = 5 AND s.c = t2.x`
+  over a GROUP BY subquery: no group sorter on the pin) are planner
+  structure, not lines; each is a unit of its own.
+- Item 9, the LIKE optimisation (`z LIKE 'a'` as `z>? AND z<?` on a
+  NOCASE index, `rowid>? AND rowid<?`): needs virtual range terms
+  (`isLikeOrGlob`: the upper-cased / lower-cased prefix bounds, the
+  numeric-prefix refusal for non-TEXT columns) in the term builder and
+  their seek; not taken for size.
+- Item 11, the automatic index's key order for a LEFT JOIN made inner
+  by a propagated constant (`ON d.x = 1 ... WHERE d.x = d.y`: the pin
+  `(x=? AND y=?)`, hipp `(y=? AND x=?)`; `WHERE d.y = d.x` is `(y=? AND
+  x=?)` on both): the pin's term order there was not derived.
+
+**Oracle-probing notes** (live 3.54.1 pin; scripts over stdin and
+EXPLAIN / EXPLAIN QUERY PLAN). Item 2: rows `(1,0),(7,0),(1,0),(3,1),
+(5,1),(9,2),(4,3)`, index on b, a=9 failing: `SELECT DISTINCT b, X ...
+WHERE b>=0 ORDER BY b, a` LIMIT 1 / 2 answer, LIMIT 3 prints the two
+rows of group 0 then fails, LIMIT 1 OFFSET 2 fails; `ORDER BY b, 2
+DESC` (the result list) fails at every LIMIT: its bytecode is a GROUP
+BY sorter (`SorterSort ... GROUP BY sort`). A scalar subquery's
+`SELECT DISTINCT X ... ORDER BY b, X LIMIT 2` reads the index there
+(`X <> 0` is no constant LIMIT) and answers 6. Item 3: `IN (SELECT
+rowid ...)`, an index on a TEXT `b` with an integer left side, an INT
+`c` with a text left side, NOCASE `d` with `'Y'` (index `d`) and `'Y'
+COLLATE BINARY` (index `d COLLATE BINARY, e`), a UNIQUE `e` read by an
+index loop: no error; `(... a ...)` with no index, `('y',2) IN (SELECT
+d, e ...)`, `o.rowid IN (SELECT c ...)` over a non-unique `c`: the
+ORDER BY runs and fails. Item 5: in a scalar subquery `LIMIT 1`,
+`(1)`, `01`, `0x1`, `0x01` take the shortcut, `+1`, `++1`, `-(-1)`,
+`'1'`, `1.0`, `1_0/10` do not; elsewhere (IN, FROM, top level) signs
+are allowed. Planning: `SELECT (SELECT a FROM t ORDER BY b, a)` sorts,
+`LIMIT 2` / `LIMIT +1` / `LIMIT 3 OFFSET 1` / `LIMIT 0` / `LIMIT '1'`
+read the index, `LIMIT 1` / `0x1` / `(1)` sort. Item 8: `c = 3`, `3 =
+c`, `c IS 3`, `c IN (3)`, `c = random()`, `c = (SELECT 1)`, `c IS NULL`
+fix `c`; `+c = 3`, `c = d`, `c = 3 OR c = 4`, a NOCASE ORDER BY over a
+BINARY `=` do not. Item 12: `x IN (SELECT a FROM t UNION ALL SELECT b
+FROM t)` has a filter under each arm, `UNION` two after `RIGHT`,
+`EXCEPT` / `INTERSECT` one, `A UNION B UNION ALL C` two on the merge
+and one under `UNION ALL`, `(VALUES (1),(random()))` two, `ORDER BY c`
+none, `DISTINCT` the filter before its temp b-tree; `SELECT (VALUES
+(1),(random()))` is `SCAN 1 CONSTANT ROW`; `VALUES (1),(2) UNION
+VALUES (3),(4)` sorts both arms.
+
+**Tests.** `tests/order_eqp_v17.rs` (9 tests): the LIMIT-1 shortcut
+over 15 LIMIT forms in six contexts, the first-row planning LIMIT over
+13 forms, DISTINCT partial order (fixed scripts and 160 generated
+cases over three index shapes and five wrappers), the IN-index read
+(27 fixed and 140 generated: WITHOUT ROWID, collations, affinities,
+UNIQUE probes, row values), WHERE-fixed co-routine order (66 fixed and
+200 generated, views included) and 87 Bloom-filter / VALUES plans;
+rows and plans are the pin's. `hipp-cli/tests/cli_v17_order_eqp.rs`
+(3 tests): the same shapes byte for byte (the rows the frozen VM
+handles itself checked off the VM).
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed (its `--features vm` suite included); `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and `tests/triggers_v16.rs` with debug info, with and without `--features vm`: pass, no `STACK_*` change (the IN-index read's plan copy is boxed, so the recursive subquery future keeps its size).
+
+Size Δ: tiny 76,928 (Δ 0); full 496,684 (+1,376); max 997,308 (+2,040); xl 1,100,792 (+2,104). Ratchets raised to the measured figures (no offsetting saving found); the tiny profile holds none of this code.
+
+Honest gaps:
+- The items above under "Not built".
+- A partly delivered co-routine order (`LAST TERM OF ORDER BY` over a
+  FROM subquery) still defers a row's columns under a top-N sorter
+  (the pin loads each row first there, `nOBSat`); and the IN-index
+  read is the main database's (an attached or TEMP table's subquery
+  still runs its ORDER BY). Both found here, not built.
+- A row value IN probing an index on its first column (`(x, y) IN
+  (SELECT ...)` over an index on `x`: the pin's vector IN loop, `LIST
+  SUBQUERY` twice) is planned as a scan in hipp, so a failing ORDER BY
+  there fails in hipp only (pre-existing, found by the corpus).
+- A covering-index choice under a sorter (`SELECT b COLLATE NOCASE
+  FROM t ORDER BY 1` over indexes on `b` and `(c, b)`: the pin reads
+  `b`'s, hipp `(c, b)`'s) and a DISTINCT that the pin plans as its
+  GROUP BY (`SELECT DISTINCT b, a%2 FROM t ORDER BY b, 2 DESC`: the
+  pin scans the index on `b`) are pre-existing plan differences the
+  corpora found; the generated DISTINCT corpus compares plans only
+  with a WHERE.
+- Rows before an error: the pin's shell prints a statement's rows up
+  to its error (`LIMIT 3` above); hipp computes a sorted query whole
+  first and prints only the error. Unchanged (the error agrees).
+- The frozen VM (hidden `vm`, no profile; ADR 0005 / 0007) keeps its
+  own DISTINCT, sorter and IN handling; the library suite runs on
+  today's executor under `vm`, the CLI suite checks those rows off it.
+
 ### Parity: stmt_txn — reads across databases: pragma_integrity_check, views in attached writes, WITHOUT ROWID seeks (2026-11-22)
 
 Wave 21's unit (owner decision 2026-11-22: SQLite 3.54.1 parity
@@ -932,13 +1117,15 @@ new leaf.
   a lazy merge is beyond this unit). Also DISTINCT under a partly
   delivered ORDER BY: the pin stops after the LIMIT's distinct rows,
   hipp computes every row (its projections keep duplicates until the
-  end, so counting there gave too few rows when tried).
+  end, so counting there gave too few rows when tried). (DISTINCT
+  closed in v0.17: order_eqp.)
 - Finding 6 (pre-existing, unrecorded until now): `x IN (SELECT col
   FROM tbl ORDER BY <failing>)` where an index or the rowid covers
   `col` — the pin reads the index (`sqlite3FindInIndex`) and never runs
   the subquery or its ORDER BY; hipp runs it and fails. EQP's
   `in_index` already models the choice; executing it needs the
-  catalog at the IN's evaluation (left open). Also pre-existing:
+  catalog at the IN's evaluation (left open). (closed in v0.17:
+  order_eqp, under `planner`) Also pre-existing:
   `SELECT * FROM w, s ORDER BY a, abs(-9223372036854775808)` (w WITHOUT
   ROWID in a join) answers in hipp where the pin fails (`LAST TERM OF
   ORDER BY`).
@@ -989,6 +1176,7 @@ increments are gone.
 **Honest gaps.**
 - `LIMIT +1` in a scalar / EXISTS subquery takes the shortcut in hipp
   (its parser folds the sign into the literal) and not on the pin.
+  (closed in v0.17: order_eqp)
 - The cursor count follows hipp's walk, which reads a compound's cores
   left to right (the pin's rightmost first: `SELECT 1 WHERE 1 IN (999
   refs) UNION ALL SELECT 1 FROM u` fails on the pin only) and an
@@ -997,12 +1185,16 @@ increments are gone.
   on the pin before its RETURNING expressions (990 references fail
   there).
 - The compound merge's lazy arms, DISTINCT under a partly delivered
-  ORDER BY, and the IN-index read (see "Not fixed").
+  ORDER BY, and the IN-index read (see "Not fixed"). (DISTINCT and the
+  IN-index read closed in v0.17: order_eqp; the lazy arms stay open.)
 - Found by the partial-order corpus (pre-existing planner gaps): `WHERE
   b IS NOT NULL` is no index range in hipp (the pin: `SEARCH t USING
   INDEX tbd (b>?)`), so a top-N over it sorts every row; and an ORDER
   BY term naming a delivered column again by ordinal (`ORDER BY b, 1`
-  with `b` result column 1) is not seen as delivered.
+  with `b` result column 1) is not seen as delivered. (Probed by
+  order_eqp: `ORDER BY b, 1` sorts its last term on the pin too, and
+  `b IS NOT NULL` is a range in hipp; only the cost under a LIMIT
+  still differs — open.)
 
 ### Parity: result_gaps — result-level wrong answers left by wave 18 (2026-11-18)
 
@@ -1818,7 +2010,8 @@ Honest gaps the review fixes leave (new or found on the way):
   `SCALAR SUBQUERY` per arm (hipp shows the co-routine); chain plans
   under a scalar / EXISTS LIMIT 1 (`SCAN 1 CONSTANT ROW`), an IN
   list's bloom filters, a UNION's sorter on its left arm (review
-  finding 10, not taken: EQP only).
+  finding 10, not taken: EQP only). (The chain plans, Bloom filters
+  and VALUES sorters closed in v0.17: order_eqp.)
 
 ### Parity: order_offset — ORDER BY / OFFSET result divergences (2026-11-17)
 
@@ -2269,6 +2462,7 @@ and could not take the lone-table one).
   earlier table's access path (`t JOIN (sub) ON t.k = 1` scans `t`,
   the pin searches it), and a WHERE equality on a co-routine column
   does not satisfy an ORDER BY on it (hipp adds a sorter). EQP only.
+  (The WHERE equality closed in v0.17: order_eqp.)
 - The LIKE optimisation (`z LIKE 'a'` as `z>? AND z<?` on a NOCASE
   index, or the rowid) is not modelled (pre-existing).
 - A merged member whose item has no collation, with none to its left,

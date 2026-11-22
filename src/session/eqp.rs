@@ -471,31 +471,11 @@ fn last_sel(p: &SubPlan) -> u32 {
     p.compound.as_slice().last().map_or(p.sel, |(_, t)| t.sel)
 }
 
-/// The left operand's elements of `x IN (SELECT ...)` (one, or a
-/// row value's), each with the result column it compares with.
-fn in_pairs<'x>(x: &'x RExpr, p: &'x SubPlan) -> AVec<(&'x RExpr, Option<&'x RExpr>)> {
-    let core = p.compound.as_slice().last().map_or(p, |(_, t)| t);
-    let items: &[RExpr] = match core.values.as_slice().first() {
-        Some(r) if core.items.is_empty() => r.as_slice(),
-        _ => core.items.as_slice(),
-    };
-    let mut out = AVec::new();
-    match x {
-        RExpr::Scalar(crate::query::ScalarFn::Vector, xs) => {
-            for (i, e) in xs.iter().enumerate() {
-                out.push((e, items.get(i)));
-            }
-        }
-        _ => out.push((x, items.first())),
-    }
-    out
-}
-
 /// Whether every comparison of `x IN (SELECT ...)` is BINARY: the pin
 /// builds the IN operator's Bloom filter only then (probed: a NOCASE
 /// left column, or `x COLLATE NOCASE IN (...)`, has none).
 fn in_binary(x: &RExpr, p: &SubPlan) -> bool {
-    in_pairs(x, p).iter().all(|(l, r)| {
+    crate::query::in_pairs(x, p).iter().all(|(l, r)| {
         let c = match r {
             Some(r) => crate::query::binary_coll(l, r),
             None => crate::query::expr_coll(l).unwrap_or_default(),
@@ -525,6 +505,9 @@ pub(super) struct Walk<'a> {
     /// The subqueries being shown are an index loop's IN probes (no
     /// Bloom filter of the IN operator; v0.17).
     probing: bool,
+    /// The select shown next fills an IN operator's set that has a
+    /// Bloom filter (v0.17 `order_eqp`; `blooms`).
+    bloom: bool,
     /// The statement's own catalog, then (v0.17, `attach`) the TEMP
     /// database's and each attached database's, in main's numbering
     /// (`Connection::src_db`), and each external source's database:
@@ -553,6 +536,7 @@ impl<'a> Walk<'a> {
             mats: AVec::new(),
             update_from: false,
             probing: false,
+            bloom: false,
             #[cfg(feature = "attach")]
             dbs: AVec::new(),
             #[cfg(feature = "attach")]
@@ -637,29 +621,38 @@ impl<'a> Walk<'a> {
     }
 
     fn select(&mut self, s: &Sel<'_>, parent: i64) {
+        let bloom = core::mem::take(&mut self.bloom);
         for e in s.limit.iter().chain(s.offset.iter()) {
             self.exprs(core::slice::from_ref(*e), parent, &[]);
         }
         let n = s.cores.len();
         if n == 1 {
             if let Some((_, c)) = s.cores.as_slice().first() {
+                let from = self.rows.len();
                 self.core(c, parent, true);
+                self.blooms(bloom, parent, from, 1);
             }
             return;
         }
         // A VALUES chain of one-row selects throughout is one line
-        // (the pin's `multiSelectValues`, v0.17).
+        // (the pin's `multiSelectValues`, v0.17), of one row under a
+        // LIMIT (a scalar / EXISTS subquery's: its `bShowAll`).
         if s.cores
             .iter()
             .all(|(op, c)| c.vchain && *op == CompoundOp::UnionAll)
         {
-            self.add_n(parent, b"SCAN ", n as u32, b" CONSTANT ROWS");
+            if s.limit.is_some() {
+                self.add(parent, &[b"SCAN 1 CONSTANT ROW"]);
+            } else {
+                self.add_n(parent, b"SCAN ", n as u32, b" CONSTANT ROWS");
+            }
             for (_, c) in s.cores.iter() {
                 self.shown(c.sel);
                 for r in c.values.iter() {
                     self.exprs(r.as_slice(), parent, &[]);
                 }
             }
+            self.blooms(bloom, parent, self.rows.len(), n);
             return;
         }
         // The pin merges the compound up to its last operator other
@@ -674,12 +667,51 @@ impl<'a> Walk<'a> {
                 .rposition(|(op, _)| *op != CompoundOp::UnionAll)
                 .unwrap_or(0)
         };
-        self.chain(s, n - 1, last, parent);
+        self.chain(s, (n - 1, bloom), last, parent);
+    }
+
+    /// The IN operator's Bloom filter lines under `parent` (`bloom`:
+    /// the select fills one; v0.17): the pin's `CREATE BLOOM FILTER`
+    /// once per place that writes the set's rows as they come — `n`
+    /// one-row selects, a core's loop (not under a sorter of its ORDER
+    /// BY: the sorted rows are written without the filter), or a
+    /// merge's output routines (two for UNION / UNION ALL, one for
+    /// INTERSECT / EXCEPT).
+    fn blooms(&mut self, bloom: bool, parent: i64, from: usize, n: usize) {
+        let sorted = self.rows.as_slice().get(from..).is_some_and(|r| {
+            r.iter().any(|(_, p, d)| {
+                *p == parent
+                    && d.as_slice().starts_with(b"USE TEMP B-TREE FOR")
+                    && d.as_slice().ends_with(b"ORDER BY")
+            })
+        });
+        if !bloom || sorted {
+            return;
+        }
+        // (A DISTINCT's temp b-tree line comes after the loop is
+        // coded, the filter's inside it: the filter goes first.)
+        let last = self.rows.as_mut_slice().last_mut();
+        let distinct: &[u8] = b"USE TEMP B-TREE FOR DISTINCT";
+        let moved = match last {
+            Some((_, p, d)) if *p == parent && d.as_slice() == distinct => {
+                d.clear();
+                d.extend_from_slice(b"CREATE BLOOM FILTER");
+                true
+            }
+            _ => false,
+        };
+        for _ in usize::from(moved)..n {
+            self.add(parent, &[b"CREATE BLOOM FILTER"]);
+        }
+        if moved {
+            self.add(parent, &[distinct]);
+        }
     }
 
     /// Cores `0..=k` of a compound; returns the parent its later
-    /// members go under.
-    fn chain(&mut self, s: &Sel<'_>, k: usize, last: usize, parent: i64) -> i64 {
+    /// members go under. `bloom`: the compound fills an IN operator's
+    /// set with a Bloom filter (`blooms`).
+    fn chain(&mut self, s: &Sel<'_>, (k, bloom): (usize, bool), last: usize, parent: i64) -> i64 {
         let Some((op, c)) = s.cores.as_slice().get(k) else {
             return parent;
         };
@@ -714,32 +746,47 @@ impl<'a> Walk<'a> {
                     self.merge_sort(c0, l, klen);
                 }
                 _ => {
-                    self.chain(s, k - 1, last, l);
+                    // (A merge on the left yields to this one.)
+                    self.chain(s, (k - 1, false), last, l);
                 }
             }
             let r = self.add(m, &[b"RIGHT"]);
             self.core(c, r, false);
             self.merge_sort(c, r, klen);
+            let outs = match op {
+                CompoundOp::Union | CompoundOp::UnionAll => 2,
+                _ => 1,
+            };
+            self.blooms(bloom && k == last, m, self.rows.len(), outs);
             return parent;
         }
         let up = if k == 1 {
             let h = self.add(parent, &[b"COMPOUND QUERY"]);
             let l = self.add(h, &[b"LEFT-MOST SUBQUERY"]);
             if let Some((_, c0)) = s.cores.as_slice().first() {
+                let from = self.rows.len();
                 self.core(c0, l, true);
+                self.blooms(bloom, l, from, 1);
             }
             h
         } else {
-            self.chain(s, k - 1, last, parent)
+            self.chain(s, (k - 1, bloom), last, parent)
         };
         let u = self.add(up, &[name]);
+        let from = self.rows.len();
         self.core(c, u, true);
+        self.blooms(bloom, u, from, 1);
         up
     }
 
     /// A merged compound member's sort (hipp sorts each member).
     fn merge_sort(&mut self, c: &Core<'_>, parent: i64, klen: usize) {
-        let klen = klen.min(c.items.len());
+        // (A VALUES core's width is its rows'.)
+        let width = match c.values.first() {
+            Some(r) if c.items.is_empty() => r.len(),
+            _ => c.items.len(),
+        };
+        let klen = klen.min(width);
         // (An aggregate without GROUP BY is one row: v0.17 fix.)
         if (c.values.len() <= 1 && c.sources.is_empty()) || (c.has_agg && c.group_by.is_empty()) {
             return;
@@ -1714,138 +1761,27 @@ impl<'a> Walk<'a> {
 
     #[cfg(feature = "planner")]
     fn in_index(&self, x: &RExpr, p: &SubPlan) -> Option<AVec<u8>> {
-        use crate::record::Affinity;
-        if !p.uncorrelated
-            || !p.compound.is_empty()
-            || !p.values.is_empty()
-            || p.filter.is_some()
-            || !p.group_by.is_empty()
-            || p.having.is_some()
-            || p.has_agg
-            || p.limit.is_some()
-            || p.sources.len() != 1
-            || (self.probing && matches!(x, RExpr::Literal(_)))
-        {
-            return None;
-        }
-        let sp = p.sources.as_slice().first()?;
-        // (A table of another database read in place, v0.17 `attach`:
-        // `in_index_of` describes it with its own catalog.)
-        #[cfg(feature = "attach")]
-        let foreign = sp.temp && sp.root <= 1;
-        #[cfg(not(feature = "attach"))]
-        let foreign = sp.temp;
-        if sp.derived.is_some() || sp.rec != 0 || foreign {
-            return None;
-        }
-        #[cfg(any(feature = "json", feature = "vtab"))]
-        if sp.tvf != 0 {
-            return None;
-        }
-        // (A FROM subquery or view the flattener merged is still one
-        // on the pin.)
-        if !p.view_names.is_empty() {
-            return None;
-        }
-        let t = self.cat.tables.iter().find(|t| t.root == sp.root)?;
-        // Each result column's table column (`None`: the rowid).
-        let mut cols: AVec<Option<usize>> = AVec::new();
-        for it in p.items.iter() {
-            cols.push(match it {
-                RExpr::Rowid(_) if t.has_rowid() => None,
-                RExpr::Column(slot, ..) => {
-                    let c = slot.checked_sub(sp.eqp.base)?;
-                    if c >= sp.ncols {
-                        return None;
-                    }
-                    if t.has_rowid() && sp.rowid_alias == Some(c) {
-                        None
-                    } else {
-                        Some(c)
-                    }
-                }
-                _ => return None,
-            });
-        }
-        let pairs = in_pairs(x, p);
-        if pairs.len() != cols.len() {
-            return None;
-        }
-        let name = handle_bytes(self.ca, t.name);
+        let (t, ix) = super::xindex::in_index_pick(
+            self.cat,
+            self.ca,
+            x,
+            p,
+            (self.probing, p.sources.as_slice().first()?.eqp.base),
+        )?;
         let mut line = AVec::new();
-        if let [None] = cols.as_slice() {
-            line.extend_from_slice(b"USING ROWID SEARCH ON TABLE ");
-            line.extend_from_slice(name);
-            line.extend_from_slice(b" FOR IN-OPERATOR");
-            return Some(line);
-        }
-        let numeric =
-            |a: Affinity| matches!(a, Affinity::Numeric | Affinity::Integer | Affinity::Real);
-        for ((l, _), c) in pairs.iter().zip(cols.iter()) {
-            let c = (*c)?;
-            let idx = sp.affs.as_slice().get(c).copied().unwrap_or(Affinity::Blob);
-            if crate::query::item_result_affinity(l).is_some_and(numeric) && !numeric(idx) {
-                return None;
+        match ix {
+            None => {
+                line.extend_from_slice(b"USING ROWID SEARCH ON TABLE ");
+                line.extend_from_slice(handle_bytes(self.ca, t.name));
+                line.extend_from_slice(b" FOR IN-OPERATOR");
             }
-        }
-        let pk = self.pk_of(t);
-        let ixs: AVec<&crate::schema::IndexDef> = self.cat.indexes_for(self.ca, name).collect();
-        for ix in ixs.iter().rev() {
-            // (An index loop's probes need a UNIQUE index of exactly
-            // those columns: the pin's `mustBeUnique`.)
-            if ix.partial() || (self.probing && (ix.columns.len() != cols.len() || !ix.unique)) {
-                continue;
-            }
-            // The entry's columns: the key, then (a WITHOUT ROWID
-            // table's secondary index) the PRIMARY KEY columns it lacks.
-            let mut ent: AVec<(Option<usize>, crate::record::Coll)> = AVec::new();
-            for (i, k) in ix.columns.iter().enumerate() {
-                let expr = ix
-                    .ext
-                    .as_ref()
-                    .is_some_and(|e| e.exprs.as_slice().get(i).is_some_and(|e| e.is_some()));
-                ent.push((k.col.filter(|_| !expr), k.coll));
-            }
-            if !clustered(ix)
-                && let Some(pk) = pk
-            {
-                for k in pk.columns.iter() {
-                    if !ix.columns.iter().any(|x| x.col == k.col) {
-                        ent.push((k.col, k.coll));
-                    }
-                }
-            }
-            let Some(lead) = ent.as_slice().get(..cols.len()) else {
-                continue;
-            };
-            let mut used: AVec<bool> = lead.iter().map(|_| false).collect();
-            let ok = pairs.iter().zip(cols.iter()).all(|((l, r), c)| {
-                let coll = match r {
-                    Some(r) => crate::query::binary_coll(l, r),
-                    None => crate::query::expr_coll(l).unwrap_or_default(),
-                };
-                let at = lead.iter().enumerate().position(|(j, (k, kc))| {
-                    *k == *c
-                        && k.is_some()
-                        && *kc == coll
-                        && !used.as_slice().get(j).copied().unwrap_or(true)
-                });
-                match at.and_then(|j| used.as_mut_slice().get_mut(j)) {
-                    Some(u) => {
-                        *u = true;
-                        true
-                    }
-                    None => false,
-                }
-            });
-            if ok {
+            Some(ix) => {
                 line.extend_from_slice(b"USING INDEX ");
                 line.extend_from_slice(handle_bytes(self.ca, ix.name));
                 line.extend_from_slice(b" FOR IN-OPERATOR");
-                return Some(line);
             }
         }
-        None
+        Some(line)
     }
 
     /// A WITHOUT ROWID table's clustered PRIMARY KEY index.
@@ -1986,21 +1922,17 @@ impl<'a> Walk<'a> {
             num(&mut d, u64::from(n), false);
             let id = self.add(parent, &[d.as_slice()]);
             let probing = core::mem::replace(&mut self.probing, false);
-            self.select_sub(p, id);
-            self.probing = probing;
             // The IN operator's Bloom filter over an uncorrelated
             // subquery's values, unless an index loop probes with
-            // them (v0.17 fix; a compound's are not shown), or the
-            // comparison is not BINARY (v0.17 review fix).
-            if list
+            // them (v0.17 fix), or the comparison is not BINARY (v0.17
+            // review fix); shown where its rows are written (`blooms`).
+            self.bloom = list
                 && p.uncorrelated
                 && !probing
-                && p.compound.is_empty()
-                && let RExpr::InSub(x, ..) = e
-                && in_binary(x, p)
-            {
-                self.add(id, &[b"CREATE BLOOM FILTER"]);
-            }
+                && matches!(e, RExpr::InSub(x, ..) if in_binary(x, p));
+            self.select_sub(p, id);
+            self.bloom = false;
+            self.probing = probing;
         }
     }
 

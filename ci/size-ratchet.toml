@@ -130,7 +130,13 @@ justify_over = 4096
 # 495,460 -> 495,308 (v0.17 stmt_txn; STATUS.md): -152 B. One view-text
 # splitter (`view_head`) and one identifier quoter (`alter::quoted`)
 # shared by the TEMP router's rewrites.
-ratchet = 495308
+# 495,308 -> 496,684 (v0.17 order_eqp, ungated correctness; STATUS.md):
+# +1,376 B. DISTINCT under a partly delivered ORDER BY stops at its
+# LIMIT (`TopN::distinct`), a signed scalar LIMIT takes no shortcut
+# (`lim_signed`), `same_expr` compares CASE / LIKE, a FROM subquery
+# delivers WHERE-fixed ORDER BY columns (`sub_sat`, `where_fixed`).
+# No offsetting saving found.
+ratchet = 496684
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -247,7 +253,11 @@ justify_over = 16384
 # other databases' views written in as CTEs for attached / TEMP writes
 # (~2.7 KB), integrity_check's per-database runs (`run_kept`), attached
 # WITHOUT ROWID handles cleared per statement; offset -152 B.
-ratchet = 995268
+# 995,268 -> 997,308 (v0.17 order_eqp, ungated correctness; STATUS.md):
+# +2,040 B, the `full` growth plus a scalar / EXISTS subquery planned
+# for the pin's LIMIT (`expr_index`) and the IN operator's Bloom filter
+# / VALUES plan lines (`explain`, `Walk::blooms`).
+ratchet = 997308
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -351,7 +361,10 @@ justify_over = 32768
 # 1,093,244 -> 1,098,688 (v0.17 stmt_txn, `attach` leaf; STATUS.md):
 # +5,444 B, the `max` growth (the flattener's LIMIT re-check, ungated in
 # `planner`, is within it: a LIMIT under a merged WHERE lost its order).
-ratchet = 1098688
+# 1,098,688 -> 1,100,792 (v0.17 order_eqp; STATUS.md): +2,104 B, the
+# `max` growth plus the IN operator reading its table's index in place
+# of the subquery (`planner`: `in_index_pick` shared with EQP).
+ratchet = 1100792
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

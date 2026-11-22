@@ -333,7 +333,10 @@ impl<S: Storage> Statement<'_, S> {
                 (0, 0),
                 (window.0, window.0.saturating_add(window.1)),
             );
-            Mode::Sort(AVec::new(), TopN::new(top.2))
+            Mode::Sort(
+                AVec::new(),
+                TopN::new(top.2).distinct(qp.distinct, qp.items.as_slice()),
+            )
         } else if qp.distinct {
             Mode::Distinct(AVec::new())
         } else {
