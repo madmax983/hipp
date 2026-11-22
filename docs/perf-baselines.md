@@ -548,3 +548,37 @@ dhat (n=1000): 429,827 -> 411,365 blocks (-4.30%), 106,617,844 ->
 
 Size gates on that base: tiny unchanged; full +400 B, max +632 B,
 xl +632 B; ratchets set to the measured figures.
+
+## Leaf rewrites copy every cell one by one (baseline at b3e4a59)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every table
+INSERT that fits its leaf builds the new image in
+`build_leaf_image_inserted` (a zeroed 4 KiB allocation, then one
+`copy_from_slice` -- an out-of-line `memcpy` -- and one out-of-line
+`put_be_u16` per cell), and every index entry that fits its leaf is
+written by `write_index_leaf_inserted` (inlined into
+`index_insert_core`: `fill(0)` of the whole frame, then the same
+per-cell copy and pointer store). The cells of a page hipp wrote lie
+back to back, so all but the inserted cell are copied as one or two
+contiguous runs.
+
+| n    | total Ir      |
+|------|---------------|
+| 500  | 175,007,039   |
+| 1000 | 417,778,543   |
+| 2000 | 1,063,680,749 |
+
+n=1000 profile: `build_leaf_image_inserted` inclusive 22,507,977
+(5.39%; 1,996 calls, ~11.3k Ir per call, of which its zeroed
+allocation 8,937,365); `write_index_leaf_inserted` (inlined, 1,986
+calls) 20,920,914 on its own lines plus the frame `fill(0)` memset
+8,168,418 (together 29,089,332, 6.96%; `put_be_u16` 4,489,824 for
+561,228 out-of-line calls, `padded_cell_len` 2,236,968 for 559,242).
+Top self costs: memset 6.45%, memcpy 6.32%, `_int_free` 5.60%,
+`_int_malloc` 4.82%, `index_insert_core` 4.73%, `index_search_raw`
+4.54%, malloc 3.93%, `decode_varint` 2.92%, free 2.55%,
+`leaf_cells_meta` 1.51%. dhat (n=1000): 411,367 blocks, 104,014,629
+bytes; t-gmax 854,004 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
