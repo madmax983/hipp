@@ -11,6 +11,129 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: order_eqp — review fixes (2026-11-22)
+
+Five review findings on `order_eqp` (38e4c53), each reproduced and
+probed on the live 3.54.1 pin first; built on the `stmt_txn` review
+fixes (571ed2c). All ungated fixes on claimed paths (the IN reads under
+`planner`, the plan line under `sql` / `explain`); no new leaf.
+
+**Fixed.**
+1. **A row-value IN the pin runs as a vector IN loop** (regression,
+   `planner`; `Connection::mark_in_loops`, `SubPlan::in_loop`). `(y, x)
+   IN (SELECT c, b FROM t ORDER BY X)` with an index on `o(y)` (or
+   `o(x)`, or the outer rowid) is the pin's IN loop on that index:
+   `removeUnindexableInClauseTerms` keeps the fields the index uses and
+   `sqlite3FindInIndex(IN_INDEX_LOOP)` reads them from the subquery's
+   table only through an index unique over them (`mustBeUnique`:
+   `nKeyCol` at most that many, `nColumn` too unless UNIQUE); otherwise
+   the subquery runs, its ORDER BY included, and fails. 38e4c53's
+   IN-index read skipped that ORDER BY (it found `t(c, b)` for the
+   membership test) and answered. Each core's WHERE AND terms are now
+   marked at plan time: the fields on the rowid of one of the core's
+   tables, else the longest run of an index's leading columns, then
+   `in_index_pick` with those fields as an index loop; an UPDATE /
+   DELETE WHERE over its target alike (`mark_target_loops`: the
+   regression reached `DELETE FROM o WHERE (y, x) IN (...)` too). Same
+   for a WITHOUT ROWID subquery table.
+2. **A row value naming the rowid matches an index** (`in_index_pick`).
+   The pin's `sqlite3FindInIndex` matches `XN_ROWID`, the trailing
+   column of every rowid table's index, and the rowid's INTEGER
+   affinity always passes: `(x, y) IN (SELECT a, c FROM t ORDER BY X)`
+   (`a` the INTEGER PRIMARY KEY, a UNIQUE index on `c`) reads `tc`
+   and answers; hipp mapped the rowid to no column and ran the ORDER
+   BY. Also `(x, x) IN (SELECT b, a ...)` over an index on `b`, `(y,
+   x) IN (SELECT c, rowid ...)`, `(x, z) IN (SELECT a, d ...)`. The
+   index loop's uniqueness rule is now the pin's (above) rather than
+   "UNIQUE of exactly those columns".
+3. **A window subquery's ORDER BY delivers nothing** (EXPLAIN QUERY
+   PLAN; `sub_match`). `sqlite3WindowRewrite` deletes a core's ORDER BY
+   when it is a prefix of its outer window's sort (PARTITION BY terms
+   ascending, then the window's ORDER BY, compared with directions and
+   NULLS flags): the reader of `(SELECT c, d, e, row_number() OVER
+   (ORDER BY d) FROM u ORDER BY d LIMIT 6) WHERE c = 3 ORDER BY c, d`
+   shows `LAST TERM OF ORDER BY` (hipp: no sorter after 38e4c53, which
+   counted the WHERE-fixed `c` and then the dropped order), plain
+   `ORDER BY d` keeps its sorter (hipp: none with the LIMIT).
+4. **The DISTINCT-to-GROUP-BY rewrite needs default NULLS placements**
+   (`ob_grp` now shared by `pre_skip` and EXPLAIN QUERY PLAN's
+   `as_group`): an ASC term with NULLS LAST or a DESC one with NULLS
+   FIRST (`KEYINFO_ORDER_BIGNULL`) makes the pin's
+   `sqlite3ExprListCompare` differ, so `SELECT DISTINCT b, X ... ORDER
+   BY b NULLS LAST, 2 LIMIT 2` is a DISTINCT with a partly delivered
+   sorter (`USE TEMP B-TREE FOR LAST TERM OF ORDER BY`) that stops at
+   the LIMIT's distinct rows; plain DESC and `DESC NULLS LAST` are
+   still the GROUP BY.
+5. **A DISTINCT repeat computes no ORDER BY key** (`Statement::keyed`,
+   `keyed_sync`, `win_project_async`; `TopN::dist` is now set for every
+   DISTINCT). The pin's `selectInnerLoop` computes the result columns,
+   drops a repeat (`codeDistinct`), and only then has `pushOntoSorter`
+   compute the ORDER BY key (a term naming a result column copied from
+   it, `ECEL_REF`): `SELECT DISTINCT b FROM t ORDER BY X` answers when
+   the row X fails on repeats an earlier row, at any LIMIT / OFFSET and
+   through FROM / scalar subqueries, GROUP BY and window cores. The
+   callers' own capped-DISTINCT checks and `TopN::push`'s became
+   redundant and are gone (the `full` saving).
+
+**Oracle-probing notes** (live 3.54.1 pin, stdin scripts and EXPLAIN
+QUERY PLAN). Finding 1: `o(x, y)` with no index answers through `tcb`
+(`USING INDEX tcb FOR IN-OPERATOR`); with `ox ON o(x)` it is `SEARCH o
+USING INDEX ox (x=?)`, `LIST SUBQUERY 3` with its sorter, then `USING
+INDEX tcb FOR IN-OPERATOR`, and fails; adding `UNIQUE tb ON t(b)` makes
+the loop `USING INDEX tb FOR IN-OPERATOR` and it answers; `(y, x+0)`
+(no column) is a scan and answers. A generated corpus of 1,260 shapes
+(six outer index sets, five inner, six subqueries, six row values)
+agrees once the data gives the loop rows; with a TEXT `y` whose probes
+find no row the pin never runs the membership subquery (it sits in the
+loop body behind `OP_Once`), a data-dependent difference left open
+below. Finding 3: the pin's window rewrite shows no sorter in the
+window subquery when its ORDER BY repeats the window's, so the core's
+ORDER BY is gone; 1,176 generated window-subquery plans (seven
+windows, seven sub-orders, four WHEREs, six outer orders) agree.
+Finding 4: `ORDER BY b, 2` / `2 DESC` / `2 NULLS FIRST` / `b DESC, 2`
+/ `2 DESC NULLS LAST` show only `USE TEMP B-TREE FOR DISTINCT` (the
+GROUP BY), `b NULLS LAST, 2` and `b, 2 DESC NULLS FIRST` add `LAST TERM
+OF ORDER BY`; 360 generated shapes agree on rows and plans. Finding 5:
+`SELECT DISTINCT c FROM t ORDER BY X` answers when the failing row's
+`c` repeats, fails when it is the first of its value (a=8 vs a=9);
+`DISTINCT b, count(*) ... GROUP BY c ORDER BY <failing on the group>`
+fails on both; `DISTINCT b, row_number() OVER () > 0 ... ORDER BY X`
+answers.
+
+**Tests.** `tests/order_eqp_v17.rs` adds five tests: the vector IN loop
+(2,160 generated shapes over 30 schemas, each as a SELECT and a no-op
+UPDATE, plus WITHOUT ROWID / rowid outer cases; rows), rowid fields (24 shapes, rows and plans), window
+subqueries (10 fixed and 160 generated; rows and plans), the GROUP BY
+rewrite's NULLS rule (108 shapes; rows and plans) and DISTINCT repeats
+(8 fixed and 200 generated across plain, FROM-subquery and scalar
+wrappers; rows). `hipp-cli/tests/cli_v17_order_eqp.rs` adds one
+byte-for-byte test (plans everywhere, rows off the frozen VM).
+
+Gates: `cargo fmt --all`; full `ci/local-gates.sh`: all gates passed
+(its `--features vm` suite included); `tests/depth_v16.rs`,
+`tests/depth_tiny_v16.rs` and `tests/triggers_v16.rs` with debug info,
+with and without `--features vm`: pass, no `STACK_*` change (`keyed`
+is already a boxed future; `Statement::step` / `Connection::prepare`
+are untouched).
+
+Size Δ (against 571ed2c): tiny 76,928 (Δ 0); full 496,508 (-184); max
+1,001,212 (+8); xl 1,105,472 (+824). The `full` saving is the removed
+DISTINCT checks; `xl` carries the vector IN loop marking. Ratchets set
+to the measured figures.
+
+Honest gaps:
+- A vector IN loop whose probes find no row never runs the membership
+  subquery on the pin (it is lazy, inside the loop); hipp scans and
+  runs it, so a failing ORDER BY there fails in hipp only (as before
+  this unit). The pin's choice between the IN loop and a better
+  equality on another index is not modelled (the loop is assumed), nor
+  an outer table in an attached / TEMP database.
+- A vector IN loop is still planned as a scan in EXPLAIN QUERY PLAN.
+- The window subquery's own plan lines differ where the window's sort
+  is partly delivered (`OVER (ORDER BY d, e)` over an index on `d`: the
+  pin's `LAST TERM OF ORDER BY` inside it) or a WHERE on the PARTITION
+  BY column is pushed into it (pre-existing; found by the corpus).
+
 ### Parity: stmt_txn — review fixes (2026-11-22)
 
 Seven review findings on `stmt_txn` (f259a86), each reproduced and
@@ -199,7 +322,8 @@ planning-LIMIT rule under `expr_index`, the IN-index read under
    b>=0 ORDER BY b, a LIMIT 2` failed where the pin answers). A
    DISTINCT whose ORDER BY repeats its result columns in order is the
    pin's GROUP BY (`sqlite3ExprListCompare(sSort.pOrderBy, pEList)`,
-   direction ignored) and sorts every row: no stop there.
+   direction ignored, a NULLS placement off the default not: review
+   fix) and sorts every row: no stop there.
    `query::same_expr` now compares CASE and LIKE as the pin's
    `sqlite3ExprCompare` does (an ORDER BY CASE equal to a result
    column is that column, as `resolveOrderByTermToExprList` matches).
@@ -346,8 +470,11 @@ Honest gaps:
   still runs its ORDER BY). Both found here, not built.
 - A row value IN probing an index on its first column (`(x, y) IN
   (SELECT ...)` over an index on `x`: the pin's vector IN loop, `LIST
-  SUBQUERY` twice) is planned as a scan in hipp, so a failing ORDER BY
-  there fails in hipp only (pre-existing, found by the corpus).
+  SUBQUERY` twice) is planned as a scan in hipp (pre-existing, found by
+  the corpus). (Its rows closed in v0.17: order_eqp review fixes — the
+  loop runs the subquery and its ORDER BY as the pin does, the
+  IN-index read had skipped it; a loop whose probes find no row stays
+  open there.)
 - A covering-index choice under a sorter (`SELECT b COLLATE NOCASE
   FROM t ORDER BY 1` over indexes on `b` and `(c, b)`: the pin reads
   `b`'s, hipp `(c, b)`'s) and a DISTINCT that the pin plans as its

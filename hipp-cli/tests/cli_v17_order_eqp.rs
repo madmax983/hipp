@@ -160,3 +160,39 @@ EXPLAIN QUERY PLAN SELECT c FROM u UNION VALUES (1),(2);
 VALUES (1),(2) UNION VALUES (3),(1);",
     );
 }
+
+/// Review fixes: a row-value IN the pin runs as a vector IN loop (its
+/// ORDER BY runs), one naming the rowid read from an index, a window
+/// subquery's dropped ORDER BY, the DISTINCT-to-GROUP-BY rule's NULLS
+/// placements, and a DISTINCT repeat that computes no ORDER BY key.
+#[test]
+fn review_fixes_render_like_the_pin() {
+    let setup = "CREATE TABLE r(a INTEGER PRIMARY KEY, b, c TEXT, d); CREATE INDEX rb ON r(b);
+CREATE UNIQUE INDEX rc ON r(c);
+INSERT INTO r VALUES(1,1,'x',1),(2,1,'y',1),(3,1,'z',2),(4,2,'w',NULL),(8,3,'p',9),(9,3,'q',9),(10,3,'k',1);
+CREATE TABLE q(x, y); INSERT INTO q VALUES(1,'x'),(2,'y'),(9,'q');
+CREATE TABLE qq(x, y); CREATE INDEX qqy ON qq(y); INSERT INTO qq VALUES(1,'x'),(2,'y'),(9,'q');
+CREATE TABLE v(c INT, d TEXT, e); CREATE INDEX vd ON v(d); INSERT INTO v VALUES(3,'a',1),(3,'b',2),(2,'A',3);";
+    let plans = "EXPLAIN QUERY PLAN SELECT * FROM (SELECT c, d, e, row_number() OVER (ORDER BY d) r FROM v ORDER BY d LIMIT 6) WHERE c = 3 ORDER BY c, d;
+EXPLAIN QUERY PLAN SELECT * FROM (SELECT c, d, e, row_number() OVER (ORDER BY d) r FROM v ORDER BY d LIMIT 6) ORDER BY d;
+EXPLAIN QUERY PLAN SELECT DISTINCT b, a+1 FROM r WHERE b>=0 ORDER BY b NULLS LAST, 2 LIMIT 2;
+EXPLAIN QUERY PLAN SELECT DISTINCT b, a+1 FROM r WHERE b>=0 ORDER BY b, 2 DESC LIMIT 2;
+EXPLAIN QUERY PLAN SELECT x FROM q WHERE (x, y) IN (SELECT a, c FROM r ORDER BY abs(-9223372036854775808));";
+    same("review-eqp", setup, plans);
+    if on_vm() {
+        return;
+    }
+    same(
+        "review-rows",
+        setup,
+        "SELECT x FROM q WHERE (x, y) IN (SELECT a, c FROM r ORDER BY abs(-9223372036854775808));
+SELECT x FROM q WHERE (y, x) IN (SELECT c, rowid FROM r ORDER BY abs(-9223372036854775808));
+SELECT 'loop';
+SELECT x FROM qq WHERE (y, x) IN (SELECT c, b FROM r ORDER BY abs(-9223372036854775808));
+SELECT DISTINCT b, CASE WHEN a=9 THEN abs(-9223372036854775808) ELSE a END FROM r WHERE b>=0 ORDER BY b NULLS LAST, 2 LIMIT 2;
+SELECT DISTINCT b, CASE WHEN a=9 THEN abs(-9223372036854775808) ELSE a END FROM r WHERE b>=0 ORDER BY b, 2 DESC NULLS FIRST LIMIT 2;
+SELECT DISTINCT b FROM r WHERE b>=0 ORDER BY b, CASE WHEN a=9 THEN abs(-9223372036854775808) ELSE a END LIMIT 3;
+SELECT DISTINCT d FROM r ORDER BY CASE WHEN a=9 THEN abs(-9223372036854775808) ELSE a END;
+SELECT * FROM (SELECT c, d, e, row_number() OVER (ORDER BY d) r FROM v ORDER BY d LIMIT 6) WHERE c = 3 ORDER BY c, d;",
+    );
+}

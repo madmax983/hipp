@@ -712,3 +712,294 @@ fn bloom_filters_and_values_plans() {
     let bad = diffs_on(&path, &qs, true);
     assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
 }
+
+// ---------------------------------------------------------------
+// Review fixes (v0.17 `order_eqp`), each probed on the live pin.
+
+/// A row-value IN whose field the reader's index (or rowid) serves is
+/// the pin's vector IN loop (`removeUnindexableInClauseTerms`): it
+/// runs the subquery, its ORDER BY included, unless the loop's fields
+/// read an index unique over them (`sqlite3FindInIndex(IN_INDEX_LOOP)`).
+/// Regression: hipp read the subquery's index and skipped a failing
+/// ORDER BY the pin runs (rows only: hipp plans the loop as a scan,
+/// a recorded gap).
+#[test]
+fn row_value_in_loop_runs_its_subquery() {
+    let outer = [
+        "",
+        "CREATE INDEX oy ON o(y);",
+        "CREATE INDEX ox ON o(x);",
+        "CREATE INDEX oyx ON o(y,x);",
+        "CREATE INDEX oxy ON o(x,y);",
+        "CREATE UNIQUE INDEX oz ON o(z);",
+    ];
+    let inner = [
+        "CREATE INDEX tcb ON t(c,b);",
+        "CREATE UNIQUE INDEX tb ON t(b); CREATE INDEX tcb ON t(c,b);",
+        "CREATE UNIQUE INDEX tc ON t(c);",
+        "CREATE UNIQUE INDEX tcb ON t(c,b);",
+        "CREATE INDEX tbc ON t(b,c); CREATE UNIQUE INDEX td ON t(d);",
+    ];
+    let subs = [
+        "SELECT c, b FROM t",
+        "SELECT b, c FROM t",
+        "SELECT c, a FROM t",
+        "SELECT a, c FROM t",
+        "SELECT b, d FROM t",
+        "SELECT c, rowid FROM t",
+    ];
+    let lefts = [
+        "(y, x)",
+        "(x, y)",
+        "(x, z)",
+        "(z, x)",
+        "(y COLLATE nocase, x)",
+        "(y, x+0)",
+    ];
+    let mut bad = Vec::new();
+    for (k, (oi, ii)) in outer
+        .iter()
+        .flat_map(|o| inner.iter().map(move |i| (o, i)))
+        .enumerate()
+    {
+        let schema = format!(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c TEXT, d); {ii} \
+             INSERT INTO t VALUES(1,1,'x',1),(2,2,'y',2),(3,3,'z',3); \
+             CREATE TABLE o(x, y, z); {oi} \
+             INSERT INTO o VALUES(1,'x',1),(2,'y',2),(5,'q',5),('x',1,'x'),('z','3','z'),(3,3,3);"
+        );
+        let mut qs: Vec<String> = Vec::new();
+        for s in subs {
+            for l in lefts {
+                qs.push(format!("SELECT * FROM o WHERE {l} IN ({s} ORDER BY {BAD})"));
+                // (UPDATE / DELETE plan their WHERE apart; a no-op SET
+                // leaves the file as it was for the pin's run.)
+                qs.push(format!(
+                    "UPDATE o SET x = x WHERE {l} IN ({s} ORDER BY {BAD})"
+                ));
+            }
+        }
+        let path = fresh(&format!("vloop{k}"), &schema);
+        bad.extend(diffs_on(&path, &qs, false));
+    }
+    // The rowid outer table and a WITHOUT ROWID subquery table.
+    let schema = "CREATE TABLE w(j, k, PRIMARY KEY(k, j)) WITHOUT ROWID; \
+                  INSERT INTO w VALUES(1,'x'),(2,'y'); \
+                  CREATE TABLE o2(x INTEGER PRIMARY KEY, y); INSERT INTO o2 VALUES(1,'x'),(3,'z');";
+    let qs: Vec<String> = [
+        "SELECT * FROM o2 WHERE (y, x) IN (SELECT k, j FROM w ORDER BY {BAD})",
+        "SELECT * FROM o2 WHERE (x, y) IN (SELECT j, k FROM w ORDER BY {BAD})",
+        "SELECT * FROM o2 WHERE (rowid, y) IN (SELECT j, k FROM w ORDER BY {BAD})",
+        "SELECT * FROM o2 WHERE (y, x+0) IN (SELECT k, j FROM w ORDER BY {BAD})",
+        "SELECT * FROM o2 WHERE (y, x) IN (SELECT k, j FROM w)",
+    ]
+    .iter()
+    .map(|q| q.replace("{BAD}", BAD))
+    .collect();
+    let path = fresh("vloopw", schema);
+    bad.extend(diffs_on(&path, &qs, false));
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// A row value naming the rowid (or an INTEGER PRIMARY KEY) matches
+/// the trailing rowid of every index of a rowid table, whose INTEGER
+/// affinity always passes (the pin's `XN_ROWID` in
+/// `sqlite3FindInIndex`): the index is read, the ORDER BY never runs.
+#[test]
+fn in_index_reads_rowid_fields() {
+    let schema = "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c TEXT, d); \
+                  CREATE UNIQUE INDEX tc ON t(c); CREATE INDEX tb ON t(b); CREATE UNIQUE INDEX td ON t(d); \
+                  INSERT INTO t VALUES(1,1,'x',1),(2,1,'y',2),(9,3,'q',9); \
+                  CREATE TABLE o(x, y TEXT, z); INSERT INTO o VALUES(1,'x',1),(2,'2',2),(9,'q',9);";
+    let mut qs: Vec<String> = Vec::new();
+    for (l, s) in [
+        ("(x, y)", "a, c"),
+        ("(x, x)", "b, a"),
+        ("(y, x)", "c, a"),
+        ("(x, z)", "a, d"),
+        ("(y, x)", "c, rowid"),
+        ("(y, x)", "c, b"),
+        ("(x, y)", "a, c COLLATE nocase"),
+        ("(y COLLATE nocase, x)", "c, a"),
+        ("(x, y)", "rowid, c"),
+        ("(z, x)", "d, a"),
+        ("(x, z)", "a, b"),
+        ("(z, x, y)", "d, a, c"),
+    ] {
+        qs.push(format!(
+            "SELECT x FROM o WHERE {l} IN (SELECT {s} FROM t ORDER BY {BAD})"
+        ));
+        qs.push(format!(
+            "SELECT {l} IN (SELECT {s} FROM t ORDER BY {BAD}) FROM o"
+        ));
+    }
+    let path = fresh("inrowid", schema);
+    let bad = diffs_on(&path, &qs, true);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// A window core whose ORDER BY starts its outer window's sort has no
+/// ORDER BY on the pin (`sqlite3WindowRewrite` drops it): its reader
+/// sorts, even for the columns its WHERE fixes (regression: hipp took
+/// the window subquery's order as delivered after a WHERE-fixed term).
+#[test]
+fn window_subquery_order_is_not_delivered() {
+    let schema = "CREATE TABLE u(c INT, d TEXT, e); CREATE INDEX ud ON u(d); \
+                  INSERT INTO u VALUES(3,'a',1),(3,'b',2),(2,'A',3),(NULL,'c',4),(3,NULL,5);";
+    let mut qs: Vec<String> = Vec::new();
+    let w0 = "SELECT c, d, e, row_number() OVER (ORDER BY d) r FROM u ORDER BY d LIMIT 6";
+    for tail in [
+        "WHERE c = 3 ORDER BY c, d",
+        "WHERE c = 3 ORDER BY d, c",
+        "WHERE c = '3' ORDER BY c, d",
+        "WHERE c = 3.0 ORDER BY c, d",
+        "WHERE c = 3 ORDER BY 1, 2",
+        "WHERE c = 3 ORDER BY c NULLS LAST, d",
+        "WHERE e = 5 ORDER BY e, d",
+        "WHERE c = 3 AND e > 1 ORDER BY c, d, e",
+        "ORDER BY d",
+        "WHERE c = 3 ORDER BY c",
+    ] {
+        qs.push(format!("SELECT * FROM ({w0}) {tail}"));
+    }
+    let wins = [
+        "OVER (ORDER BY d)",
+        "OVER (ORDER BY d DESC)",
+        "OVER ()",
+        "OVER (ORDER BY e)",
+        "OVER (ORDER BY d NULLS LAST)",
+        "OVER (PARTITION BY d)",
+        "OVER (PARTITION BY e ORDER BY d)",
+    ];
+    let subo = [
+        "ORDER BY d",
+        "ORDER BY d DESC",
+        "ORDER BY c, d",
+        "ORDER BY e",
+        "ORDER BY d NULLS LAST",
+        "ORDER BY d, e",
+        "",
+    ];
+    let wh = ["", "WHERE c = 3", "WHERE e = 2", "WHERE d = 'a'"];
+    let oo = [
+        "ORDER BY d",
+        "ORDER BY c, d",
+        "ORDER BY d, c",
+        "ORDER BY e, d",
+        "ORDER BY d DESC",
+        "ORDER BY 1, 2",
+    ];
+    let mut rng = Rng(0x5eed_0e17);
+    for _ in 0..160 {
+        qs.push(format!(
+            "SELECT * FROM (SELECT c, d, e, row_number() {} r FROM u {} LIMIT 6) {} {}",
+            rng.pick(&wins),
+            rng.pick(&subo),
+            rng.pick(&wh),
+            rng.pick(&oo)
+        ));
+    }
+    let path = fresh("winsub", schema);
+    let bad = diffs_on(&path, &qs, true);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// A DISTINCT whose ORDER BY repeats its result columns becomes the
+/// pin's GROUP BY only with default NULLS placements (`KEYINFO_ORDER_
+/// BIGNULL` makes `sqlite3ExprListCompare` differ; directions do not):
+/// otherwise its sorter takes the partly delivered ORDER BY and stops
+/// at the LIMIT's distinct rows.
+#[test]
+fn distinct_group_rewrite_needs_default_nulls() {
+    let schema = "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c TEXT, d); CREATE INDEX tb ON t(b); \
+                  INSERT INTO t VALUES(1,1,'x',1),(2,1,'x',1),(3,1,'y',2),(4,2,'z',NULL),(5,2,'z',NULL),\
+                  (6,2,NULL,3),(7,NULL,'w',3),(8,3,'q',9),(9,3,'q',9),(10,3,'X',1),(11,4,'k',1);";
+    let dirs = [
+        "",
+        " DESC",
+        " NULLS FIRST",
+        " NULLS LAST",
+        " DESC NULLS FIRST",
+        " DESC NULLS LAST",
+    ];
+    let mut qs: Vec<String> = Vec::new();
+    for d1 in dirs {
+        for d2 in dirs {
+            for l in ["LIMIT 1", "LIMIT 2", "LIMIT 1 OFFSET 1"] {
+                qs.push(format!(
+                    "SELECT DISTINCT b, {X} FROM t WHERE b>=0 ORDER BY b{d1}, 2{d2} {l}"
+                ));
+            }
+        }
+    }
+    let path = fresh("dgroup", schema);
+    let bad = diffs_on(&path, &qs, true);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// The pin's distinct table drops a repeated row before its sorter
+/// computes the ORDER BY key (`codeDistinct` ahead of `pushOntoSorter`;
+/// a key term naming a result column is copied from it): an ORDER BY
+/// term outside the result list is never computed for a repeat, in
+/// every executor path (plain, grouped, window, subquery).
+#[test]
+fn distinct_drops_repeats_before_order_keys() {
+    let schema = "CREATE TABLE t(a INTEGER PRIMARY KEY, b, c TEXT, d); CREATE INDEX tb ON t(b); \
+                  INSERT INTO t VALUES(1,1,'x',1),(2,1,'x',1),(3,1,'y',2),(4,2,'z',NULL),(5,2,'z',NULL),\
+                  (6,2,NULL,3),(7,NULL,'w',3),(8,3,'q',9),(9,3,'q',9),(10,3,'X',1),(11,4,'k',1);";
+    let mut qs: Vec<String> = Vec::new();
+    for q in [
+        format!("SELECT DISTINCT b FROM t WHERE b>=0 ORDER BY b, {X} LIMIT 3"),
+        format!("SELECT DISTINCT b FROM t ORDER BY {X}"),
+        format!("SELECT DISTINCT c FROM t ORDER BY {X}"),
+        format!(
+            "SELECT DISTINCT c FROM t ORDER BY {}",
+            X.replace("a=9", "a=8")
+        ),
+        format!(
+            "SELECT DISTINCT b, count(*) FROM t GROUP BY c ORDER BY CASE WHEN max(a)=9 THEN {BAD} ELSE 1 END"
+        ),
+        format!("SELECT DISTINCT b, row_number() OVER () > 0 FROM t ORDER BY {X}"),
+        format!("SELECT DISTINCT b, (SELECT 1) FROM t ORDER BY {X}"),
+        format!("SELECT DISTINCT b FROM t ORDER BY CASE WHEN a=9 THEN {BAD} ELSE (SELECT a) END"),
+    ] {
+        qs.push(q);
+    }
+    let sels = ["b", "c", "b, d", "d", "c COLLATE nocase", "b, c"];
+    let obs = [
+        format!("b, {X}"),
+        X.to_string(),
+        format!("{X} DESC"),
+        format!("b DESC, {X}"),
+        format!("1, {X}"),
+        format!("{X}, 1"),
+    ];
+    let obs: Vec<&str> = obs.iter().map(|s| s.as_str()).collect();
+    let wheres = ["WHERE b>=0", "", "WHERE a>0"];
+    let lims = [
+        "LIMIT 1",
+        "LIMIT 2",
+        "LIMIT 3",
+        "LIMIT -1",
+        "LIMIT 2 OFFSET 1",
+        "",
+    ];
+    let mut rng = Rng(0x0d15_71c7);
+    for _ in 0..200 {
+        let q = format!(
+            "SELECT DISTINCT {} FROM t {} ORDER BY {} {}",
+            rng.pick(&sels),
+            rng.pick(&wheres),
+            rng.pick(&obs),
+            rng.pick(&lims)
+        );
+        match rng.n(4) {
+            0 => qs.push(format!("SELECT * FROM ({q})")),
+            1 => qs.push(format!("SELECT (SELECT count(*) FROM ({q}))")),
+            _ => qs.push(q),
+        }
+    }
+    let path = fresh("dkeys", schema);
+    let bad = diffs_on(&path, &qs, false);
+    assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+}

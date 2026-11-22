@@ -466,6 +466,8 @@ impl<S: Storage> Connection<S> {
             lazy: false,
             #[cfg(feature = "planner")]
             grp: 0,
+            #[cfg(feature = "planner")]
+            in_loop: false,
         };
         let vname = if own { copy_vec(n) } else { AVec::new() };
         plans.push(SourcePlan {

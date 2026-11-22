@@ -102,6 +102,8 @@ impl<S: Storage> Connection<S> {
             lazy: false,
             #[cfg(feature = "planner")]
             grp: 0,
+            #[cfg(feature = "planner")]
+            in_loop: false,
         };
         plans.push(SourcePlan {
             #[cfg(feature = "explain")]

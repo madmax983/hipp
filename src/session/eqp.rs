@@ -1329,16 +1329,10 @@ impl<'a> Walk<'a> {
             self.agg_lines(aggs, parent);
         }
         // The pin turns a DISTINCT whose ORDER BY is its result list
-        // (any directions) into a GROUP BY, which then delivers the
-        // ORDER BY.
-        let as_group = c.distinct
-            && !c.has_agg
-            && c.group_by.is_empty()
-            && c.order_by.len() == c.items.len()
-            && c.order_by
-                .iter()
-                .zip(c.items.iter())
-                .all(|((o, _), i)| crate::query::same_expr(o, i));
+        // (any directions, default NULLS placements: `ob_grp`) into a
+        // GROUP BY, which then delivers the ORDER BY.
+        let as_group =
+            c.distinct && !c.has_agg && c.group_by.is_empty() && super::ob_grp(c.items, c.order_by);
         // DISTINCT: delivered by the loop when the planner was given
         // it (no ORDER BY, no aggregate) or found the loop brings equal
         // rows together, or redundant (a rowid among the result columns
@@ -1781,7 +1775,7 @@ impl<'a> Walk<'a> {
             self.ca,
             x,
             p,
-            (self.probing, p.sources.as_slice().first()?.eqp.base),
+            (self.probing, p.sources.as_slice().first()?.eqp.base, &[]),
         )?;
         let mut line = AVec::new();
         match ix {

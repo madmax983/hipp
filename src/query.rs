@@ -1227,6 +1227,12 @@ pub struct SubPlan {
     pub lazy: bool,
     #[cfg(feature = "planner")]
     pub grp: u32,
+    /// An IN subquery the pin runs for a vector IN loop on its
+    /// reader's index (v0.17 review fix, `planner`;
+    /// `Connection::mark_in_loops`): never read from its table in
+    /// place (`xindex::in_index_pick`), its ORDER BY runs.
+    #[cfg(feature = "planner")]
+    pub in_loop: bool,
 }
 
 impl SubPlan {

@@ -583,6 +583,8 @@ fn placeholder(id: usize) -> SubPlan {
         lazy: false,
         #[cfg(feature = "planner")]
         grp: 0,
+        #[cfg(feature = "planner")]
+        in_loop: false,
     }
 }
 

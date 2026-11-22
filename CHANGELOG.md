@@ -5,6 +5,28 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Review fixes: ORDER BY / LIMIT answers and plan lines (wave 21, unit `order_eqp`)
+
+- Regression fix (`planner`): a row-value IN whose field the reader's
+  index or rowid serves is the pin's vector IN loop, which runs the
+  subquery, its ORDER BY included, unless the loop's fields read an
+  index unique over them; hipp read the subquery's index and answered
+  where the pin fails.
+- A row value naming the subquery table's rowid (or INTEGER PRIMARY
+  KEY) matches the trailing rowid of its indexes: the index is read and
+  the ORDER BY never runs, as on the pin.
+- A window FROM subquery whose ORDER BY starts its window's sort has
+  none on the pin (`sqlite3WindowRewrite`): its reader keeps its sorter
+  (EXPLAIN QUERY PLAN showed none after a WHERE-fixed column).
+- A DISTINCT ordered by its result columns is the pin's GROUP BY only
+  with default NULLS placements: `ORDER BY b NULLS LAST, 2` now stops
+  at the LIMIT's distinct rows and shows its sorter line.
+- A DISTINCT repeat no longer computes its ORDER BY key (the pin drops
+  it first): `SELECT DISTINCT b FROM t ORDER BY <failing expr>` answers
+  when the failing row repeats an earlier one, in every executor path.
+- Sizes: tiny 76,928 (Δ 0); full 496,508 (-184); max 1,001,212 (+8);
+  xl 1,105,472 (+824). Ratchets set to the measured figures.
+
 ### Review fixes: reads across databases (wave 21, unit `stmt_txn`)
 
 - A table-valued pragma function (or dbstat) in a statement naming an

@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 496,692 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 1,001,204 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,104,648 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 496,508 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,001,212 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,105,472 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -72,14 +72,18 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 - **ORDER BY / LIMIT answers and plan lines as the pin's** (unit
   `order_eqp`, ungated; the IN-index read under `planner`). DISTINCT
   under an ORDER BY an index delivers in part stops at the LIMIT's
-  distinct rows (a DISTINCT ordered by its own result columns is the
-  pin's GROUP BY and sorts every row); `x IN (SELECT col FROM t ORDER
-  BY ...)` reads the rowid or an index of `col` in place of the
-  subquery, never running its ORDER BY; `LIMIT +1` in a scalar /
+  distinct rows (a DISTINCT ordered by its own result columns, with
+  default NULLS placements, is the pin's GROUP BY and sorts every row),
+  and a DISTINCT repeat computes no ORDER BY key; `x IN (SELECT col
+  FROM t ORDER BY ...)` reads the rowid or an index of `col` in place
+  of the subquery (row values naming the rowid too), never running its
+  ORDER BY, while a row-value IN on the reader's index runs it as the
+  pin's vector IN loop does; `LIMIT +1` in a scalar /
   EXISTS subquery takes no UNION-with-LIMIT-1 shortcut, and such a
   subquery is planned for the LIMIT the pin leaves it (an EXISTS with
   no ORDER BY); a WHERE `col = x` over a FROM subquery delivers an
-  ORDER BY on `col`; EXPLAIN QUERY PLAN shows the IN operator's Bloom
+  ORDER BY on `col` (a window subquery's ORDER BY delivers nothing);
+  EXPLAIN QUERY PLAN shows the IN operator's Bloom
   filters where the pin writes the set's rows, a merged VALUES core's
   sorter and `SCAN 1 CONSTANT ROW` for a chain under a LIMIT. Still
   open: the compound merge's lazy arms, the LIKE optimisation,
