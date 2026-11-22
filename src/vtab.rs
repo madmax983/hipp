@@ -77,6 +77,13 @@ pub enum Module {
     /// `fts5vocab` (leaf `fts5`).
     #[cfg(feature = "fts5")]
     Fts5Vocab,
+    /// `pragma_integrity_check` (`quick: false`) and
+    /// `pragma_quick_check` (v0.17, with `attach`): the pin's
+    /// eponymous pragma virtual tables, whose filter runs the check
+    /// (`PRAGMA "schema".integrity_check('arg')`). Hidden columns
+    /// `arg` (always a table name) and `schema`.
+    #[cfg(feature = "attach")]
+    Pragma { quick: bool },
 }
 
 /// The internal name `rtreecheck()` calls resolve to (a FROM source
@@ -338,6 +345,12 @@ impl Module {
             } else if eq(name, b"fts5vocab") {
                 return Some(Module::Fts5Vocab);
             }
+            #[cfg(feature = "attach")]
+            if eq(name, b"pragma_integrity_check") {
+                return Some(Module::Pragma { quick: false });
+            } else if eq(name, b"pragma_quick_check") {
+                return Some(Module::Pragma { quick: true });
+            }
             None
         }
     }
@@ -448,6 +461,19 @@ impl Vtab for Module {
                 tab.cols.push(VCol::new(b"a", b"", true));
                 tab.cols.push(VCol::new(b"b", b"", true));
             }
+            // The pin's `pragmaVtabConnect`: the pragma's result column
+            // (named after the pragma), then `arg` and `schema` HIDDEN.
+            #[cfg(feature = "attach")]
+            Module::Pragma { quick } => {
+                let n: &[u8] = if *quick {
+                    b"quick_check"
+                } else {
+                    b"integrity_check"
+                };
+                tab.cols.push(VCol::new(n, b"", false));
+                tab.cols.push(VCol::new(b"arg", b"", true));
+                tab.cols.push(VCol::new(b"schema", b"", true));
+            }
         }
         Ok(tab)
     }
@@ -486,6 +512,8 @@ impl Vtab for Module {
                 }
                 Ok(())
             }
+            #[cfg(feature = "attach")]
+            Module::Pragma { .. } => pragma_best_index(info),
         }
     }
 
@@ -498,6 +526,8 @@ impl Vtab for Module {
             Module::Rtree { .. } => false,
             #[cfg(feature = "fts5")]
             Module::Fts5 | Module::Fts5Vocab => false,
+            #[cfg(feature = "attach")]
+            Module::Pragma { .. } => true,
         }
     }
 
@@ -540,6 +570,39 @@ impl Vtab for Module {
         let _ = suffix;
         false
     }
+}
+
+/// The pin's `pragmaVtabBestIndex`: an `=` on `arg` (column 1) and
+/// then on `schema` (column 2) become the filter's two arguments, both
+/// omitted; an unusable `=` on either makes the plan unusable; without
+/// one on `arg`, `schema`'s is not used either. idxNum stays 0.
+#[cfg(feature = "attach")]
+fn pragma_best_index(info: &mut IndexInfo) -> Result<(), BestErr> {
+    let mut seen = [None, None];
+    for (i, c) in info.cons.iter().enumerate() {
+        if c.col < 1 || c.op != Op::Eq {
+            continue;
+        }
+        if !c.usable {
+            return Err(BestErr::Unusable);
+        }
+        if let Some(s) = seen.get_mut((c.col - 1) as usize) {
+            *s = Some(i);
+        }
+    }
+    info.cost = 1.0;
+    let Some(a) = seen[0] else {
+        info.cost = 2_147_483_647.0;
+        info.rows = 2_147_483_647;
+        return Ok(());
+    };
+    info.set(a, 1, true);
+    info.cost = 20.0;
+    info.rows = 20;
+    if let Some(s) = seen[1] {
+        info.set(s, 2, true);
+    }
+    Ok(())
 }
 
 /// `fts5BestIndexMethod`: MATCH (or `=` on the hidden columns: the

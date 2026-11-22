@@ -128,7 +128,7 @@ fn tok_end(sql: &[u8], off: usize) -> usize {
 }
 
 /// `"name"` with every `"` doubled.
-fn quoted(name: &[u8]) -> AVec<u8> {
+pub(super) fn quoted(name: &[u8]) -> AVec<u8> {
     let mut v = AVec::new();
     v.push(b'"');
     for &b in name {

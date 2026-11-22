@@ -127,7 +127,10 @@ justify_over = 4096
 # +400 B (Bolt): prepare lexes each statement once for the TEMP /
 # ATTACH routers and the parse (prepare -17.7% instructions on
 # bolt_workload). Measured on main at 8ce2df6.
-ratchet = 495460
+# 495,460 -> 495,308 (v0.17 stmt_txn; STATUS.md): -152 B. One view-text
+# splitter (`view_head`) and one identifier quoter (`alter::quoted`)
+# shared by the TEMP router's rewrites.
+ratchet = 495308
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -239,7 +242,12 @@ justify_over = 16384
 # ATTACH routers and the parse (prepare -17.7% instructions on
 # bolt_workload). Measured on main at 8ce2df6; +608 B after merging main
 # into v0.17 wave 20 (989,736).
-ratchet = 989736
+# 989,736 -> 995,268 (v0.17 stmt_txn, `attach` leaf; STATUS.md): +5,532 B.
+# pragma_integrity_check / pragma_quick_check as virtual tables (~1.8 KB),
+# other databases' views written in as CTEs for attached / TEMP writes
+# (~2.7 KB), integrity_check's per-database runs (`run_kept`), attached
+# WITHOUT ROWID handles cleared per statement; offset -152 B.
+ratchet = 995268
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -340,7 +348,10 @@ justify_over = 32768
 # ATTACH routers and the parse (prepare -17.7% instructions on
 # bolt_workload). Measured on main at 8ce2df6; +624 B after merging main
 # into v0.17 wave 20 (1,093,244).
-ratchet = 1093244
+# 1,093,244 -> 1,098,688 (v0.17 stmt_txn, `attach` leaf; STATUS.md):
+# +5,444 B, the `max` growth (the flattener's LIMIT re-check, ungated in
+# `planner`, is within it: a LIMIT under a merged WHERE lost its order).
+ratchet = 1098688
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

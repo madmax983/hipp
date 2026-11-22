@@ -313,7 +313,7 @@ impl<S: Storage> Statement<'_, S> {
                         let rows =
                             crate::vtab::drain(c, sp.ncols, need, self.conn.cfg.max_vtab_rows)
                                 .map_err(|kind| Error::Schema { kind })?;
-                        cur = super::vtab::VtCur::Rows(rows, 0);
+                        cur = super::vtab::VtCur::Rows(rows, 0, false);
                     }
                     Box::new(cur)
                 }
@@ -494,8 +494,13 @@ fn vt_next_sync<E>(
             c.next();
             Some(r)
         }
-        super::vtab::VtCur::Rows(rows, pos) => {
+        super::vtab::VtCur::Rows(rows, pos, err) => {
             let Some((vals, rowid)) = rows.as_slice().get(*pos) else {
+                // (The frozen VM has no statement to hold the check's
+                // error: it fails the statement as unsupported.)
+                if *err {
+                    return Err(Error::Unsupported);
+                }
                 return Ok(None);
             };
             *pos += 1;

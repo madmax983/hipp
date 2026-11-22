@@ -5,6 +5,31 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Reads across databases: pragma_integrity_check, views in attached writes, WITHOUT ROWID seeks (wave 21, unit `stmt_txn`)
+
+- `pragma_integrity_check` / `pragma_quick_check` as table-valued
+  functions (leaf `attach` with `vtab`): the pin's eponymous pragma
+  virtual tables, with its argument forms ("no such table: 2", the
+  `schema` argument, "unknown database"), hidden columns `arg` and
+  `schema`, `SCAN pragma_integrity_check VIRTUAL TABLE INDEX 0:`, and
+  the corruption error after the check's rows. Statements reading one
+  run on main whatever else they name.
+- A write of an attached or TEMP table reading another database's view,
+  or a TEMP view over other databases' tables, runs (it was refused):
+  the views are written in as common table expressions, their table
+  names bound to their own database.
+- WITHOUT ROWID tables of attached databases and of the TEMP database
+  are searched by their PRIMARY KEY and indexes from main's statements
+  (they were read whole; a TEMP one was refused in a mixed statement).
+- Fix (`planner`, every database): a WHERE over a subquery or view that
+  reads a LIMITed one through another merged body filtered before the
+  LIMIT, or merged an ORDER BY / aggregate over it; the flattener now
+  checks the pin's restrictions (8), (9), (16) and (19) against the
+  merged body.
+- Sizes: tiny 76,928 (Δ 0); full 495,308 (-152); max 995,268 (+5,532);
+  xl 1,098,688 (+5,444). Not built: the statement transaction spanning
+  databases and TEMP triggers across databases (design in STATUS.md).
+
 ### The pin shell's dot-commands, output modes and `.dump` options (wave 20, unit `shell`)
 
 - hipp-cli only (no library or size change): `.mode` list, csv,

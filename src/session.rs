@@ -1776,6 +1776,12 @@ impl<S: Storage> Connection<S> {
             if let Some(t) = self.temp.as_mut() {
                 t.pager.wr.clear_handles();
             }
+            // (v0.17: main's statements bind handles in an attached
+            // database's pager too, reading its WITHOUT ROWID tables.)
+            #[cfg(feature = "attach")]
+            for a in self.attached.as_mut_slice() {
+                a.conn.pager.wr.clear_handles();
+            }
         }
         let arena = Arena::new(Scope::Statement, self.cfg.stmt_init, self.cfg.stmt_max);
         // The original statement text, retained for CREATE TABLE:

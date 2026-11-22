@@ -11,6 +11,225 @@ still against the 3.54.1 pin, under ADR 0001 (gating) and ADR 0004
 (the `xl` profile for leaves past `max`). Each unit records itself
 below.
 
+### Parity: stmt_txn — reads across databases: pragma_integrity_check, views in attached writes, WITHOUT ROWID seeks (2026-11-22)
+
+Wave 21's unit (owner decision 2026-11-22: SQLite 3.54.1 parity
+continues): the `attach_access` honest gaps. Items 3, 4 and 5 are
+closed; items 1 and 2 (the statement transaction spanning databases,
+and TEMP triggers across databases on top of it) are not built — the
+design and the blocker are below. Everything new is behind the
+`attach` leaf (the pragma tables also need `vtab`; planning stays
+under `expr_index` / `planner`); one wrong answer found on the way is
+fixed in `planner` for every database. No new leaf.
+
+**Shipped.**
+1. **`pragma_integrity_check` / `pragma_quick_check` as table-valued
+   functions** (item 5; `Module::Pragma`, `Statement::integrity_tvf`).
+   They are the pin's eponymous pragma virtual tables: columns
+   `integrity_check` (or `quick_check`), HIDDEN `arg` and `schema`;
+   `pragmaVtabBestIndex`'s plan (an `=` on `arg`, then on `schema`, as
+   the filter's arguments, both omitted; an unusable one makes the plan
+   unusable; `schema` alone is not used; idxNum 0, so `SCAN
+   pragma_integrity_check VIRTUAL TABLE INDEX 0:`); the filter
+   (`pragmaVtabFilter`) runs `PRAGMA "schema".integrity_check('arg')`
+   — the argument is quoted, so it is always a table name — found in
+   the `schema` argument's database or, without one, in temp, main,
+   then each attached database (`Connection::locate` / `holds`): "no
+   such table" otherwise, "unknown database" for an unknown `schema`;
+   with neither, main's check and then every other database's under
+   one error limit (`integrity_rest`, now also asked for one database
+   and one table: `only`). Each row is the result, then `arg` and
+   `schema` as text, rowids from 1. A check that meets a corrupt page
+   gives its rows and then the error (the statement's `deferred`, read
+   by the cursor after its last row: `VtCur::Rows`' flag), so a LIMIT
+   the rows meet first sees no error and `count(*)` sees it at once;
+   the check runs again at each filter (`filters_whole` false), as the
+   pin re-runs xFilter. A statement reading one runs on main whatever
+   it names (`temp::ic_fn`: the TEMP router and `route_attach` keep it
+   there, its qualifier ignored), and an attached database's or the
+   TEMP database's part runs as a statement there (`run_kept`, which
+   keeps the WITHOUT ROWID row handles an outer statement holds in that
+   pager).
+2. **A write of an attached or TEMP table reading another database's
+   view** (item 3, first half; `Connection::expand_views` /
+   `view_cte`). Such a write is routed to its own database with the
+   other databases' tables handed over as external sources (read
+   whole); a view could not be handed over. The statement is now
+   written again with each such view — and each view that view reads,
+   first — as a common table expression of its name, first in the
+   statement's WITH list (`WITH "mv"(cols) AS (body), ...`), each
+   reference's qualifier cut (three-part column names of the view
+   too), and routed again: the tables the views read become external
+   sources. A view's table names are qualified with the database they
+   bind to — a main or attached view's own (the pin's `DbFixer`), a
+   TEMP view's by the pin's search order (`locate`) — so a statement
+   CTE or a same-named table of the writing database cannot capture
+   them. TEMP views over other databases' tables read by a TEMP write
+   (which the TEMP database could not expand) take the same path; TEMP
+   views over temp tables alone are left to the temp database.
+   Refused (`Unsupported`, as before): a statement whose own CTE is
+   named like a view it would write in, or that reads another object
+   of a view's name.
+3. **WITHOUT ROWID tables of attached databases and of the TEMP
+   database** (item 4). `plan_ext_source` gives such a table its root,
+   defaults and hint as it gives a rowid table, and `plan_temp_source`
+   no longer refuses one, so main's statements plan and read them with
+   their own database's catalog and pager (wave 20's `Own` / `pager_of`
+   path; the WITHOUT ROWID translation lives in each pager, its row
+   handles too, and `prepare` now clears an attached pager's handles
+   per statement as it clears main's and the TEMP one's): `SEARCH aux.w USING PRIMARY KEY (k=? AND v=?)`,
+   `COVERING INDEX`, index order, IN lists, ranges, `INDEXED BY` /
+   `NOT INDEXED`, and the join driven from them, as on the pin.
+4. **Fix (found by the generated view corpus; `planner`, every
+   database): a LIMIT under a merged WHERE.** `SELECT * FROM v1 WHERE c
+   > 1`, `v1` a view over `v0 ... ORDER BY k DESC LIMIT 2`, returned a
+   row the LIMIT excludes (hipp merged `v0` into `v1`, then `v1` into
+   the query, so the WHERE filtered before the LIMIT; the term was also
+   pushed down into the merged body). The pin's flattener meets that
+   LIMIT only once the middle body is merged and stops; `splice` now
+   checks the merged body's LIMIT against the reader's WHERE, joins,
+   aggregates and ORDER BY (restrictions (19), (8), (9), (16), (11)),
+   and `passes_on` hands no term to a LIMITed body merged below. Rows
+   match the pin; the co-routine left is named after the middle body
+   (`CO-ROUTINE v1`) where the pin names the inner one (`v0`).
+
+**Not built (items 1 and 2).** Probed again: the pin opens a statement
+journal per database a statement writes (OP_Savepoint / OP_Transaction
+per Btree) and rolls them back together; a TEMP trigger on a main
+table writing an attached table is rolled back on both on RAISE(ABORT).
+In hipp no statement writes two databases today — a write runs on the
+one database it targets, and its triggers and foreign-key actions stay
+there — so item 1 has no user without item 2. Design (unchanged from
+`attach_access`, refined): (a) `Pager::sp_begin`'s statement savepoint
+opened on each pager a statement touches (main's, the TEMP one, each
+attached one), released together on success and rolled back together
+on an error, with `commit_all`'s super-journal on autocommit; (b) a
+TEMP trigger's program run through main's router with `NEW.` / `OLD.`
+written in as literals of their affinity (`TrigValue`), its `changes()`
+frame and `recursive_triggers` carried across. Blocker: (b) — trigger
+programs are planned on the connection that fires them
+(`trigger::run_step`), and a program whose statements route to other
+connections needs a new firing path (and its crash tests); it does not
+fit this wave's size line beside items 3-5. `tests/crash.rs` is
+unchanged (no new multi-database write path) and passes.
+
+**Oracle-probing notes** (live 3.54.1 pin, scripts over stdin, with
+EXPLAIN QUERY PLAN): `SELECT * FROM pragma_integrity_check` is `ok`;
+`(2)`, `('2')`, `(-1)`, `(1.5)` are "no such table: 2" etc. (the
+filter quotes the argument: `sqlite3GetInt32` sees `'2'`), `(x'75')`
+checks `u`; `('aux')` is "no such table: aux"; `('u')` finds `aux.u`;
+`('v')` (a view) is `ok`; `('t', 'nosuch')` is "unknown database
+'nosuch'", `('u', 'main')` "no such table: main.u", `(NULL, 2)`
+"unknown database '2'"; `(NULL, 'aux')` checks aux only; three
+arguments are "too many arguments on pragma_quick_check() - max 2";
+`aux.pragma_quick_check` and `main.pragma_quick_check('u')` ignore the
+qualifier; `temp.pragma_quick_check` works; the column of
+`pragma_quick_check` is `quick_check` (`integrity_check` is "no such
+column"); `SELECT *, schema, arg` shows `ok||t`; `WHERE schema =
+'aux'` alone gives no rows (unused, and the column is NULL), `WHERE
+arg = 'u'` checks `u`; `(SELECT 'u' AS n) JOIN pragma_quick_check(n)`
+passes the argument per row; `rowid` counts from 1; `PRAGMA
+table_xinfo(pragma_integrity_check)` lists `arg` / `schema` hidden.
+With an attached file whose index page is corrupt: `SELECT * FROM
+pragma_quick_check` prints `*** in database aux ***` / `Tree 2 page 5:
+btreeInitPage() returns error code 11` / `wrong # of entries in index
+uy`, then "database disk image is malformed"; `LIMIT 2` gives two rows
+and no error; `count(*)` gives the error only; `(NULL, 'main')` is
+`ok`. A non-TEMP view or trigger over a pragma table is "unsafe use of
+virtual table" in the pin's shell (`trusted_schema=0`); hipp keeps the
+library default, as for `pragma_table_info` and `dbstat` before. Views:
+`UPDATE aux.t SET c = (SELECT y2 FROM mv WHERE mv.x = t.a)` (a main
+view), `INSERT INTO tt SELECT * FROM aux.av`, a TEMP view over
+`aux.t` read by a TEMP write, a view with a column list, a view over a
+view, aggregates, ORDER BY ... LIMIT, a view's own WITH, RETURNING and
+upsert all run on the pin; a statement CTE `mv` beside `main.mv` too.
+WITHOUT ROWID: `SEARCH aux.w USING PRIMARY KEY (k=?)`, `(k=? AND
+v=?)`, `(k>?)`, `SEARCH aux.w USING COVERING INDEX wz (z=?)`, `SCAN
+aux.w USING COVERING INDEX wz` driving `SEARCH m USING INTEGER
+PRIMARY KEY (rowid=?)`, and the TEMP table `tw` in a join with main
+(hipp refused it). The LIMIT case: `SELECT * FROM v1 WHERE c > 1` is
+`5|2` on the pin (`CO-ROUTINE v0`), `5|2`, `3|2` on hipp before the
+fix. Unchanged divergences of every virtual table, also for these
+(probed with `generate_series`, `dbstat`, `pragma_table_info`): the
+pin's EXISTS-to-join of a virtual table (`SCAN ... EXISTS VIRTUAL
+TABLE`), and its join order beside a compound subquery (`CO-ROUTINE`
+first; hipp materializes it and scans the virtual table first).
+
+**Tests.** `tests/stmt_txn_v17.rs` (9 tests; twin directories,
+statement by statement — rows, plans as the pin shell's tree, failing
+statements): `integrity_tvf_forms` (49 queries each with its plan,
+then TEMP tables, writes reading the check, a TEMP view, DETACH under a
+transaction), `integrity_tvf_corrupt` (a file the pin wrote, its index
+page corrupted: rows then the error, LIMIT, count(*), ORDER BY, joins,
+`PRAGMA quick_check`), `views_in_cross_database_writes` (27 writes of
+attached / TEMP tables reading main, attached and TEMP views, with
+`changes()`, a rolled-back DETACH and a same-named table),
+`view_name_clash_refused` (the refusal above), `generated_views_in_writes`
+(xorshift64: views over views, column lists, aggregates, ORDER BY ...
+LIMIT, mixed affinities and collations in all three databases, and
+10 random writes each; 24 scripts, `HIPP_STX_CORPUS=150` ran clean),
+`without_rowid_seeks` (24 queries with plans, writes of main reading
+them, DETACH, DROP INDEX, a re-created TEMP table), and
+`generated_without_rowid_seeks` (random key shapes, DESC and NOCASE
+keys, partial and secondary indexes, ANALYZE, joins, correlated and
+EXISTS subqueries; every script also run with all tables in main, a
+statement whose all-main twin already differs compared as a set:
+16 of 7,032 statements over 150 scripts), and `limit_under_merged_where`
+(the fix: 15 statements and plans). `hipp-cli/tests/cli_v17_stmt_txn.rs`
+(3 tests, one-shot and stdin byte-identical: the pragma tables with
+plans, view writes, WITHOUT ROWID plans). `tests/attach_v17.rs`'s
+`documented_refusals` no longer lists the view write. With
+`--features vm` the frozen VM reads a later join source whole, so a
+corrupt check's error there comes without its rows (asserted).
+
+**Gates.** `cargo fmt --all`; full `ci/local-gates.sh`: all gates
+passed. `tests/depth_v16.rs`, `tests/depth_tiny_v16.rs` and
+`tests/triggers_v16.rs` with debug info on, with and without
+`--features vm`: pass (no recursive path changed but the router's
+re-route, bounded at 4 passes and 32 nested views).
+
+**Size Δ** (against b3e4a59's ratchets). tiny 0 (76,928); full -152
+(495,460 → 495,308: one view-text splitter `view_head` and one quoter
+`alter::quoted` shared by the TEMP router's rewrites); max +5,532
+(989,736 → 995,268); xl +5,444 (1,093,244 → 1,098,688). The max growth
+is the pragma virtual table and its filter (~1.8 KB with
+`integrity_rest`'s one-database mode), the view expansion (~2.7 KB:
+`expand_views`, `view_cte`, `holds`), `run_kept`, the attached
+pagers' handle clearing (+56 B), and the router no
+longer inlined into `prepare` (about +200 B net). Smaller versions
+taken: the check's error kept in the statement's `deferred`, not in
+the cursor as an `Error<Infallible>` (two `map_storage` instances;
+-88 B); one search by `locate` / `holds` in place of a per-database
+`has_named`, with `view_head` (-288 B); the check's temp / attached
+runs as `integrity_rest`'s one-database mode (-600 B); `alter::quoted`
+for five quoting loops (-152 B). Dropping the three-part column cut
+would save 256 B more (kept: the generated corpus wrote such names). Ratchets
+raised to the measured figures with one-line justifications in
+`ci/size-ratchet.toml`; the owner must approve the raises before they
+are pushed.
+
+**Honest gaps.**
+- (open: items 1 and 2) The statement transaction spanning databases,
+  and TEMP triggers on main or attached tables or writing another
+  database's table (refused at CREATE, `Unsupported`): see "Not built".
+- A write of an attached or TEMP table reading main's (or a third
+  database's) tables still reads them whole (unchanged from
+  `attach_access`): the child connection has no route to the other
+  pagers.
+- A statement whose own CTE takes the name of another database's view
+  it reads is refused (the pin answers).
+- `CREATE TABLE aux.x AS SELECT ... FROM <a main view>` and other
+  non-INSERT / UPDATE / DELETE writes reading another database's view
+  are refused as before.
+- A pragma table read by a statement that runs on an attached or the
+  TEMP database (an attached / TEMP write reading one) is refused
+  (`Unsupported`): the check reads every database from main.
+- The other pragma tables' hidden `arg` / `schema` columns (v0.16).
+- After the LIMIT fix the co-routine left is named after the middle
+  body, not the inner one, in EXPLAIN QUERY PLAN.
+- Virtual tables' EXISTS-to-join and join order beside a compound
+  subquery (probed above; unchanged for every module).
+
 ### Parity: shell — review fixes (2026-11-20)
 
 Ten review findings on `shell` (8872cc8), each reproduced and probed
@@ -612,15 +831,18 @@ call on `Pg` in place of the macro (+80 B more). No offsetting saving
 found in the code the unit touches.
 
 **Honest gaps.**
-- (open: item 2) TEMP triggers on main or attached tables, and TEMP
+- (open: item 2; still open after v0.17 stmt_txn, its design and
+  blocker below) TEMP triggers on main or attached tables, and TEMP
   triggers writing another database's table, are refused
   (`Unsupported`); see "Not closed" above.
-- (open: item 3) A write of an attached or TEMP table reading another
-  database's view, and `pragma_integrity_check` / `pragma_quick_check`
-  as table-valued functions, are refused (`Unsupported`).
-- A WITHOUT ROWID table of another database (and a WITHOUT ROWID TEMP
-  table, refused in a mixed statement as before) is still read whole
-  with no access path; a join with an attached one keeps FROM order.
+- (closed in v0.17: stmt_txn) A write of an attached or TEMP table
+  reading another database's view, and `pragma_integrity_check` /
+  `pragma_quick_check` as table-valued functions, are refused
+  (`Unsupported`).
+- (closed in v0.17: stmt_txn) A WITHOUT ROWID table of another database
+  (and a WITHOUT ROWID TEMP table, refused in a mixed statement as
+  before) is still read whole with no access path; a join with an
+  attached one keeps FROM order.
 - A write of an attached or TEMP table reading *main's* (or a third
   database's) tables still gets them as external sources read whole
   (the child connection has no route to the other pagers); only
@@ -1193,9 +1415,9 @@ smaller and were not kept.
 - (closed in v0.17: attach review fixes) `UPDATE 't' SET 'a' = 5` (a
   string as a SET column name) does not parse (found along the way; not
   a qualifier).
-- (still open after v0.17 attach_access, its item 3)
-  `pragma_integrity_check` / `pragma_quick_check` as table-valued
-  functions are refused (the v0.16 PRAGMA unit's gap, unchanged).
+- (closed in v0.17: stmt_txn) `pragma_integrity_check` /
+  `pragma_quick_check` as table-valued functions are refused (the
+  v0.16 PRAGMA unit's gap).
 - With a TEMP database every INSERT / UPDATE / DELETE is parsed once
   more by the ATTACH router (to find a TEMP write reading main).
 
@@ -9846,7 +10068,10 @@ table-valued arity rules, and the generated-column LIKE plumbing.
   correlated `JOIN pragma_table_info(m.name)` idiom is refused),
   expose no hidden `arg` / `schema` columns (`WHERE arg = 't'`
   is unsupported), and `pragma_integrity_check` /
-  `pragma_quick_check` are refused in FROM.
+  `pragma_quick_check` are refused in FROM. (Closed in v0.17:
+  stmt_txn for `pragma_integrity_check` / `pragma_quick_check`, with
+  their hidden columns and correlated arguments, under `attach` +
+  `vtab`; the other pragmas' hidden columns stay open.)
 - No temp database: `temp.` pragmas, and header values of temp
   through the table-valued forms, are refused. (~~Table-valued
   pragmas on TEMP objects~~ (closed by the honest-gap sweep, below): `pragma_table_info('t')` /

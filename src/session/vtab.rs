@@ -73,8 +73,11 @@ pub(super) enum VtCur {
     /// An R*Tree search, walking the nodes as it reaches them.
     #[cfg(feature = "rtree")]
     Rtree(Box<super::rtree::RtCursor>),
-    /// The rows a module computed at its filter, and the next one.
-    Rows(VRows, usize),
+    /// The rows a module computed at its filter, the next one, and
+    /// whether an error waits after the last (v0.17: an integrity
+    /// check that met a corrupt page, `pragma_integrity_check`; the
+    /// error is the statement's `deferred`).
+    Rows(VRows, usize, bool),
 }
 
 /// Whether `vt`'s module computes its rows at its filter (dbstat,
@@ -84,6 +87,10 @@ pub(super) fn filters_whole(vt: &VtSrc) -> bool {
         Module::Series => false,
         #[cfg(feature = "rtree")]
         Module::Rtree { .. } => false,
+        // The pin runs the check at each filter, its error after the
+        // rows (v0.17).
+        #[cfg(feature = "attach")]
+        Module::Pragma { .. } => false,
         _ => true,
     }
 }
@@ -365,9 +372,11 @@ impl<S: Storage> Connection<S> {
         if self.is_temp && !eq_ci(n, b"generate_series") {
             return Ok(None);
         }
+        // (A pragma function's qualifier is ignored, as on the pin.)
         #[cfg(feature = "attach")]
         if s.schema
             .is_some_and(|h| !eq_ci(handle_bytes(arena, h), b"main"))
+            && !n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_"))
         {
             return Ok(None);
         }
@@ -1465,7 +1474,12 @@ impl<S: Storage> Statement<'_, S> {
             Module::Rtree { .. } => {
                 VtCur::Rtree(Box::new(self.rtree_open(vt, argv.as_slice()).await?))
             }
-            _ => VtCur::Rows(self.vtab_rows_of(vt, argv, row, need).await?, 0),
+            #[cfg(feature = "attach")]
+            Module::Pragma { quick } => {
+                let (rows, err) = self.integrity_tvf(argv.as_slice(), quick).await?;
+                VtCur::Rows(rows, 0, err)
+            }
+            _ => VtCur::Rows(self.vtab_rows_of(vt, argv, row, need).await?, 0, false),
         })
     }
 
@@ -1512,8 +1526,11 @@ impl<S: Storage> Statement<'_, S> {
                 }
                 out.rowids.push(rowid);
             }
-            VtCur::Rows(rows, pos) => {
+            VtCur::Rows(rows, pos, err) => {
                 let Some((vals, rowid)) = rows.as_slice().get(*pos) else {
+                    if core::mem::take(err) {
+                        return Err(self.deferred.take().unwrap_or(Error::Unsupported));
+                    }
                     return Ok(false);
                 };
                 *pos += 1;
@@ -1553,6 +1570,12 @@ impl<S: Storage> Statement<'_, S> {
             Module::Fts5 => self.fts5_rows(vt, argv.as_slice(), need).await,
             #[cfg(feature = "fts5")]
             Module::Fts5Vocab => self.vocab_rows(vt).await,
+            // Read whole: the error comes with no rows.
+            #[cfg(feature = "attach")]
+            Module::Pragma { quick } => match self.integrity_tvf(argv.as_slice(), quick).await? {
+                (_, true) => Err(self.deferred.take().unwrap_or(Error::Unsupported)),
+                (rows, false) => Ok(rows),
+            },
         }
     }
 

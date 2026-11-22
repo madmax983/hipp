@@ -756,9 +756,10 @@ fn integrity_check_rows_and_temp() {
 }
 
 /// What hipp still refuses cleanly where the pin answers (STATUS.md's
-/// v0.17 honest gaps): a TEMP trigger on a main or attached table, one
-/// writing a schema-qualified table, and an attached database's write
-/// reading another database's view.
+/// v0.17 honest gaps): a TEMP trigger on a main or attached table, and
+/// one writing a schema-qualified table. (An attached database's write
+/// reading another database's view runs since the v0.17 `stmt_txn`
+/// unit: `tests/stmt_txn_v17.rs`.)
 #[test]
 fn documented_refusals() {
     let d = fresh_dir("refusals");
@@ -783,7 +784,6 @@ fn documented_refusals() {
             "CREATE TEMP TRIGGER tg AFTER INSERT ON a.t BEGIN SELECT 1; END",
             "CREATE TEMP TRIGGER tm AFTER INSERT ON m BEGIN SELECT 1; END",
             "CREATE TEMP TRIGGER tq AFTER INSERT ON tt BEGIN INSERT INTO main.m VALUES (1); END",
-            "INSERT INTO a.t SELECT y FROM mv",
         ] {
             let r = db.prepare(sql).await.map(|_| ());
             assert!(matches!(r, Err(Error::Unsupported)), "{sql}: {r:?}");
