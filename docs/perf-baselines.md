@@ -598,8 +598,8 @@ a zeroed 4 KiB image, copies page 1's frame for its first 100 bytes
 (they are the frame's own) or copies the image back
 (`set_page_image`). Workload checksums identical (176089 / 657610 /
 4083309). Test pass/fail set identical before/after (1131 tests: 134
-pass, 992 fail on the absent `sqlite3` oracle and 5 are ignored, the
-same on the baseline commit). A 3,000-row shuffled-rowid workload (12 tables on page 1,
+pass, 992 fail -- nearly all on the absent `sqlite3` oracle -- and 5
+are ignored, the same set on the baseline commit). A 3,000-row shuffled-rowid workload (12 tables on page 1,
 DESC / UNIQUE NOCASE / multi-column indexes, 300 / 1,200-byte overflow
 keys, deletes, updates, a WITHOUT ROWID table with a secondary index,
 INSERT ... SELECT, late CREATE INDEX) through the `hipp` CLI writes
