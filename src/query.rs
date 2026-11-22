@@ -1227,6 +1227,12 @@ pub struct SubPlan {
     pub lazy: bool,
     #[cfg(feature = "planner")]
     pub grp: u32,
+    /// An IN subquery the pin runs for a vector IN loop on its
+    /// reader's index (v0.17 review fix, `planner`;
+    /// `Connection::mark_in_loops`): never read from its table in
+    /// place (`xindex::in_index_pick`), its ORDER BY runs.
+    #[cfg(feature = "planner")]
+    pub in_loop: bool,
 }
 
 impl SubPlan {
@@ -1429,7 +1435,9 @@ pub fn item_result_affinity(r: &RExpr) -> Option<Affinity> {
 pub enum SubKind<'x> {
     Scalar(&'x SubPlan),
     Exists(&'x SubPlan),
-    In(&'x SubPlan),
+    /// The IN operator's left operand too (v0.17: which index the pin
+    /// reads in place of the subquery, `xindex::in_index_pick`).
+    In(&'x RExpr, &'x SubPlan),
 }
 
 pub(crate) fn is_rowid_name(b: &[u8]) -> bool {
@@ -3659,6 +3667,35 @@ pub fn same_expr(a: &RExpr, b: &RExpr) -> bool {
         (RExpr::Cast(x, f), RExpr::Cast(y, g)) => f == g && same_expr(x, y),
         (RExpr::Collate(x, c), RExpr::Collate(y, d)) => c == d && same_expr(x, y),
         (RExpr::Scalar(f, x), RExpr::Scalar(g, y)) => f == g && all(x.as_slice(), y.as_slice()),
+        // (v0.17: CASE and LIKE too, as the pin's sqlite3ExprCompare.)
+        (RExpr::Like(x1, y1, n), RExpr::Like(x2, y2, m)) => {
+            n == m && same_expr(x1, x2) && same_expr(y1, y2)
+        }
+        (
+            RExpr::Case {
+                base: b1,
+                whens: w1,
+                otherwise: o1,
+            },
+            RExpr::Case {
+                base: b2,
+                whens: w2,
+                otherwise: o2,
+            },
+        ) => {
+            let opt = |x: &Option<Box<RExpr>>, y: &Option<Box<RExpr>>| match (x, y) {
+                (None, None) => true,
+                (Some(p), Some(q)) => same_expr(p, q),
+                _ => false,
+            };
+            opt(b1, b2)
+                && opt(o1, o2)
+                && w1.len() == w2.len()
+                && w1
+                    .iter()
+                    .zip(w2.iter())
+                    .all(|((p, q), (r, t))| same_expr(p, r) && same_expr(q, t))
+        }
         // Aggregates (v0.16 review fix, `window`): two windows over
         // groups ordered or partitioned by the same aggregate
         // (`OVER (ORDER BY sum(v))`) are the same window.
@@ -4405,7 +4442,7 @@ pub fn subs_reading(e: &RExpr, root: u32, out: &mut AVec<usize>) {
     collect_subs(e, &mut subs);
     for k in subs.iter() {
         let p = match k {
-            SubKind::Scalar(p) | SubKind::Exists(p) | SubKind::In(p) => *p,
+            SubKind::Scalar(p) | SubKind::Exists(p) | SubKind::In(_, p) => *p,
         };
         plan_subs_reading(p, root, out);
     }
@@ -4460,7 +4497,7 @@ pub fn collect_subs<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         RExpr::SubExists(p) => out.push(SubKind::Exists(p)),
         RExpr::InSub(x, p, _) => {
             collect_subs(x, out);
-            out.push(SubKind::In(p));
+            out.push(SubKind::In(x, p));
         }
         RExpr::Literal(_)
         | RExpr::AffLiteral(..)
@@ -4956,7 +4993,7 @@ pub fn collect_subs_outside_agg<'x>(e: &'x RExpr, out: &mut AVec<SubKind<'x>>) {
         RExpr::SubExists(p) => out.push(SubKind::Exists(p)),
         RExpr::InSub(x, p, _) => {
             collect_subs_outside_agg(x, out);
-            out.push(SubKind::In(p));
+            out.push(SubKind::In(x, p));
         }
         RExpr::Agg { .. }
         | RExpr::Literal(_)
@@ -8584,4 +8621,25 @@ pub fn limit_int<E>(v: OwnedValue) -> Result<i64, E> {
             kind: SchemaKind::DatatypeMismatch,
         }),
     }
+}
+
+/// The left operand's elements of `x IN (SELECT ...)` (one, or a
+/// row value's), each with the result column it compares with.
+#[cfg(any(feature = "explain", feature = "planner"))]
+pub(crate) fn in_pairs<'x>(x: &'x RExpr, p: &'x SubPlan) -> AVec<(&'x RExpr, Option<&'x RExpr>)> {
+    let core = p.compound.as_slice().last().map_or(p, |(_, t)| t);
+    let items: &[RExpr] = match core.values.as_slice().first() {
+        Some(r) if core.items.is_empty() => r.as_slice(),
+        _ => core.items.as_slice(),
+    };
+    let mut out = AVec::new();
+    match x {
+        RExpr::Scalar(crate::query::ScalarFn::Vector, xs) => {
+            for (i, e) in xs.iter().enumerate() {
+                out.push((e, items.get(i)));
+            }
+        }
+        _ => out.push((x, items.first())),
+    }
+    out
 }

@@ -278,6 +278,19 @@ fn splice(p: &mut Parts<'_>, i: usize, base: (usize, usize)) -> Option<usize> {
     if p.sources.iter().any(tvf_source) || (dp.limit.is_some() && p.limit.is_some()) {
         return None;
     }
+    // A body that took a LIMIT from one merged into it (v0.17 fix: a
+    // view over a view with LIMIT lost the LIMIT's order under a
+    // WHERE): the pin's restrictions (8), (9), (16) and (19), checked
+    // again, as its flattener meets that LIMIT only once the body is
+    // merged.
+    if dp.limit.is_some()
+        && (p.filter.is_some()
+            || p.sources.len() > 1
+            || p.has_agg
+            || (!dp.order_by.is_empty() && !p.order_by.is_empty()))
+    {
+        return None;
+    }
     let kind = sp.kind;
     let left = kind == crate::sql::JoinKind::Left;
     if left && dp.sources.len() != 1 {
@@ -988,9 +1001,12 @@ fn passes_on(d: &SelectStmt) -> bool {
         [g] => {
             d.compound.is_empty()
                 && d.values.is_empty()
+                // (Not to a LIMITed body merged into it: the term would
+                // filter before the LIMIT, the pin's restriction (19);
+                // v0.17 fix.)
                 && g.derived
                     .as_deref()
-                    .is_some_and(|x| !g.flat || passes_on(x))
+                    .is_some_and(|x| !g.flat || (x.limit.is_none() && passes_on(x)))
         }
         _ => false,
     }

@@ -98,7 +98,7 @@ pub struct WrIndex {
 
 /// A handle's binding.
 #[derive(Debug, Clone)]
-struct Handle {
+pub struct Handle {
     root: u32,
     key: AVec<u8>,
     alive: bool,
@@ -143,6 +143,24 @@ impl WrState {
         self.handles.clear();
         self.slots.clear();
         self.used = 0;
+    }
+
+    /// Take the statement's handles out (v0.17: a statement run from
+    /// inside another, `pragma_integrity_check`), to be put back by
+    /// [`Self::put_handles`] when it is done.
+    pub fn take_handles(&mut self) -> (AVec<Handle>, AVec<usize>, usize) {
+        let used = core::mem::take(&mut self.used);
+        (
+            core::mem::take(&mut self.handles),
+            core::mem::take(&mut self.slots),
+            used,
+        )
+    }
+
+    /// Put back the handles [`Self::take_handles`] took (the inner
+    /// statement's are dropped).
+    pub fn put_handles(&mut self, h: (AVec<Handle>, AVec<usize>, usize)) {
+        (self.handles, self.slots, self.used) = h;
     }
 
     pub fn table_of(&self, root: u32) -> Option<usize> {

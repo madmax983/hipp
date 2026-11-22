@@ -671,7 +671,13 @@ impl<'c, S: Storage> Statement<'c, S> {
             let mut kinds: AVec<crate::query::SubKind<'_>> = AVec::new();
             crate::query::collect_subs(e, &mut kinds);
             for k in kinds.iter() {
-                match self.sub_value_for(k, row).await? {
+                #[cfg(feature = "planner")]
+                {
+                    self.dest = super::DEST_PROBE;
+                }
+                let v = self.sub_value_for(k, row).await;
+                self.dest = 0;
+                match v? {
                     crate::query::SubValue::Many(vs, _) => {
                         for v in vs.iter() {
                             let v = crate::query::probe_value(v.clone(), p.aff);
@@ -2295,6 +2301,275 @@ fn never_null_terms<'x>(
             && let Some(l) = lits.get(usize::from(*not))
         {
             *c = l;
+        }
+    }
+}
+
+/// The table an IN operator reads in place of its subquery's values
+/// (the pin's `isCandidateForInOpt` and `sqlite3FindInIndex`; v0.17
+/// review fix, `planner`, shared by EXPLAIN QUERY PLAN and the
+/// executor since v0.17 `order_eqp`): an uncorrelated `SELECT cols
+/// FROM table` with no WHERE, GROUP BY, aggregate, LIMIT or compound,
+/// whose columns are the rowid (`(t, None)`: `USING ROWID SEARCH ON
+/// TABLE t FOR IN-OPERATOR`) or lead an index of the comparisons'
+/// collations (`(t, Some(i))`: `USING INDEX i FOR IN-OPERATOR`; a
+/// UNIQUE one of exactly those columns when an index loop probes with
+/// the values, `probing`), the affinities allowing it (`base`: where
+/// the source's columns start in the row). The pin then
+/// never runs the subquery, its ORDER BY included.
+#[cfg(feature = "planner")]
+pub(super) fn in_index_pick<'c>(
+    cat: &'c Catalog,
+    ca: &'c Arena,
+    x: &RExpr,
+    p: &crate::query::SubPlan,
+    (probing, base, keep): (bool, usize, &[usize]),
+) -> Option<(
+    &'c crate::schema::TableDef,
+    Option<&'c crate::schema::IndexDef>,
+)> {
+    use crate::record::Affinity;
+    if !p.uncorrelated
+        || !p.compound.is_empty()
+        || !p.values.is_empty()
+        || p.filter.is_some()
+        || !p.group_by.is_empty()
+        || p.having.is_some()
+        || p.has_agg
+        || p.limit.is_some()
+        || p.sources.len() != 1
+        || (probing && matches!(x, RExpr::Literal(_)))
+    {
+        return None;
+    }
+    let sp = p.sources.as_slice().first()?;
+    // (A table of another database read in place, v0.17 `attach`:
+    // `in_index_of` describes it with its own catalog.)
+    #[cfg(feature = "attach")]
+    let foreign = sp.temp && sp.root <= 1;
+    #[cfg(not(feature = "attach"))]
+    let foreign = sp.temp;
+    if sp.derived.is_some() || sp.rec != 0 || foreign {
+        return None;
+    }
+    #[cfg(any(feature = "json", feature = "vtab"))]
+    if sp.tvf != 0 {
+        return None;
+    }
+    // (A FROM subquery or view the flattener merged is still one
+    // on the pin.)
+    if !p.view_names.is_empty() {
+        return None;
+    }
+    let t = cat.tables.iter().find(|t| t.root == sp.root)?;
+    // Each result column's table column (`ROWID`: the rowid, the
+    // pin's `XN_ROWID`, which also ends every index of a rowid
+    // table; v0.17 review fix: a row value naming it matches there).
+    const ROWID: usize = usize::MAX;
+    let all = crate::query::in_pairs(x, p);
+    if all.len() != p.items.len() {
+        return None;
+    }
+    // (Just the fields `keep` names, when it names any: a vector IN
+    // loop's, `Connection::mark_in_loops`.)
+    let mut cols: AVec<usize> = AVec::new();
+    let mut pairs = AVec::new();
+    for (i, (it, pr)) in p.items.iter().zip(all.iter()).enumerate() {
+        if !keep.is_empty() && !keep.contains(&i) {
+            continue;
+        }
+        pairs.push(*pr);
+        cols.push(match it {
+            RExpr::Rowid(_) if t.has_rowid() => ROWID,
+            RExpr::Column(slot, ..) => {
+                let c = slot.checked_sub(base)?;
+                if c >= sp.ncols {
+                    return None;
+                }
+                if t.has_rowid() && sp.rowid_alias == Some(c) {
+                    ROWID
+                } else {
+                    c
+                }
+            }
+            _ => return None,
+        });
+    }
+    let name = handle_bytes(ca, t.name);
+    if let [ROWID] = cols.as_slice() {
+        return Some((t, None));
+    }
+    // (The rowid's INTEGER affinity always allows it.)
+    let numeric = |a: Affinity| matches!(a, Affinity::Numeric | Affinity::Integer | Affinity::Real);
+    for ((l, _), &c) in pairs.iter().zip(cols.iter()) {
+        let Some(&idx) = sp.affs.as_slice().get(c) else {
+            continue;
+        };
+        if crate::query::item_result_affinity(l).is_some_and(numeric) && !numeric(idx) {
+            return None;
+        }
+    }
+    let pk = {
+        #[cfg(feature = "without_rowid")]
+        {
+            cat.indexes_for(ca, handle_bytes(ca, t.name))
+                .find(|i| i.clustered)
+        }
+        #[cfg(not(feature = "without_rowid"))]
+        {
+            None::<&crate::schema::IndexDef>
+        }
+    };
+    let ixs: AVec<&crate::schema::IndexDef> = cat.indexes_for(ca, name).collect();
+    for ix in ixs.iter().rev() {
+        if ix.partial() {
+            continue;
+        }
+        // The entry's columns: the key, then the rowid or (a WITHOUT
+        // ROWID table's secondary index) the PRIMARY KEY columns it
+        // lacks.
+        let mut ent: AVec<(Option<usize>, crate::record::Coll)> = AVec::new();
+        for (i, k) in ix.columns.iter().enumerate() {
+            let expr = ix
+                .ext
+                .as_ref()
+                .is_some_and(|e| e.exprs.as_slice().get(i).is_some_and(|e| e.is_some()));
+            ent.push((k.col.filter(|_| !expr), k.coll));
+        }
+        match pk {
+            None => ent.push((Some(ROWID), Default::default())),
+            Some(pk)
+                if !{
+                    #[cfg(feature = "without_rowid")]
+                    {
+                        ix.clustered
+                    }
+                    #[cfg(not(feature = "without_rowid"))]
+                    {
+                        false
+                    }
+                } =>
+            {
+                for k in pk.columns.iter() {
+                    if !ix.columns.iter().any(|x| x.col == k.col) {
+                        ent.push((k.col, k.coll));
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+        // (An index loop's probes need an index unique over those
+        // columns: the pin's `mustBeUnique`, `nKeyCol` at most that
+        // many and `nColumn` too unless UNIQUE.)
+        let n = cols.len();
+        if probing && (ix.columns.len() > n || (ent.len() > n && !ix.unique)) {
+            continue;
+        }
+        let Some(lead) = ent.as_slice().get(..n) else {
+            continue;
+        };
+        let mut used: AVec<bool> = lead.iter().map(|_| false).collect();
+        let ok = pairs.iter().zip(cols.iter()).all(|((l, r), c)| {
+            let coll = match r {
+                Some(r) => crate::query::binary_coll(l, r),
+                None => crate::query::expr_coll(l).unwrap_or_default(),
+            };
+            let at = lead.iter().enumerate().position(|(j, (k, kc))| {
+                *k == Some(*c) && *kc == coll && !used.as_slice().get(j).copied().unwrap_or(true)
+            });
+            match at.and_then(|j| used.as_mut_slice().get_mut(j)) {
+                Some(u) => {
+                    *u = true;
+                    true
+                }
+                None => false,
+            }
+        });
+        if ok {
+            return Some((t, Some(*ix)));
+        }
+    }
+    None
+}
+
+#[cfg(feature = "planner")]
+impl<S: Storage> Connection<S> {
+    /// Mark the row-value IN terms of WHERE clause `e` that the pin
+    /// runs as a vector IN loop (v0.17 review fix, `planner`; where.c
+    /// `removeUnindexableInClauseTerms` with `sqlite3FindInIndex
+    /// (IN_INDEX_LOOP)`): an AND term `(f1, ...) IN (SELECT ...)` with
+    /// a field on the rowid or the leading columns of an index of one
+    /// of the core's main-database tables (`tabs`: each root and where
+    /// it sits in the row, `width` slots wide) probes there with the
+    /// values of just those fields, read from the subquery's table only
+    /// through an index unique over them (`in_index_pick`); otherwise
+    /// the subquery runs, its ORDER BY included (`SubPlan::in_loop`).
+    pub(super) fn mark_in_loops(
+        &self,
+        e: &mut RExpr,
+        tabs: &[(u32, crate::xplan::Src)],
+        width: usize,
+    ) {
+        if let RExpr::Binary(BinOp::And, l, r) = e {
+            self.mark_in_loops(l, tabs, width);
+            self.mark_in_loops(r, tabs, width);
+            return;
+        }
+        let RExpr::InSub(x, p, false) = e else {
+            return;
+        };
+        let (RExpr::Scalar(crate::query::ScalarFn::Vector, xs), false) =
+            (&**x, p.order_by.is_empty())
+        else {
+            return;
+        };
+        let ca = &self.catalog_arena;
+        // The fields the loop takes: the rowid's, else the longest run
+        // of an index's leading columns.
+        let mut best: AVec<usize> = AVec::new();
+        for (root, s) in tabs.iter() {
+            let Some(t) = self.catalog.tables.iter().find(|t| t.root == *root) else {
+                continue;
+            };
+            // The field reading table column `c` (`None`: the rowid).
+            let field = |c: Option<usize>| {
+                xs.iter().position(|f| match c {
+                    Some(c) => s.is_col(skip_coll(f), c),
+                    None => s.is_rowid(skip_coll(f)),
+                })
+            };
+            if let Some(f) = field(None) {
+                best.clear();
+                best.push(f);
+                break;
+            }
+            for ix in self.catalog.indexes_for(ca, handle_bytes(ca, t.name)) {
+                let mut got: AVec<usize> = AVec::new();
+                for k in ix.columns.iter() {
+                    match k.col.and_then(|c| field(Some(c))) {
+                        Some(f) if !got.as_slice().contains(&f) => got.push(f),
+                        _ => break,
+                    }
+                }
+                if got.len() > best.len() {
+                    best = got;
+                }
+            }
+        }
+        p.in_loop = !best.is_empty()
+            && in_index_pick(&self.catalog, ca, x, p, (true, width, best.as_slice())).is_none();
+    }
+
+    /// `mark_in_loops` for an UPDATE / DELETE WHERE over target `t`.
+    pub(super) fn mark_target_loops(&self, f: &mut Option<RExpr>, t: &crate::schema::TableDef) {
+        if let Some(f) = f {
+            let s = crate::xplan::Src {
+                base: 0,
+                ncols: t.columns.len(),
+                src: 0,
+                rowid_alias: t.rowid_alias,
+            };
+            self.mark_in_loops(f, &[(t.root, s)], t.columns.len());
         }
     }
 }

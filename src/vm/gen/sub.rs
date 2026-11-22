@@ -455,7 +455,7 @@ fn sub_node(
     let (plan, kind) = match k {
         K::Scalar(p) => (*p, SubKind::Scalar),
         K::Exists(p) => (*p, SubKind::Exists),
-        K::In(p) => (*p, SubKind::In),
+        K::In(_, p) => (*p, SubKind::In),
     };
     if let Some(s) = preset_slot(b, plan) {
         return Some(s);
@@ -583,6 +583,8 @@ fn placeholder(id: usize) -> SubPlan {
         lazy: false,
         #[cfg(feature = "planner")]
         grp: 0,
+        #[cfg(feature = "planner")]
+        in_loop: false,
     }
 }
 
@@ -633,7 +635,7 @@ fn expr_has_preset(b: &Builder, e: &RExpr) -> bool {
         let p = match k {
             crate::query::SubKind::Scalar(p)
             | crate::query::SubKind::Exists(p)
-            | crate::query::SubKind::In(p) => *p,
+            | crate::query::SubKind::In(_, p) => *p,
         };
         preset_slot(b, p).is_some() || plan_has_preset(b, p)
     })
@@ -671,7 +673,7 @@ pub(super) fn real_sub(b: &Builder, e: &RExpr) -> bool {
         let p = match k {
             crate::query::SubKind::Scalar(p)
             | crate::query::SubKind::Exists(p)
-            | crate::query::SubKind::In(p) => *p,
+            | crate::query::SubKind::In(_, p) => *p,
         };
         preset_slot(b, p).is_none()
     })

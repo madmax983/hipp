@@ -865,8 +865,9 @@ pub struct SelectStmt {
     /// first row only (v0.16, `expr_index`): a UNION compound there
     /// takes the pin's first-row shortcut, so its members are not
     /// planned for a merge key (`session::merge_member`).
+    /// 1: a scalar subquery, 2: an EXISTS (v0.17), 0: neither.
     #[cfg(feature = "expr_index")]
-    pub first_row: bool,
+    pub first_row: u8,
     /// A multi-row VALUES core the pin reads as a chain of one-row
     /// selects joined by UNION ALL, not as one VALUES co-routine
     /// (v0.17 review fix, `sql`; `sqlite3MultiValues`): after a WITH

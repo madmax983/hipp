@@ -476,6 +476,38 @@ fn eponymous(n: &[u8]) -> bool {
     cfg!(feature = "vtab") && eq_ci(n, b"dbstat")
 }
 
+/// `n` names `pragma_integrity_check` / `pragma_quick_check` (v0.17,
+/// with `vtab` and `attach`): main runs every statement reading one,
+/// whatever its qualifier or arguments, since its check reads every
+/// database (`Statement::integrity_tvf`).
+pub(super) fn ic_fn(n: &[u8]) -> bool {
+    cfg!(all(feature = "vtab", feature = "attach"))
+        && (eq_ci(n, b"pragma_integrity_check") || eq_ci(n, b"pragma_quick_check"))
+}
+
+/// A CREATE VIEW's text (tokens `t`, the view's name `vh`) as `name
+/// [(columns)] AS body`: the offsets of the column list (empty when
+/// absent: it ends where it starts) and of the body.
+pub(super) fn view_head(t: &[Token], vh: ABytes, arena: &Arena) -> Option<(usize, usize, usize)> {
+    let ni = tok_index(t, vh)?;
+    let mut depth = 0usize;
+    let mut j = ni + 1;
+    let as_at = loop {
+        match t.get(j)?.tok {
+            Tok::LParen => depth += 1,
+            Tok::RParen => depth = depth.saturating_sub(1),
+            Tok::Ident(h, false) if depth == 0 && eq_ci(handle_bytes(arena, h), b"AS") => break j,
+            _ => {}
+        }
+        j += 1;
+    };
+    Some((
+        t.get(ni + 1)?.offset,
+        t.get(as_at)?.offset,
+        t.get(as_at + 1)?.offset,
+    ))
+}
+
 pub(super) fn is_temp_schema_name(n: &[u8]) -> bool {
     eq_ci(n, b"sqlite_temp_schema") || eq_ci(n, b"sqlite_temp_master")
 }
@@ -733,7 +765,13 @@ impl<S: Storage> Connection<S> {
                         && !routed.as_slice().contains(&k)
                 })
             });
-            if *kind == Kind::Func {
+            if *kind == Kind::Func || ic_fn(n) {
+                // (Its `temp.` qualifier is ignored on main.)
+                if ic_fn(n)
+                    && let Some(i) = i
+                {
+                    routed.push(i);
+                }
                 main += usize::from(
                     i.and_then(|i| qualifier(t, i, arena)) == Some(false)
                         || self.func_reads_main(t, i, n, arena),
@@ -923,14 +961,9 @@ impl<S: Storage> Connection<S> {
                 && create_temp
                 && self.temp_has(handle_bytes(arena, *name), false)
             {
-                let mut noop = copy_vec(b"CREATE TABLE IF NOT EXISTS \"");
-                for &b in handle_bytes(arena, *name) {
-                    noop.push(b);
-                    if b == b'"' {
-                        noop.push(b'"');
-                    }
-                }
-                noop.extend_from_slice(b"\" AS SELECT 1");
+                let mut noop = copy_vec(b"CREATE TABLE IF NOT EXISTS ");
+                noop.extend_from_slice(super::alter::quoted(handle_bytes(arena, *name)).as_slice());
+                noop.extend_from_slice(b" AS SELECT 1");
                 return Ok(Route::Temp(noop));
             }
             if let Some(f) = self.fed_route(&ast, &text, t, create_temp, arena)? {
@@ -1049,31 +1082,7 @@ impl<S: Storage> Connection<S> {
             return Err(Error::Unsupported);
         };
         let t = toks.as_slice();
-        // `name [(columns)] AS body`.
-        let Some(ni) = tok_index(t, vh) else {
-            return Err(Error::Unsupported);
-        };
-        let mut j = ni + 1;
-        let mut depth_p = 0usize;
-        let as_at = loop {
-            match t.get(j).map(|x| x.tok) {
-                None => return Err(Error::Unsupported),
-                Some(Tok::LParen) => depth_p += 1,
-                Some(Tok::RParen) => depth_p = depth_p.saturating_sub(1),
-                Some(Tok::Ident(h, false))
-                    if depth_p == 0 && eq_ci(handle_bytes(arena, h), b"AS") =>
-                {
-                    break j;
-                }
-                _ => {}
-            }
-            j += 1;
-        };
-        let (Some(cols_from), Some(cols_to), Some(body)) = (
-            t.get(ni + 1).map(|x| x.offset),
-            t.get(as_at).map(|x| x.offset),
-            t.get(as_at + 1).map(|x| x.offset),
-        ) else {
+        let Some((cols_from, cols_to, body)) = view_head(t, vh, arena) else {
             return Err(Error::Unsupported);
         };
         let mut names = AVec::new();
@@ -1082,7 +1091,7 @@ impl<S: Storage> Connection<S> {
         let (mut reads_temp, mut reads_main) = (false, false);
         for (h, kind) in names.iter() {
             let n = handle_bytes(arena, *h);
-            if *kind == Kind::Func {
+            if *kind == Kind::Func || ic_fn(n) {
                 reads_main |= self.func_reads_main(t, tok_index(t, *h), n, arena);
                 continue;
             }
@@ -1109,15 +1118,7 @@ impl<S: Storage> Connection<S> {
         }
         // `"name"(columns) AS (body)`; the body may end in a `--`
         // comment.
-        let mut cte = AVec::new();
-        cte.push(b'"');
-        for &b in name {
-            cte.push(b);
-            if b == b'"' {
-                cte.push(b'"');
-            }
-        }
-        cte.push(b'"');
+        let mut cte = super::alter::quoted(name);
         cte.extend_from_slice(sql.get(cols_from..cols_to).unwrap_or_default());
         cte.extend_from_slice(b"AS (");
         cte.extend_from_slice(sql.get(body..).unwrap_or_default());
@@ -1247,7 +1248,9 @@ impl<S: Storage> Connection<S> {
                 )
             })
         };
-        eponymous(n) || (n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_")) && !temp_arg())
+        eponymous(n)
+            || ic_fn(n)
+            || (n.get(..7).is_some_and(|p| eq_ci(p, b"pragma_")) && !temp_arg())
     }
 
     /// Whether a write statement's target (an INSERT / UPDATE /
@@ -1313,14 +1316,8 @@ impl<S: Storage> Connection<S> {
                 }
                 for (name, _) in marks.iter() {
                     if let Some(n) = name {
-                        let mut s = copy_vec(b"SAVEPOINT \"");
-                        for &b in n.as_slice() {
-                            s.push(b);
-                            if b == b'"' {
-                                s.push(b'"');
-                            }
-                        }
-                        s.push(b'"');
+                        let mut s = copy_vec(b"SAVEPOINT ");
+                        s.extend_from_slice(super::alter::quoted(n.as_slice()).as_slice());
                         script.push(s);
                     }
                 }
@@ -1563,11 +1560,6 @@ impl<S: Storage> Connection<S> {
         } else {
             None
         };
-        // A WITHOUT ROWID temp table is read through its own key
-        // order, which this scan does not model.
-        if !t.has_rowid() {
-            return Err(Error::Unsupported);
-        }
         plans.push(super::SourcePlan {
             #[cfg(feature = "explain")]
             eqp: Default::default(),
@@ -1811,14 +1803,9 @@ impl<S: Storage> Connection<S> {
                     return Err(Error::Unsupported);
                 };
                 flex = fx;
-                let mut insert = copy_vec(b"INSERT INTO \"");
-                for &b in name.iter() {
-                    insert.push(b);
-                    if b == b'"' {
-                        insert.push(b'"');
-                    }
-                }
-                insert.extend_from_slice(b"\" VALUES (");
+                let mut insert = copy_vec(b"INSERT INTO ");
+                insert.extend_from_slice(super::alter::quoted(name.as_slice()).as_slice());
+                insert.extend_from_slice(b" VALUES (");
                 for i in 0..affs.len() {
                     if i > 0 {
                         insert.push(b',');

@@ -333,7 +333,10 @@ impl<S: Storage> Statement<'_, S> {
                 (0, 0),
                 (window.0, window.0.saturating_add(window.1)),
             );
-            Mode::Sort(AVec::new(), TopN::new(top.2))
+            Mode::Sort(
+                AVec::new(),
+                TopN::new(top.2).distinct(qp.distinct, qp.items.as_slice()),
+            )
         } else if qp.distinct {
             Mode::Distinct(AVec::new())
         } else {
@@ -744,7 +747,7 @@ impl<S: Storage> Statement<'_, S> {
                 // every outer row, computed once.
                 if !lateral && d > 0 && super::vtab::filters_whole(vt) {
                     if lv.cache.is_none() {
-                        lv.cache = Some(self.vtab_whole(sp, vt, &padded).await?);
+                        lv.cache = Some(self.vtab_rows(sp, vt, &padded, None).await?);
                     }
                     lv.src = Src::Cached(0);
                 } else {

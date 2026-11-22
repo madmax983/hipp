@@ -5,6 +5,98 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Review fixes: ORDER BY / LIMIT answers and plan lines (wave 21, unit `order_eqp`)
+
+- Regression fix (`planner`): a row-value IN whose field the reader's
+  index or rowid serves is the pin's vector IN loop, which runs the
+  subquery, its ORDER BY included, unless the loop's fields read an
+  index unique over them; hipp read the subquery's index and answered
+  where the pin fails.
+- A row value naming the subquery table's rowid (or INTEGER PRIMARY
+  KEY) matches the trailing rowid of its indexes: the index is read and
+  the ORDER BY never runs, as on the pin.
+- A window FROM subquery whose ORDER BY starts its window's sort has
+  none on the pin (`sqlite3WindowRewrite`): its reader keeps its sorter
+  (EXPLAIN QUERY PLAN showed none after a WHERE-fixed column).
+- A DISTINCT ordered by its result columns is the pin's GROUP BY only
+  with default NULLS placements: `ORDER BY b NULLS LAST, 2` now stops
+  at the LIMIT's distinct rows and shows its sorter line.
+- A DISTINCT repeat no longer computes its ORDER BY key (the pin drops
+  it first): `SELECT DISTINCT b FROM t ORDER BY <failing expr>` answers
+  when the failing row repeats an earlier one, in every executor path.
+- Sizes: tiny 76,928 (Δ 0); full 496,508 (-184); max 1,001,212 (+8);
+  xl 1,105,472 (+824). Ratchets set to the measured figures.
+
+### Review fixes: reads across databases (wave 21, unit `stmt_txn`)
+
+- A table-valued pragma function (or dbstat) in a statement naming an
+  attached table is answered by the database the pin finds its object
+  in: a query main answers runs on main; an attached / TEMP write that
+  another database answers is refused (it read the attached file's
+  table of the same name).
+- `IN` lists, `IN (SELECT ...)` and ORs of `=` on the
+  `pragma_integrity_check` / `pragma_quick_check` and generate_series
+  arguments run one filter per distinct, sorted value, as the pin's IN
+  loop (no rows / the list ignored before); EXPLAIN QUERY PLAN shows a
+  table-valued function's argument subqueries.
+- The check tables: `sqlite_master` found in every database and the
+  temp schema's names only in temp, TEMP / attached views `ok`, the TEMP
+  database opened by an unqualified check, EXISTS / scalar readers of a
+  corrupt check answered before its error.
+- hipp-cli names the columns of TEMP views the temp database cannot
+  plan from their text (headers were `column1`, ...).
+- Fix (`sql`): a view over `pragma_table_list` no longer recurses
+  until the stack overflows.
+- Sizes: tiny 76,928 (Δ 0); full 496,692 (+8); max 1,001,204 (+3,896);
+  xl 1,104,648 (+3,856). Ratchets raised to the measured figures
+  (owner approval pending).
+
+### ORDER BY / LIMIT wrong answers and EXPLAIN QUERY PLAN differences (wave 21, unit `order_eqp`)
+
+- DISTINCT under an ORDER BY an index delivers in part stops after the
+  LIMIT's distinct rows, as the pin's sorter does; a DISTINCT whose
+  ORDER BY repeats its result columns sorts every row (the pin's GROUP
+  BY rewrite). `same_expr` compares CASE and LIKE.
+- `x IN (SELECT col FROM tbl ORDER BY ...)` where the rowid or an
+  index serves `col` no longer runs the subquery's ORDER BY (`planner`;
+  an index loop's probes need a UNIQUE index, as on the pin).
+- A signed `LIMIT +1` in a scalar / EXISTS subquery takes no
+  UNION-with-LIMIT-1 shortcut. A scalar / EXISTS subquery is planned
+  for its implicit LIMIT 1 or a bare written 1, any other LIMIT as
+  none (the pin's `X <> 0`); an EXISTS is planned with no ORDER BY.
+- A lone FROM subquery delivers ORDER BY columns its reader's WHERE
+  fixes (`=`, `IS`, one-item `IN`, `IS NULL`), then its own order.
+- EXPLAIN QUERY PLAN: the IN operator's `CREATE BLOOM FILTER` lines
+  per compound arm, merge output and VALUES chain row, none under a
+  sorter, before a DISTINCT's temp b-tree; a merged VALUES core's
+  sorter; `SCAN 1 CONSTANT ROW` for a chain under a scalar / EXISTS.
+- Sizes: tiny 76,928 (Δ 0); full 496,684 (+1,376); max 997,308 (+2,040); xl 1,100,792 (+2,104). Ratchets raised to the measured figures (no offsetting saving found); the tiny profile holds none of this code.
+
+### Reads across databases: pragma_integrity_check, views in attached writes, WITHOUT ROWID seeks (wave 21, unit `stmt_txn`)
+
+- `pragma_integrity_check` / `pragma_quick_check` as table-valued
+  functions (leaf `attach` with `vtab`): the pin's eponymous pragma
+  virtual tables, with its argument forms ("no such table: 2", the
+  `schema` argument, "unknown database"), hidden columns `arg` and
+  `schema`, `SCAN pragma_integrity_check VIRTUAL TABLE INDEX 0:`, and
+  the corruption error after the check's rows. Statements reading one
+  run on main whatever else they name.
+- A write of an attached or TEMP table reading another database's view,
+  or a TEMP view over other databases' tables, runs (it was refused):
+  the views are written in as common table expressions, their table
+  names bound to their own database.
+- WITHOUT ROWID tables of attached databases and of the TEMP database
+  are searched by their PRIMARY KEY and indexes from main's statements
+  (they were read whole; a TEMP one was refused in a mixed statement).
+- Fix (`planner`, every database): a WHERE over a subquery or view that
+  reads a LIMITed one through another merged body filtered before the
+  LIMIT, or merged an ORDER BY / aggregate over it; the flattener now
+  checks the pin's restrictions (8), (9), (16) and (19) against the
+  merged body.
+- Sizes: tiny 76,928 (Δ 0); full 495,308 (-152); max 995,268 (+5,532);
+  xl 1,098,688 (+5,444). Not built: the statement transaction spanning
+  databases and TEMP triggers across databases (design in STATUS.md).
+
 ### The pin shell's dot-commands, output modes and `.dump` options (wave 20, unit `shell`)
 
 - hipp-cli only (no library or size change): `.mode` list, csv,

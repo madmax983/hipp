@@ -79,7 +79,7 @@ fn perr<E>(offset: usize, kind: ParseKind) -> Error<E> {
 /// `EXISTS (SELECT a FROM t UNION SELECT abs(..) LIMIT 2)` computes
 /// every core (a merge).
 #[cfg(feature = "sql")]
-fn union_limit_one(s: &mut SelectStmt, sub: u8) {
+fn union_limit_one(s: &mut SelectStmt, sub: u8, signed: bool) {
     fn int(e: &Expr, signs: bool) -> Option<i64> {
         match e {
             Expr::Literal(Literal::Integer(n)) => Some(*n),
@@ -87,6 +87,16 @@ fn union_limit_one(s: &mut SelectStmt, sub: u8) {
             Expr::Pos(x) if signs => int(x, true),
             _ => None,
         }
+    }
+    // (A signed LIMIT of a scalar / EXISTS subquery is no bare 1: the
+    // `+` / `-` node the fold dropped comes back, for the planner too.)
+    if sub > 0
+        && signed
+        && let Some(l) = s.limit.as_mut()
+        && matches!(**l, Expr::Literal(_))
+    {
+        let e = core::mem::replace(&mut **l, Expr::Literal(Literal::Null));
+        **l = Expr::Pos(Box::new(e));
     }
     let one = match s.limit.as_deref() {
         None => sub > 0,
@@ -198,6 +208,11 @@ struct Parser<'a> {
     /// EXISTS (`union_limit_one`). Taken at the body's start.
     #[cfg(feature = "sql")]
     first_sub: u8,
+    /// The last LIMIT parsed began with a sign (v0.17, `sql`): the
+    /// pin's scalar / EXISTS LIMIT-1 shortcut wants a bare integer
+    /// token there (`union_limit_one`), and signed literals fold.
+    #[cfg(feature = "sql")]
+    lim_signed: bool,
     /// Parsing a CREATE VIEW body (v0.16 review fix): the pin keeps
     /// a view's tree in its reduced form, whose leaves lose their
     /// height, so a leaf the pin resolves on its own (`SELECT a`,
@@ -898,6 +913,8 @@ impl<'a> Parser<'a> {
             vtail: false,
             #[cfg(feature = "sql")]
             first_sub: 0,
+            #[cfg(feature = "sql")]
+            lim_signed: false,
             #[cfg(feature = "query")]
             reduced: false,
             #[cfg(feature = "query")]
@@ -4112,7 +4129,7 @@ impl<'a> Parser<'a> {
         let mut stmt = self.subquery::<E>(2 + extra_parens)?;
         #[cfg(feature = "expr_index")]
         {
-            stmt.first_row = true;
+            stmt.first_row = 2;
         }
         for _ in 0..=extra_parens {
             self.expect::<E>(Tok::RParen)?;
@@ -4154,7 +4171,7 @@ impl<'a> Parser<'a> {
             let mut stmt = self.subquery::<E>(1)?;
             #[cfg(feature = "expr_index")]
             {
-                stmt.first_row = true;
+                stmt.first_row = 1;
             }
             self.expect::<E>(Tok::RParen)?;
             self.need::<E>(3)?;
@@ -4818,7 +4835,7 @@ impl<'a> Parser<'a> {
             return Err(perr(self.cur().offset, ParseKind::TooManyCompoundTerms));
         }
         #[cfg(feature = "sql")]
-        union_limit_one(&mut head, first_sub);
+        union_limit_one(&mut head, first_sub, self.lim_signed);
         Ok(head)
     }
 
@@ -5013,7 +5030,7 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "explain")]
             sel: 0,
             #[cfg(feature = "expr_index")]
-            first_row: false,
+            first_row: 0,
             vchain: false,
         }
     }
@@ -5173,7 +5190,7 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "explain")]
             sel: 0,
             #[cfg(feature = "expr_index")]
-            first_row: false,
+            first_row: 0,
             #[cfg(feature = "sql")]
             vchain: false,
         })
@@ -5282,7 +5299,17 @@ impl<'a> Parser<'a> {
         if self.eat_kw(b"LIMIT") {
             // `... orderby_opt LIMIT expr [OFFSET | COMMA expr]`:
             // one TK_LIMIT node over both on the pin.
+            #[cfg(feature = "sql")]
+            let at = self.pos;
             let first = self.limit_term::<E>(base + 9)?;
+            #[cfg(feature = "sql")]
+            {
+                let lead = self.toks.as_slice().get(at..).unwrap_or(&[]);
+                self.lim_signed = lead
+                    .iter()
+                    .find(|t| t.tok != Tok::LParen)
+                    .is_some_and(|t| matches!(t.tok, Tok::Plus | Tok::Minus));
+            }
             let (mut h, mut rsub) = (self.eh, self.rsub);
             let comma = self.eat(Tok::Comma);
             let second = if comma || self.eat_kw(b"OFFSET") {
@@ -5393,7 +5420,7 @@ impl<'a> Parser<'a> {
             #[cfg(feature = "explain")]
             sel: self.next_sel(),
             #[cfg(feature = "expr_index")]
-            first_row: false,
+            first_row: 0,
             #[cfg(feature = "sql")]
             vchain: false,
         }

@@ -32,9 +32,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 | profile | build | size | budget |
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
-| `full` | `--no-default-features --features full` | 495,060 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 989,024 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,092,348 B | 1.25 MiB |
+| `full` | `--no-default-features --features full` | 496,508 B | 512 KiB |
+| `max` | `--no-default-features --features max` | 1,001,212 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,105,472 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,54 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **ORDER BY / LIMIT answers and plan lines as the pin's** (unit
+  `order_eqp`, ungated; the IN-index read under `planner`). DISTINCT
+  under an ORDER BY an index delivers in part stops at the LIMIT's
+  distinct rows (a DISTINCT ordered by its own result columns, with
+  default NULLS placements, is the pin's GROUP BY and sorts every row),
+  and a DISTINCT repeat computes no ORDER BY key; `x IN (SELECT col
+  FROM t ORDER BY ...)` reads the rowid or an index of `col` in place
+  of the subquery (row values naming the rowid too), never running its
+  ORDER BY, while a row-value IN on the reader's index runs it as the
+  pin's vector IN loop does; `LIMIT +1` in a scalar /
+  EXISTS subquery takes no UNION-with-LIMIT-1 shortcut, and such a
+  subquery is planned for the LIMIT the pin leaves it (an EXISTS with
+  no ORDER BY); a WHERE `col = x` over a FROM subquery delivers an
+  ORDER BY on `col` (a window subquery's ORDER BY delivers nothing);
+  EXPLAIN QUERY PLAN shows the IN operator's Bloom
+  filters where the pin writes the set's rows, a merged VALUES core's
+  sorter and `SCAN 1 CONSTANT ROW` for a chain under a LIMIT. Still
+  open: the compound merge's lazy arms, the LIKE optimisation,
+  compound flattening and co-routine join order (STATUS.md).
+- **Reads across databases hipp refused or read whole** (unit
+  `stmt_txn`, leaf `attach`; the pragma tables also need `vtab`).
+  `pragma_integrity_check` / `pragma_quick_check` are table-valued
+  functions, as the pin's eponymous pragma virtual tables: the
+  argument is a table name (`(2)` is "no such table"), found in the
+  `schema` argument's database or in temp, main and the attached ones
+  in turn; hidden columns `arg` / `schema`, the pin's plan line, the
+  check's rows and then its corruption error. A write of an attached
+  or TEMP table that reads another database's view (or a TEMP view
+  over other databases' tables) runs, the view written in as a common
+  table expression with its names bound to its own database. A WITHOUT
+  ROWID table of another database (a TEMP one was refused in a mixed
+  statement) is searched by its PRIMARY KEY and its indexes from
+  main's statements, with the pin's plans and join order. Found on
+  the way and fixed for every database (`planner`): a WHERE over a
+  subquery or view reading a LIMITed one through another merged body
+  filtered before the LIMIT (wrong rows). Still open (STATUS.md): the
+  statement transaction spanning databases and so TEMP triggers across
+  databases (design recorded), writes of attached / TEMP tables
+  reading other databases' tables (read whole), a statement CTE named
+  like another database's view it reads. Review fixes: a table-valued
+  pragma function (or dbstat) is answered by the database the pin
+  finds its object in (an attached write read the attached file's
+  `m`; one another database answers is now refused), `IN` / `OR` on the
+  check tables' and generate_series' arguments loop as the pin's IN
+  does (they read nothing / ignored the list), the check's schema-table
+  lookup, its TEMP open and EXISTS / scalar readers over a corrupt
+  check match the pin, the shell names TEMP views over pragma tables,
+  and a view over `pragma_table_list` no longer overflows the stack.
 - **The pin shell's dot-commands and output modes in hipp-cli** (unit
   `shell`, hipp-cli only: no library or size change). `.mode list`,
   `csv`, `column`, `line`, `box`, `markdown`, `table`, `quote`, `json`,
@@ -108,11 +156,11 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   fixes (also on main tables): a later LEFT JOIN's ON term no longer
   lets a partial index of an earlier table drop rows, and an index
   read for a generated column is no COVERING INDEX, as on the pin. Still
-  open (STATUS.md): WITHOUT ROWID tables of another database (read
-  whole), writes of an attached / TEMP table reading other databases
-  (read whole), TEMP triggers across databases, another database's
-  view read by an attached / TEMP write, and `pragma_integrity_check`
-  as a table-valued function.
+  open (STATUS.md): writes of an attached / TEMP table reading other
+  databases (read whole) and TEMP triggers across databases (WITHOUT
+  ROWID tables of another database, another database's view read by
+  an attached / TEMP write and `pragma_integrity_check` as a
+  table-valued function: closed by `stmt_txn` above).
 - **Result-level gaps of wave 18** (unit `result_gaps`, ungated
   fixes). The pin's top-N sorter: under an ORDER BY with a LIMIT and
   no DISTINCT a row's ORDER BY key is computed first, and a row whose
@@ -159,9 +207,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   reads another database's same-named table by an unqualified name and
   other databases' tables by three-part names. Still open (STATUS.md):
   TEMP triggers on main or attached tables or writing another
-  database, and an attached or TEMP write reading another database's
-  view (index / rowid access into attached and TEMP tables: closed by
-  `attach_access` above).
+  database (an attached or TEMP write reading another database's
+  view: closed by `stmt_txn`; index / rowid access into attached and
+  TEMP tables: closed by `attach_access` above).
 - **VALUES chains, lazy collations, inert aggregates** (unit
   `values_chain`, ungated fixes). A multi-row VALUES is the pin's
   `sqlite3MultiValues` row by row — a co-routine, or one-row selects

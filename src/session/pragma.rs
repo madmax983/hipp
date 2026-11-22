@@ -900,7 +900,15 @@ impl<S: Storage> Connection<S> {
                             // for one that cannot be planned, as
                             // on the pin.
                             let n = handle_bytes(ca, v.name);
-                            let ncol = self.view_columns(n).map_or(0, |c| c.len());
+                            // (None while one is being found: a
+                            // view over pragma_table_list.)
+                            let ncol = if self.listing.replace(true) {
+                                0
+                            } else {
+                                let c = self.view_columns(n).map_or(0, |c| c.len());
+                                self.listing.set(false);
+                                c
+                            };
                             (n, n, b"view", ncol, false, false)
                         }
                         Obj::Schema => (
@@ -1957,7 +1965,7 @@ impl<S: Storage> Statement<'_, S> {
                 if p.main_only {
                     return Ok(rows);
                 }
-                return self.integrity_rest(&p, quick, rows).await;
+                return self.integrity_rest(&p, quick, rows, None).await;
             }
             #[cfg(not(feature = "attach"))]
             return self.integrity(&p, quick).await;
@@ -2264,7 +2272,11 @@ impl<S: Storage> Statement<'_, S> {
 
     /// `integrity_check` / `quick_check` (see the module docs):
     /// the pin's result rows, limit and order.
-    async fn integrity(&mut self, p: &PragmaPlan, quick: bool) -> Result<Rows, S::Error> {
+    pub(super) async fn integrity(
+        &mut self,
+        p: &PragmaPlan,
+        quick: bool,
+    ) -> Result<Rows, S::Error> {
         // The limit: a number argument that is a 32-bit integer
         // (the pin reads the token without its sign), else 100; a
         // name argument — or a number outside 32 bits, sign
