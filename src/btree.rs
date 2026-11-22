@@ -290,44 +290,99 @@ fn build_leaf_image(page: u32, page_size: usize, cells: &[LeafCell], base: &[u8]
     img
 }
 
-/// `build_leaf_image` of `metas` with `new_cell` inserted at `pos`,
-/// copying cell bytes straight from the page image `snap`.
-fn build_leaf_image_inserted(
+/// Write `out` (leaf `page`'s frame) as `build_leaf_image` of
+/// `metas` with `new_cell` inserted at `pos` would build it, copying
+/// cell bytes straight from the page image `snap`. Every byte is
+/// written: page 1's first 100 bytes are the frame's own (what
+/// `build_leaf_image` copies from it), the header, the pointers and
+/// the cells are stored and the gap between them is zeroed.
+fn write_leaf_inserted(
+    out: &mut [u8],
     page: u32,
-    page_size: usize,
     snap: &[u8],
     metas: &[CellMeta],
     pos: usize,
     new_cell: &[u8],
-    base: &[u8],
-) -> AVec<u8> {
-    let mut img = vec_zeroed(page_size);
-    if page == 1 {
-        img.as_mut_slice()[0..100].copy_from_slice(&base[0..100]);
-    }
+) {
     let hdr_off = if page == 1 { 100 } else { 0 };
-    let out = img.as_mut_slice();
-    let mut content = page_size;
     let total = metas.len() + 1;
-    let mut k = 0usize;
-    for i in 0..total {
-        let src: &[u8] = if i == pos {
-            new_cell
-        } else {
-            let m = &metas[k];
-            k += 1;
-            &snap[m.cell_off..m.cell_off + m.cell_len]
-        };
-        content -= src.len();
-        out[content..content + src.len()].copy_from_slice(src);
-        put_be_u16(out, hdr_off + 8 + 2 * i, content as u16);
-    }
+    let ptrs = hdr_off + 8;
+    let content = lay_cells_inserted(
+        out,
+        ptrs,
+        snap,
+        metas.len(),
+        |k| (metas[k].cell_off, metas[k].cell_len, metas[k].cell_len),
+        pos,
+        new_cell,
+    );
+    zero_gap(out, ptrs + 2 * total, content);
     out[hdr_off] = KIND_LEAF_TABLE;
     put_be_u16(out, hdr_off + 1, 0);
     put_be_u16(out, hdr_off + 3, total as u16);
     put_be_u16(out, hdr_off + 5, content_code(content));
     out[hdr_off + 7] = 0;
-    img
+}
+
+/// Lay `n_old + 1` cells out back to back from the end of `out`
+/// (slot 0 highest), slot `pos` holding `new` and the others old
+/// cell `k` (`cell(k)` = its offset in `old`, its own length and its
+/// length on the new page, the bytes past its own copied from `old`,
+/// 0 past the end of `old`), storing slot `j`'s offset at
+/// `ptrs + 2 * j`. Returns the content offset. Old cells that lie
+/// back to back in `old` (cell `k + 1` right below cell `k`, as on
+/// every page hipp writes) land back to back too, so each such run
+/// is one copy: the bytes are the ones a copy per cell would write.
+fn lay_cells_inserted(
+    out: &mut [u8],
+    ptrs: usize,
+    old: &[u8],
+    n_old: usize,
+    cell: impl Fn(usize) -> (usize, usize, usize),
+    pos: usize,
+    new: &[u8],
+) -> usize {
+    let mut content = out.len();
+    // The run `old[lo..hi]` still to copy; it ends at `content`.
+    let (mut lo, mut hi) = (0usize, 0usize);
+    for j in 0..=n_old {
+        if j == pos {
+            out[content..content + (hi - lo)].copy_from_slice(&old[lo..hi]);
+            (lo, hi) = (0, 0);
+            content -= new.len();
+            out[content..content + new.len()].copy_from_slice(new);
+        } else {
+            let (at, own, len) = cell(if j < pos { j } else { j - 1 });
+            if at + len <= old.len() {
+                if lo == hi || at + len != lo {
+                    out[content..content + (hi - lo)].copy_from_slice(&old[lo..hi]);
+                    hi = at + len;
+                }
+                lo = at;
+                content -= len;
+            } else {
+                out[content..content + (hi - lo)].copy_from_slice(&old[lo..hi]);
+                (lo, hi) = (0, 0);
+                content -= len;
+                out[content..content + own].copy_from_slice(&old[at..at + own]);
+                for k in own..len {
+                    out[content + k] = old.get(at + k).copied().unwrap_or(0);
+                }
+            }
+        }
+        out[ptrs + 2 * j..ptrs + 2 * j + 2].copy_from_slice(&(content as u16).to_be_bytes());
+    }
+    out[content..content + (hi - lo)].copy_from_slice(&old[lo..hi]);
+    content
+}
+
+/// Zero `out[from..to]`, the free gap between a rewritten page's
+/// cell pointers and its cells (every caller checked that the cells
+/// fit, so `from <= to`).
+fn zero_gap(out: &mut [u8], from: usize, to: usize) {
+    if let Some(g) = out.get_mut(from..to) {
+        g.fill(0);
+    }
 }
 
 fn build_interior_image(
@@ -1143,21 +1198,14 @@ pub async fn btree_insert<S: Storage>(
         let content: usize = metas.iter().map(|m| m.cell_len).sum::<usize>() + new_cell.bytes.len();
         if hdr + 8 + 2 * (metas.len() + 1) + content <= usable {
             let idx = pager.dirty_page(leaf_page).await?;
-            let base = if leaf_page == 1 {
-                copy_bytes(pager.frame_data(idx))
-            } else {
-                AVec::new()
-            };
-            let img = build_leaf_image_inserted(
+            write_leaf_inserted(
+                pager.frame_data_mut(idx),
                 leaf_page,
-                page_size,
                 leaf_snap.as_slice(),
                 metas.as_slice(),
                 insert_pos,
                 new_cell.bytes.as_slice(),
-                base.as_slice(),
             );
-            set_page_image(pager, leaf_page, img.as_slice()).await?;
             return Ok(());
         }
     }
@@ -3917,26 +3965,19 @@ async fn write_index_leaf_inserted<S: Storage>(
     }
     let idx = pager.dirty_page(page).await?;
     let out = pager.frame_data_mut(idx);
-    out.fill(0);
-    let mut content = out.len();
-    for j in 0..=n {
-        let ptr = if j == pos {
-            content -= new.bytes.len();
-            out[content..content + new.bytes.len()].copy_from_slice(new.bytes.as_slice());
-            content
-        } else {
-            let src = if j < pos { j } else { j - 1 };
-            let (at, total) = (usize::from(spans[src].0), usize::from(spans[src].1));
-            let len = padded_cell_len(total);
-            content -= len;
-            out[content..content + total].copy_from_slice(&old[at..at + total]);
-            for k in total..len {
-                out[content + k] = old.get(at + k).copied().unwrap_or(0);
-            }
-            content
-        };
-        put_be_u16(out, 8 + 2 * j, ptr as u16);
-    }
+    let content = lay_cells_inserted(
+        out,
+        8,
+        old,
+        n,
+        |k| {
+            let (at, own) = (usize::from(spans[k].0), usize::from(spans[k].1));
+            (at, own, padded_cell_len(own))
+        },
+        pos,
+        new.bytes.as_slice(),
+    );
+    zero_gap(out, 8 + 2 * (n + 1), content);
     out[0] = KIND_LEAF_INDEX;
     put_be_u16(out, 1, 0);
     put_be_u16(out, 3, (n + 1) as u16);
