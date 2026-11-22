@@ -582,3 +582,47 @@ bytes; t-gmax 854,004 B.
 
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 1000`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 1000`
+
+### After: rewrite the leaf in place, copying back-to-back cells as runs
+
+`write_leaf_inserted` (table) and `write_index_leaf_inserted` (index)
+write the new leaf straight into the dirtied frame through one helper,
+`lay_cells_inserted`: old cells that lie back to back in the snapshot
+(cell `k + 1` right below cell `k`, as on every page hipp writes) land
+back to back on the new page too, so each such run is one copy (the
+bytes a copy per cell would write, index padding included); a cell
+whose padding would read past the page is still copied alone with the
+old zero rule. Only the gap between the pointers and the cells is
+zeroed (every other byte is written), the table path no longer builds
+a zeroed 4 KiB image, copies page 1's frame for its first 100 bytes
+(they are the frame's own) or copies the image back
+(`set_page_image`). Workload checksums identical (176089 / 657610 /
+4083309). Test pass/fail set identical before/after (1131 tests: 134
+pass, 992 fail on the absent `sqlite3` oracle and 5 are ignored, the
+same on the baseline commit). A 3,000-row shuffled-rowid workload (12 tables on page 1,
+DESC / UNIQUE NOCASE / multi-column indexes, 300 / 1,200-byte overflow
+keys, deletes, updates, a WITHOUT ROWID table with a secondary index,
+INSERT ... SELECT, late CREATE INDEX) through the `hipp` CLI writes
+byte-identical files (cmp) at 512 B and 4096 B pages on both commits,
+and `integrity_check` is ok.
+
+| n    | total before  | total after   | Δ total |
+|------|---------------|---------------|---------|
+| 500  | 175,007,039   | 162,545,752   | -7.12%  |
+| 1000 | 417,778,543   | 387,441,290   | -7.26%  |
+| 2000 | 1,063,680,749 | 995,814,161   | -6.38%  |
+
+n=1000: `btree_insert` inclusive 62,833,859 -> 52,593,399 (-16.3%);
+`index_insert_core` inclusive 149,905,694 -> 129,755,496 (-13.4%);
+the table rewrite 22,507,977 (`build_leaf_image_inserted`) ->
+13,467,178 (`write_leaf_inserted`, -40.2%). memset self 26,932,228 ->
+15,430,572; memcpy self 26,410,396 -> 15,501,722. dhat (n=1000):
+104,014,629 -> 95,822,629 bytes (-7.88%), 411,367 -> 409,367 blocks
+(-0.49%); t-gmax unchanged at 854,004 B.
+
+Not pursued: the index rewrite's per-cell loop (pointer store, span
+lookup, run check) is still ~36 Ir per cell (20.2M self at n=1000,
+plus 2.2M in an out-of-line `padded_cell_len`).
+
+Size gates: tiny -20 B, full +424 B, max +768 B, xl +792 B; ratchets
+set to those figures (each well under `justify_over`).
