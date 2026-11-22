@@ -1325,6 +1325,11 @@ pub struct JMask<'x> {
     pub me: u64,
     /// The FROM-order prerequisites (CROSS / LEFT JOIN).
     pub pre: u64,
+    /// The conjuncts that may prove a partial index's WHERE (v0.17
+    /// review fix; the pin's `whereUsablePartialIndex`): no other
+    /// source's LEFT JOIN ON terms, and only this source's own ON
+    /// terms when it is a LEFT JOIN's right side.
+    pub pconj: &'x [&'x RExpr],
 }
 
 /// The table being planned.
@@ -2036,8 +2041,12 @@ pub(crate) fn candidates(q: &Query<'_>, s: &Src, tab: &Table<'_>, ts: &[Term]) -
         if (tab.hint == Hint::Not && !tab.wr) || forced.is_some_and(|r| r != m.root) {
             continue;
         }
+        #[cfg(feature = "planner")]
+        let pconj = q.jm.map_or(q.conj, |j| j.pconj);
+        #[cfg(not(feature = "planner"))]
+        let pconj = q.conj;
         if let Some(p) = &m.pred
-            && !implies(q.conj, p)
+            && !implies(pconj, p)
         {
             continue;
         }

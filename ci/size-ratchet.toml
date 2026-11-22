@@ -227,10 +227,19 @@ justify_over = 16384
 # special cases), co-routine GROUP BY + ORDER BY order, the partly
 # delivered ORDER BY's LIMIT stop, names as text handles, the CTE
 # limit's cursor count.
+# 986,232 -> 989,024 (v0.17 attach_access, `attach` leaf; STATUS.md): +2,792 B.
+# Seeks into attached / TEMP tables through their own catalog and pager:
+# the TEMP pager's arm of each access-path B-tree call (~880 B), the owner
+# lookups and plan checks, the attached table's defaults / hint, EQP's
+# per-source catalog. No offsetting saving found.
+# 989,024 -> 989,128 (v0.17 attach_access review fixes, ungated correctness;
+# STATUS.md): +104 B. A generated column read marks every column read
+# (`gen_reads`, the pin's sqlite3ExprColUsed): no COVERING INDEX for it.
 # +632 B (Bolt): prepare lexes each statement once for the TEMP /
 # ATTACH routers and the parse (prepare -17.7% instructions on
-# bolt_workload). Measured on main at 8ce2df6.
-ratchet = 986864
+# bolt_workload). Measured on main at 8ce2df6; +608 B after merging main
+# into v0.17 wave 20 (989,736).
+ratchet = 989736
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -321,10 +330,17 @@ justify_over = 32768
 # special cases), co-routine GROUP BY + ORDER BY order, the partly
 # delivered ORDER BY's LIMIT stop, names as text handles, the CTE
 # limit's cursor count.
+# 1,089,500 -> 1,092,348 (v0.17 attach_access, `attach` leaf; STATUS.md):
+# +2,848 B, the `max` growth plus the join planner's owner lookups.
+# 1,092,348 -> 1,092,620 (v0.17 attach_access review fixes, ungated
+# correctness; STATUS.md): +272 B, the `max` +104 B plus a LEFT JOIN's ON
+# term proving only its own source's partial index (`JMask::pconj`: rows
+# were lost).
 # +632 B (Bolt): prepare lexes each statement once for the TEMP /
 # ATTACH routers and the parse (prepare -17.7% instructions on
-# bolt_workload). Measured on main at 8ce2df6.
-ratchet = 1090132
+# bolt_workload). Measured on main at 8ce2df6; +624 B after merging main
+# into v0.17 wave 20 (1,093,244).
+ratchet = 1093244
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768

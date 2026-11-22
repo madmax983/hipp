@@ -40,7 +40,11 @@
 //!   `ext_source` makes each attached table such a source, read from
 //!   its database when the statement scans it; an attached database's
 //!   view is expanded there with its names bound to its own database
-//!   (`Expander::att_source`, v0.17).
+//!   (`Expander::att_source`, v0.17). v0.17 (`expr_index`): such a
+//!   rowid table (and a TEMP one) is planned with its own database's
+//!   catalog (`Connection::owner`, `xindex::Own`) and its access
+//!   paths read that database's B-trees through its own pager
+//!   (`pager_of`), so main seeks into it as into its own tables.
 //! - An unqualified `PRAGMA integrity_check` / `quick_check` checks
 //!   main, the TEMP database and each attached database in turn under
 //!   one error limit (`Statement::integrity_rest`, v0.17).
@@ -89,7 +93,7 @@ pub(super) struct ExtTab {
     name: AVec<u8>,
     /// Its database in the main connection's numbering: 0 main,
     /// 1 temp, 2 + i attached database i.
-    db: u8,
+    pub(super) db: u8,
     cols: AVec<(AVec<u8>, Affinity)>,
     decls: AVec<AVec<u8>>,
     colls: AVec<Coll>,
@@ -1225,6 +1229,24 @@ impl<S: Storage> Connection<S> {
         Ok(out)
     }
 
+    /// Inside a transaction, lock every attached database whose
+    /// tables a statement of main reads (`ext`) against DETACH
+    /// (`Attached::used`).
+    pub(super) fn lock_ext(&self) {
+        if !self.explicit_txn || self.alias.is_some() || self.is_temp {
+            return;
+        }
+        for e in self.ext.borrow().iter() {
+            if let Some(a) = self
+                .attached
+                .as_slice()
+                .get(usize::from(e.db).wrapping_sub(2))
+            {
+                a.used.set(true);
+            }
+        }
+    }
+
     /// Every row of table `name` of database `db` (main's numbering).
     async fn ext_rows(&mut self, db: u8, name: &[u8]) -> Result<Rows, S::Error> {
         match db {
@@ -1403,10 +1425,47 @@ impl<S: Storage> Connection<S> {
             affs.push(*a);
             defaults.push(OwnedValue::Null);
         }
+        // Read by a statement of main (v0.17, `expr_index`): a rowid
+        // table is planned with its own database's catalog and read
+        // through its own pager (`Connection::owner`), so its row
+        // decoding needs the table's defaults and generated columns.
+        #[cfg_attr(not(feature = "expr_index"), allow(unused_mut))]
+        let (mut root, mut gcols) = (0, None);
+        #[cfg(feature = "expr_index")]
+        let mut hint = crate::query::Hint::Any;
+        #[cfg(feature = "expr_index")]
+        if self.alias.is_none()
+            && !self.is_temp
+            && let Some(a) = self
+                .attached
+                .as_slice()
+                .get(usize::from(e.db).wrapping_sub(2))
+            && let Some(t) = a
+                .conn
+                .catalog
+                .find_readable(&a.conn.catalog_arena, e.name.as_slice())
+            && t.has_rowid()
+            && t.columns.len() == e.cols.len()
+        {
+            let ca = &a.conn.catalog_arena;
+            defaults.clear();
+            for c in t.columns.iter() {
+                defaults.push(super::read_default(ca, c));
+            }
+            hint = a.conn.index_hint(arena, t, s.indexed)?;
+            if t.has_generated() {
+                gcols = a
+                    .conn
+                    .table_rules(arena, t)?
+                    .and_then(|r| r.gcols)
+                    .map(Box::new);
+            }
+            root = t.root;
+        }
         plans.push(super::SourcePlan {
             #[cfg(feature = "explain")]
             eqp: Default::default(),
-            root: 0,
+            root,
             kind: s.kind,
             on: None,
             rowid_alias: e.rowid_alias,
@@ -1414,7 +1473,7 @@ impl<S: Storage> Connection<S> {
             affs,
             defaults,
             derived: None,
-            gcols: None,
+            gcols,
             rec: 0,
             #[cfg(any(feature = "json", feature = "vtab"))]
             tvf: 0,
@@ -1425,7 +1484,7 @@ impl<S: Storage> Connection<S> {
             #[cfg(feature = "expr_index")]
             access: None,
             #[cfg(feature = "expr_index")]
-            hint: crate::query::Hint::Any,
+            hint,
             temp: true,
             ext: u16::try_from(k + 1).unwrap_or(u16::MAX),
             #[cfg(feature = "planner")]
@@ -2156,6 +2215,108 @@ impl<S: Storage> Statement<'_, S> {
             for e in self.conn.ext.borrow_mut().as_mut_slice().iter_mut() {
                 e.rows = None;
             }
+        }
+    }
+}
+
+#[cfg(feature = "expr_index")]
+impl<S: Storage> Connection<S> {
+    /// The connection whose catalog holds source `sp`'s table (`Own`):
+    /// this one for a table of its own; for a table of another
+    /// database read by a statement of main, that database's, when its
+    /// B-tree can be read in place (a rowid table: `sp.root` is set,
+    /// `plan_ext_source` / `plan_temp_source`). `None` otherwise (the
+    /// source's rows are read whole, `scan_temp`).
+    pub(super) fn owner(&self, sp: &super::SourcePlan) -> Option<super::xindex::Own<'_, S>> {
+        if !sp.temp {
+            return Some(super::xindex::Own::Db(self));
+        }
+        if sp.root <= 1 || self.is_temp || self.alias.is_some() {
+            return None;
+        }
+        match self.src_db(sp) {
+            1 => self.temp.as_deref().map(super::xindex::Own::Temp),
+            d => self
+                .attached
+                .as_slice()
+                .get(usize::from(d).checked_sub(2)?)
+                .map(|a| super::xindex::Own::Db(&*a.conn)),
+        }
+    }
+
+    /// Source `sp`'s database in main's numbering (0 this one, 1 the
+    /// TEMP database, 2 + i attached database i).
+    pub(super) fn src_db(&self, sp: &super::SourcePlan) -> u8 {
+        if !sp.temp {
+            return 0;
+        }
+        match usize::from(sp.ext).checked_sub(1) {
+            None => 1,
+            Some(k) => self.ext.borrow().as_slice().get(k).map_or(0, |e| e.db),
+        }
+    }
+
+    /// Whether database `db` (`src_db`) still has the table rooted at
+    /// `root` with `ncols` columns (and index `index`, unless 0) a
+    /// planned access path reads: an error when a DDL statement of
+    /// that database replaced them since the statement was planned (as
+    /// `scan_temp` checks), so no freed page is read.
+    pub(super) fn check_src(
+        &self,
+        db: u8,
+        root: u32,
+        ncols: usize,
+        index: u32,
+    ) -> Result<(), S::Error> {
+        let ok = |cat: &crate::schema::Catalog| {
+            cat.tables
+                .iter()
+                .any(|t| t.root == root && t.columns.len() == ncols)
+                && (index == 0 || cat.indexes.iter().any(|i| i.root == index))
+        };
+        let here = match db {
+            0 => true,
+            1 => self.temp.as_deref().is_some_and(|c| ok(&c.catalog)),
+            d => self
+                .attached
+                .as_slice()
+                .get(usize::from(d).saturating_sub(2))
+                .is_some_and(|a| ok(&a.conn.catalog)),
+        };
+        if here {
+            Ok(())
+        } else {
+            Err(Error::Schema {
+                kind: SchemaKind::UnknownTable,
+            })
+        }
+    }
+
+    /// The pager of database `db` (`src_db`; `check_src` first).
+    /// Reading an attached database inside a transaction locks it
+    /// against DETACH.
+    pub(super) fn pager_of(&mut self, db: u8) -> Result<super::xindex::Pg<'_, S>, S::Error> {
+        use super::xindex::Pg;
+        let txn = self.explicit_txn;
+        match db {
+            0 => Ok(Pg::Db(&mut self.pager)),
+            1 => match self.temp.as_deref_mut() {
+                Some(c) => Ok(Pg::Temp(&mut c.pager)),
+                None => Err(Error::Unsupported),
+            },
+            d => match self
+                .attached
+                .as_mut_slice()
+                .get_mut(usize::from(d).saturating_sub(2))
+            {
+                Some(a) => {
+                    if txn {
+                        a.used.set(true);
+                    }
+                    Ok(Pg::Db(&mut a.conn.pager))
+                }
+                None => Err(Error::Unsupported),
+            },
         }
     }
 }

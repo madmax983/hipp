@@ -1531,8 +1531,13 @@ impl<S: Storage> Connection<S> {
     ) -> Result<usize, S::Error> {
         let ca = &tc.catalog_arena;
         let t = t.usable::<MemError>().map_err(mem_err)?;
-        // `INDEXED BY` is checked against the temp table's indexes.
-        tc.index_hint(arena, t, s.indexed).map_err(mem_err)?;
+        // `INDEXED BY` is checked against the temp table's indexes
+        // (and, v0.17 with `attach`, followed: `Connection::owner`).
+        #[cfg_attr(
+            not(all(feature = "attach", feature = "expr_index")),
+            allow(unused_variables)
+        )]
+        let hint = tc.index_hint(arena, t, s.indexed).map_err(mem_err)?;
         let mut cols = AVec::new();
         let mut affs = AVec::new();
         let mut defaults = AVec::new();
@@ -1584,7 +1589,9 @@ impl<S: Storage> Connection<S> {
             vt: None,
             #[cfg(feature = "expr_index")]
             access: None,
-            #[cfg(feature = "expr_index")]
+            #[cfg(all(feature = "attach", feature = "expr_index"))]
+            hint,
+            #[cfg(all(not(feature = "attach"), feature = "expr_index"))]
             hint: crate::query::Hint::Any,
             temp: true,
             #[cfg(feature = "attach")]

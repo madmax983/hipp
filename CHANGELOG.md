@@ -5,6 +5,76 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### The pin shell's dot-commands, output modes and `.dump` options (wave 20, unit `shell`)
+
+- hipp-cli only (no library or size change): `.mode` list, csv,
+  column, line, box, markdown, table, quote, json, tabs, insert and
+  ascii, `.headers`, `.separator`, `.nullvalue`, `.width`, byte for
+  byte as the pin's shell writes them (`render.rs`), with the column
+  names its titles show (`names.rs`); `.help` (the pin's text for the
+  commands hipp has), `.show`, `.print`, `.echo`, `.bail`, `.changes`,
+  `.timer`, `.output`, `.once`, `.read`, `.limit`, `.indexes`,
+  `.fullschema`; the pin's argument parsing, command prefixes, usage
+  lines and caret errors (`shell.rs`).
+- `.tables` (and `.indexes`) print the pin's sorted column grid
+  (hipp printed one name per line) and take its LIKE pattern.
+- `.dump --data-only`, `--nosys`, `--preserve-rowids`, `--newlines`
+  (ignored, as by the pin), `unknown option` for any other.
+- A new database file stays at 0 bytes until it is written, as the
+  pin leaves it (`lazy.rs`: the shell's storage holds the pager's
+  first page until a real write).
+- `-version` prints the pin's layout with hipp's name in the source
+  id's place: `3.54.1 2026-10-16 14:45:20 hipp-0.16.0 (64-bit)`.
+- `.parameter` with an unknown subcommand prints its help, as the pin.
+- Tests: `hipp-cli/tests/cli_v17_shell.rs`; `cli_diff.rs` and
+  `cli_v04.rs` compare `.tables` with the pin's grid.
+- Review fixes: `.schema --indent` (the pin's pretty layout), `--nosys`,
+  LIKE / GLOB patterns on the table name, the usage and unknown-option
+  errors (they printed nothing); a text ending in a comment completed
+  as the pin does (`.schema`, `.fullschema`, `.dump`), `*/` in a view
+  comment written `**`; `\r\n` breaks a columnar cell's line, stays
+  raw in the display modes, and line mode cuts its names as the pin
+  does (controls, ANSI CSI sequences); a script line loses one `\r`,
+  not two; `BEGIN IMMEDIATE; COMMIT;`, `PRAGMA incremental_vacuum` and
+  `schema_version = N` write a fresh file's page 1; `.tables`,
+  `.indexes`, `.limit`, `.databases`, `.fullschema` and `.open` on a
+  file that is not a database behave as the pin's lazy open; `.dump`
+  keeps `sqlite_sequence` last beside virtual tables; a line of only
+  `.` is nothing; a `\0` escape ends an argument; the `.read` nesting
+  limit counts standard input; `.mode column` (box, table, markdown,
+  json, insert) keeps the separators `.show` shows; the command-line
+  options `-csv`, `-box`, ..., `-header`, `-separator`, `-newline`,
+  `-nullvalue`, `-cmd`, `-bail`, `-echo`, `-batch`, `-noinit`; LIKE
+  `_` and GLOB `?` match one UTF-8 character.
+
+### Index and rowid access into attached and TEMP tables (wave 20, unit `attach_access`)
+
+- `attach` leaf: a statement of main plans a rowid table of an
+  attached database or of the TEMP database with that database's
+  catalog (indexes, NOT NULL columns, `sqlite_stat1`) and reads it
+  through that database's pager (`Connection::owner` / `pager_of`):
+  rowid and index seeks, ranges, IN lists, covering, partial and
+  expression indexes, ORDER BY from an index, `INDEXED BY` / `NOT
+  INDEXED` (an unknown index is "no such index"), MULTI-INDEX OR,
+  automatic indexes, Bloom filters, EXISTS-to-join and the join order;
+  EXPLAIN QUERY PLAN names that database's indexes. Before, such a
+  table was read whole and scanned per outer row in FROM order.
+- A statement of main that reads an attached table locks it against
+  DETACH from its first step, even when its seeks read no row.
+- Review fixes (ungated planner fixes, on main tables too): a LEFT
+  JOIN's ON term proves only its own right side's partial index (the
+  pin's `whereUsablePartialIndex`; `FROM aux.t LEFT JOIN m ON t.a = 5`
+  scanned `t` through a `WHERE a IS NOT NULL` index and lost rows);
+  reading a generated column marks every column read (the pin's
+  `sqlite3ExprColUsed`), so EXPLAIN QUERY PLAN says `USING INDEX`, not
+  `COVERING INDEX`, and the planner's covering-scan choices follow.
+- Still open: WITHOUT ROWID tables of another database, writes of an
+  attached / TEMP table reading other databases, TEMP triggers across
+  databases, views of another database read by such writes,
+  `pragma_integrity_check` as a table-valued function (STATUS.md).
+- Tests: `tests/attach_access_v17.rs`,
+  `hipp-cli/tests/cli_v17_attach_access.rs`.
+
 ### Result-level gaps of wave 18 (wave 19, unit `result_gaps`)
 
 - Fixes (ungated): the pin's top-N sorter — under an ORDER BY the loop

@@ -33,8 +33,8 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 |---|---|---|---|
 | `tiny` | `--no-default-features` | 76,928 B | 128 KiB |
 | `full` | `--no-default-features --features full` | 495,060 B | 512 KiB |
-| `max` | `--no-default-features --features max` | 986,232 B | 1 MiB |
-| `xl` | `--no-default-features --features xl` | 1,089,500 B | 1.25 MiB |
+| `max` | `--no-default-features --features max` | 989,024 B | 1 MiB |
+| `xl` | `--no-default-features --features xl` | 1,092,348 B | 1.25 MiB |
 
 - **`tiny`**: CREATE TABLE, INSERT (VALUES), scan SELECT with
   `WHERE col = literal`, transactions, rollback journal and recovery.
@@ -69,6 +69,50 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
 
 ## What v0.17 does
 
+- **The pin shell's dot-commands and output modes in hipp-cli** (unit
+  `shell`, hipp-cli only: no library or size change). `.mode list`,
+  `csv`, `column`, `line`, `box`, `markdown`, `table`, `quote`, `json`,
+  `tabs`, `insert`, `ascii` with `.headers`, `.separator`,
+  `.nullvalue` and `.width` (the pin's widths, wrapping and rules),
+  the column names the pin's titles show; `.help` (the pin's text for
+  hipp's commands), `.show`, `.print`, `.echo`, `.bail`, `.changes`,
+  `.timer`, `.output`, `.once`, `.read`, `.limit`, `.indexes`,
+  `.fullschema`, `.tables` in the pin's grid, the pin's argument
+  parsing, command prefixes and error messages; `.dump --data-only`,
+  `--nosys`, `--preserve-rowids`, `--newlines`; a new database file
+  left at 0 bytes until it is written; `-version` in the pin's layout
+  with hipp's name in the source id's place. Review fixes: `.schema
+  --indent` / `--nosys` / LIKE and GLOB patterns, `\r\n` in columnar
+  cells and line-mode names, a fresh file written by a write
+  transaction that changes nothing, the pin's lazy open of a file that
+  is not a database, the command-line forms of the settings (`-csv`,
+  `-header`, `-separator`, `-cmd`, `-bail`, ...). Each byte for byte
+  with the live pin's shell (`hipp-cli/tests/cli_v17_shell.rs`). Still
+  open (STATUS.md): the pin's other commands, modes and options
+  (refused by name), the pin's SQL error texts.
+- **Index and rowid access into attached and TEMP tables** (unit
+  `attach_access`, leaf `attach`). A statement of main that reads a
+  table of an attached database or of the TEMP database plans it with
+  that database's own catalog and reads it through that database's own
+  pager, as it does a main table: rowid and index seeks (ranges, IN
+  lists, partial / expression / collated indexes, covering indexes),
+  index order for ORDER BY, `INDEXED BY` / `NOT INDEXED`, MULTI-INDEX
+  OR, automatic indexes and Bloom filters, EXISTS-to-join and the
+  pin's join order (a join may be driven from the TEMP or attached
+  table); EXPLAIN QUERY PLAN prints the pin's lines (`SEARCH aux.t
+  USING INTEGER PRIMARY KEY (rowid=?)`, `SEARCH temp.tt USING COVERING
+  INDEX tv (v=?)`). A 3,000 x 3,000 correlated lookup into an attached
+  table no longer scans it per outer row (15.6 s for two such
+  statements in a debug build, 0.8 s now). A statement reading an
+  attached table locks it against DETACH from its first step. Review
+  fixes (also on main tables): a later LEFT JOIN's ON term no longer
+  lets a partial index of an earlier table drop rows, and an index
+  read for a generated column is no COVERING INDEX, as on the pin. Still
+  open (STATUS.md): WITHOUT ROWID tables of another database (read
+  whole), writes of an attached / TEMP table reading other databases
+  (read whole), TEMP triggers across databases, another database's
+  view read by an attached / TEMP write, and `pragma_integrity_check`
+  as a table-valued function.
 - **Result-level gaps of wave 18** (unit `result_gaps`, ungated
   fixes). The pin's top-N sorter: under an ORDER BY with a LIMIT and
   no DISTINCT a row's ORDER BY key is computed first, and a row whose
@@ -115,8 +159,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   reads another database's same-named table by an unqualified name and
   other databases' tables by three-part names. Still open (STATUS.md):
   TEMP triggers on main or attached tables or writing another
-  database, index / rowid access paths into attached and TEMP tables,
-  and an attached or TEMP write reading another database's view.
+  database, and an attached or TEMP write reading another database's
+  view (index / rowid access into attached and TEMP tables: closed by
+  `attach_access` above).
 - **VALUES chains, lazy collations, inert aggregates** (unit
   `values_chain`, ungated fixes). A multi-row VALUES is the pin's
   `sqlite3MultiValues` row by row — a co-routine, or one-row selects
@@ -1214,9 +1259,9 @@ LTO; `ci/size-ratchet.toml`, ADR 0003 / ADR 0004). `default = ["std", "xl"]`.
   database, WHEN clauses included) and the pin's unqualified-name
   order (temp, main, then attached in attach order). Not yet: TEMP
   triggers on main or attached tables, or writing schema-qualified
-  tables (refused cleanly), and index access paths into another
-  database's tables (they are read whole, once per execution). (v0.17
-  `attach` closed the string-literal qualifier, the integrity check
+  tables (refused cleanly). (v0.17 `attach_access` closed the index
+  and rowid access paths into another database's tables for statements
+  of main; v0.17 `attach` closed the string-literal qualifier, the integrity check
   over every database, attached views beside other databases' tables,
   TEMP writes reading other databases and same-named / three-part
   names in attached writes; see "What v0.17 does".) Each attached
@@ -1661,15 +1706,23 @@ and `cargo test --workspace`.
 ## hipp-cli
 
 A std binary shell (`hipp-cli/`, decision D4): interactive,
-stdin-batch and one-shot modes with list-format output
-byte-diffable against the pinned oracle CLI, the pin shell's command
-line (v0.17: `hipp [OPTIONS] [FILENAME [SQL...]]`, `-help`,
-`-version`, `--`; the pin's other options are refused), plus `.tables`,
-`.schema`, `.dump`, `.open`, `.databases` (v0.16, with attached
-databases in `.schema` / `.tables`), `.parameter` (v0.16: `set`,
-`unset`, `clear`, `list`, `init`, bound by name as the oracle
-shell binds them), `.exit [N]` / `.quit` (v0.17: neither opens the
-database). Its first job is
+stdin-batch and one-shot modes with output byte-diffable against the
+pinned oracle CLI, the pin shell's command line (v0.17: `hipp
+[OPTIONS] [FILENAME [SQL...]]`, `-help`, `-version`, `--`, the mode
+options (`-csv`, `-box`, ...), `-header` / `-noheader`, `-separator`,
+`-newline`, `-nullvalue`, `-cmd`, `-bail`, `-echo`, `-batch`,
+`-noinit`; the pin's other options are refused), plus `.tables`,
+`.schema` (v0.17: `--indent`, `--nosys`, LIKE / GLOB patterns), `.dump` (v0.17:
+`--data-only`, `--nosys`, `--preserve-rowids`, `--newlines`), `.open`,
+`.databases` (v0.16, with attached databases in `.schema` /
+`.tables`), `.parameter` (v0.16: `set`, `unset`, `clear`, `list`,
+`init`, bound by name as the oracle shell binds them), `.exit [N]` /
+`.quit` (v0.17: neither opens the database), and (v0.17) the pin's
+output modes (`.mode` list, csv, column, line, box, markdown, table,
+quote, json, tabs, insert, ascii; `.headers`, `.separator`,
+`.nullvalue`, `.width`), `.help`, `.show`, `.print`, `.echo`, `.bail`,
+`.changes`, `.timer`, `.output`, `.once`, `.read`, `.limit`,
+`.indexes`, `.fullschema`. Its first job is
 differential testing. It is a separate crate and contributes
 0 bytes to the core's tiny build.
 

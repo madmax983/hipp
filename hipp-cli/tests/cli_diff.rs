@@ -125,8 +125,18 @@ fn dot_tables_and_schema() {
         ],
     );
     assert!(setup.status.success());
+    // (v0.17: the pin's column grid, names sorted; compared with the
+    // pin on the same database.)
     let tables = run(hipp_bin(), &[db.to_str().unwrap(), ".tables"]);
-    assert_eq!(String::from_utf8_lossy(&tables.stdout), "alpha\nbeta\n");
+    let want = run(
+        oracle().to_str().unwrap(),
+        &[db.to_str().unwrap(), ".tables"],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&tables.stdout),
+        String::from_utf8_lossy(&want.stdout)
+    );
+    assert_eq!(String::from_utf8_lossy(&tables.stdout), "alpha     beta\n");
     let schema = run(hipp_bin(), &[db.to_str().unwrap(), ".schema"]);
     assert_eq!(
         String::from_utf8_lossy(&schema.stdout),

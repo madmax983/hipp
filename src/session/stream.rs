@@ -847,7 +847,7 @@ impl<S: Storage> Statement<'_, S> {
                     rows.push((r, None));
                 }
                 Some(rows)
-            } else if sp.temp {
+            } else if sp.temp && !super::planned_foreign(sp) {
                 Some(self.scan_temp(sp).await?)
             } else {
                 #[cfg(feature = "expr_index")]

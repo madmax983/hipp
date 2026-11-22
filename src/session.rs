@@ -7113,6 +7113,20 @@ fn reserved_name<E>(name: &[u8]) -> Result<(), E> {
     }
 }
 
+/// Whether `sp`, a table of another database (`sp.temp`), has an
+/// access path to read it through (v0.17, `attach`:
+/// `Connection::owner`) rather than being read whole (`scan_temp`).
+#[cfg(feature = "sql")]
+fn planned_foreign(sp: &SourcePlan) -> bool {
+    #[cfg(all(feature = "attach", feature = "expr_index"))]
+    return sp.access.is_some();
+    #[cfg(not(all(feature = "attach", feature = "expr_index")))]
+    {
+        let _ = sp;
+        false
+    }
+}
+
 /// A column's default as a stored value: the literal with the
 /// column's affinity applied (v0.16 fix). A record shorter than
 /// the table (a column added by ALTER TABLE) reads this for the
@@ -7949,6 +7963,12 @@ impl<'c, S: Storage> Statement<'c, S> {
             #[cfg(any(feature = "triggers", feature = "foreign_keys"))]
             self.ret_hoist.clear();
             self.mats.clear();
+            // The attached databases the statement reads are locked
+            // against DETACH from its start, as the pin's
+            // OP_Transaction locks them (v0.17, `attach`: a seek may
+            // read none of their rows).
+            #[cfg(feature = "attach")]
+            self.conn.lock_ext();
         }
         #[cfg(feature = "sql")]
         let was_txn = self.conn.explicit_txn;
@@ -12764,6 +12784,12 @@ impl<'c, S: Storage> Statement<'c, S> {
         &mut self,
         sp: &SourcePlan,
     ) -> Result<AVec<(AVec<OwnedValue>, Option<i64>)>, S::Error> {
+        // A table of another database planned as main's (v0.17,
+        // `attach`: an OR branch's or an automatic index's scan).
+        #[cfg(all(feature = "attach", feature = "expr_index"))]
+        if sp.temp {
+            return Box::pin(self.scan_temp(sp)).await;
+        }
         let mut rows = AVec::new();
         let mut cursor = ScanCursor::new(sp.root);
         let mut buf = AVec::new();
@@ -12837,9 +12863,10 @@ impl<'c, S: Storage> Statement<'c, S> {
                     continue;
                 }
             }
-            // v0.16: a TEMP table read by a main statement.
+            // v0.16: a TEMP table read by a main statement (v0.17,
+            // `attach`: one with an access path reads through it).
             #[cfg(feature = "sql")]
-            if sp.temp {
+            if sp.temp && !planned_foreign(sp) {
                 let rows = self.scan_temp(sp).await?;
                 src_rows.push(rows);
                 continue;
