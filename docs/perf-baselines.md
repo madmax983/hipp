@@ -575,3 +575,34 @@ t-gmax 483,169 / 854,068 / 1,623,372 B.
 Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 2000`;
 `callgrind_annotate --inclusive=yes cg.out | grep ins_balance_index_leaf_window`;
 dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 2000`
+
+### After: plan the partition from weights, move each cell once
+
+`partition_index_ins`, its greedy fallback and `index_min_pages_ins`
+compute the page / divider role of every item from the cells'
+weights (`bytes.len() + 2`) alone, then move the gathered cells
+into place once (`apply_index_plan`); `partition_index_ins` takes the
+cells by value. The window gathers (leaf and interior) move the
+loaded cells and the trigger's preset instead of cloning them (the
+preset is still cloned if its page recurred in the window). The
+partition rules and capacity checks are unchanged. Workload checksums
+identical (176089 / 657610 / 4083309); an index-heavy script (DESC /
+UNIQUE / NOCASE multi-column indexes, 900-byte overflow keys,
+deletes, updates, a WITHOUT ROWID table with a secondary index, a
+late CREATE INDEX, INSERT ... SELECT; 6,000+ rows) writes
+byte-identical database files (cmp) at 512 B and 4096 B pages, and
+`PRAGMA integrity_check` is ok on both.
+
+| n    | total before  | total after   | Δ total | leaf balance before | leaf balance after | Δ balance |
+|------|---------------|---------------|---------|---------------------|--------------------|-----------|
+| 500  | 175,293,229   | 175,148,361   | -0.08%  | 0                   | 0                  | n/a       |
+| 1000 | 417,936,209   | 397,504,007   | -4.89%  | 26,875,004          | 7,145,333          | -73.4%    |
+| 2000 | 1,064,276,249 | 933,976,949   | -12.24% | 176,896,238         | 49,390,132         | -72.1%    |
+
+dhat blocks: 164,546 -> 162,720 (-1.11%) / 411,769 -> 362,955
+(**-11.85%**) / 1,171,020 -> 874,766 (**-25.30%**); bytes 44,035,063
+-> 43,969,549 / 104,120,517 -> 101,598,408 (-2.42%) / 262,975,768 ->
+246,747,587 (-6.17%); t-gmax unchanged (483,169 / 854,068 / 1,623,372 B).
+
+Size gates: tiny unchanged; full +592 B, max +544 B, xl +544 B;
+ratchets raised by those amounts (each well under `justify_over`).

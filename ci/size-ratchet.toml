@@ -143,7 +143,10 @@ justify_over = 4096
 # STATUS.md): -184 B. A DISTINCT repeat computes no ORDER BY key (`keyed`
 # drops it first, as the pin's codeDistinct), which made the callers'
 # own capped-DISTINCT checks and `TopN::push`'s redundant: removed.
-ratchet = 496508
+# 496,508 -> 497,100 (Bolt): +592 B. Index insert balances plan their
+# pages from cell weights and move each cell once (-12.2% instructions,
+# -25.3% allocations on bolt_workload at n=2000).
+ratchet = 497100
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -277,7 +280,10 @@ justify_over = 16384
 # correctness; STATUS.md): +8 B, the `full` saving spent on a window
 # subquery's dropped ORDER BY (`sub_match`), the window path's DISTINCT
 # check before its keys, and the GROUP BY rewrite's NULLS rule (`ob_grp`).
-ratchet = 1001212
+# 1,001,212 -> 1,001,756 (Bolt): +544 B. Index insert balances plan their
+# pages from cell weights and move each cell once (-12.2% instructions,
+# -25.3% allocations on bolt_workload at n=2000).
+ratchet = 1001756
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -392,7 +398,10 @@ justify_over = 32768
 # (`mark_in_loops`, `SubPlan::in_loop`: a regression read the index and
 # skipped a failing ORDER BY) and the rowid matching an index's trailing
 # rowid in `in_index_pick`.
-ratchet = 1105472
+# 1,105,472 -> 1,106,016 (Bolt): +544 B. Index insert balances plan their
+# pages from cell weights and move each cell once (-12.2% instructions,
+# -25.3% allocations on bolt_workload at n=2000).
+ratchet = 1106016
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
