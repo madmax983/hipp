@@ -3392,6 +3392,56 @@ fn recell(child: Option<u32>, source: &IndexCell, source_prefix: usize) -> Index
     }
 }
 
+/// `index_ins_plan` role of an item lifted as a divider.
+#[cfg(feature = "indexes")]
+const IDX_DIVIDER: usize = usize::MAX;
+/// `index_ins_plan` role of an item no group holds (`group_items`
+/// drops items past the counts' total).
+#[cfg(feature = "indexes")]
+const IDX_DROPPED: usize = usize::MAX - 1;
+
+/// An index insert partition as one role per item (its page, or
+/// `IDX_DIVIDER` / `IDX_DROPPED`) plus the page count. Planned
+/// from the cells' weights alone, so the cells themselves are
+/// moved once (`apply_index_plan`) instead of copied per pass.
+#[cfg(feature = "indexes")]
+struct IndexInsPlan {
+    roles: AVec<usize>,
+    pages: usize,
+}
+
+/// The weights (`bytes.len() + 2`: cell plus pointer slot) the
+/// index insert partitions plan with.
+#[cfg(feature = "indexes")]
+fn index_ins_weights(items: &[IndexCell]) -> AVec<usize> {
+    let mut w = AVec::with_capacity(items.len());
+    for c in items.iter() {
+        w.push(c.bytes.len() + 2);
+    }
+    w
+}
+
+/// Move `items` into the pages and dividers `plan` assigns them.
+#[cfg(feature = "indexes")]
+fn apply_index_plan(
+    items: AVec<IndexCell>,
+    plan: &IndexInsPlan,
+) -> (AVec<AVec<IndexCell>>, AVec<IndexCell>) {
+    let mut pages: AVec<AVec<IndexCell>> = AVec::with_capacity(plan.pages);
+    for _ in 0..plan.pages {
+        pages.push(AVec::new());
+    }
+    let mut dividers: AVec<IndexCell> = AVec::new();
+    for (it, &role) in items.into_iter().zip(plan.roles.iter()) {
+        match role {
+            IDX_DIVIDER => dividers.push(it),
+            IDX_DROPPED => {}
+            k => pages[k].push(it),
+        }
+    }
+    (pages, dividers)
+}
+
 /// Partition a combined index sequence into page groups plus
 /// one lifted divider per boundary, for an INSERT balance
 /// (v0.15): group boundaries follow `distribute_insert`; every
@@ -3400,91 +3450,107 @@ fn recell(child: Option<u32>, source: &IndexCell, source_prefix: usize) -> Index
 /// `partition_index` (the v0.14 greedy/quota partition).
 #[cfg(feature = "indexes")]
 fn partition_index_ins(
-    items: &[IndexCell],
+    items: AVec<IndexCell>,
     n_new: usize,
     usable: usize,
     interior: bool,
     win: usize,
 ) -> (AVec<AVec<IndexCell>>, AVec<IndexCell>) {
-    let weights: AVec<usize> = {
-        let mut w = AVec::new();
-        for c in items.iter() {
-            w.push(c.bytes.len() + 2);
-        }
-        w
-    };
-    let phantom = usable - if interior { 12 } else { 8 };
-    let groups = distribute_insert(items, weights.as_slice(), n_new, phantom, win);
-    let mut pages: AVec<AVec<IndexCell>> = AVec::new();
-    let mut dividers: AVec<IndexCell> = AVec::new();
-    let mut ok = groups.len() == n_new;
+    let weights = index_ins_weights(items.as_slice());
+    let w = weights.as_slice();
+    let hdr = if interior { 12 } else { 8 };
+    let counts = insert_counts(w, n_new, usable - hdr, win);
+    let counts = counts.as_slice();
+    // `distribute_insert`'s groups (`group_items`: consecutive runs
+    // of `counts[k]` items, short once the items run out), each
+    // checked as the page it becomes once its last item lifts.
+    let mut ok = counts.len() == n_new;
+    let mut roles = AVec::filled(IDX_DROPPED, w.len());
+    let mut at = 0usize;
     if ok {
-        for (i, g) in groups.iter().enumerate() {
-            let mut g = g.clone();
-            if i + 1 < groups.len() {
-                match g.pop() {
-                    Some(d) => dividers.push(d),
-                    None => {
-                        ok = false;
-                        break;
-                    }
+        for (i, &c) in counts.iter().enumerate() {
+            let size = c.min(w.len() - at);
+            let mut page_len = size;
+            if i + 1 < counts.len() {
+                if size == 0 {
+                    ok = false;
+                    break;
                 }
+                page_len -= 1;
+                roles[at + page_len] = IDX_DIVIDER;
             }
-            if g.is_empty() || index_page_need(g.as_slice(), 0, interior) > usable {
+            let need = hdr + w[at..at + page_len].iter().sum::<usize>();
+            if page_len == 0 || need > usable {
                 ok = false;
                 break;
             }
-            pages.push(g);
+            for r in roles.as_mut_slice()[at..at + page_len].iter_mut() {
+                *r = i;
+            }
+            at += size;
         }
     }
-    if ok {
-        return (pages, dividers);
-    }
-    greedy_index_partition_ins(items, usable, interior)
+    let plan = if ok {
+        IndexInsPlan {
+            roles,
+            pages: counts.len(),
+        }
+    } else {
+        greedy_index_plan_ins(w, usable, interior)
+    };
+    apply_index_plan(items, &plan)
 }
 
 /// Greedy index partition for inserts: pack pages in order; when the
 /// next item does not fit and more items follow, that item lifts as
 /// the divider between the pages (it consumes no leaf space -- the
 /// accounting the pin's page counts follow). The last item never
-/// lifts; it starts a fresh page instead.
+/// lifts; it starts a fresh page instead. Planned from the items'
+/// `index_ins_weights`.
 #[cfg(feature = "indexes")]
-fn greedy_index_partition_ins(
-    items: &[IndexCell],
-    usable: usize,
-    interior: bool,
-) -> (AVec<AVec<IndexCell>>, AVec<IndexCell>) {
+fn greedy_index_plan_ins(weights: &[usize], usable: usize, interior: bool) -> IndexInsPlan {
     let hdr = if interior { 12 } else { 8 };
-    let mut pages: AVec<AVec<IndexCell>> = AVec::new();
-    let mut dividers: AVec<IndexCell> = AVec::new();
-    let mut cur: AVec<IndexCell> = AVec::new();
+    let mut roles = AVec::with_capacity(weights.len());
+    let mut pages = 0usize;
+    let mut cur = 0usize;
     let mut need = hdr;
-    for (i, it) in items.iter().enumerate() {
-        let add = it.bytes.len() + 2;
-        if !cur.is_empty() && need + add > usable {
-            if i + 1 < items.len() {
-                dividers.push(it.clone());
-                pages.push(core::mem::take(&mut cur));
-                need = hdr;
+    for (i, &add) in weights.iter().enumerate() {
+        if cur > 0 && need + add > usable {
+            pages += 1;
+            cur = 0;
+            need = hdr;
+            if i + 1 < weights.len() {
+                roles.push(IDX_DIVIDER);
                 continue;
             }
-            pages.push(core::mem::take(&mut cur));
-            need = hdr;
         }
-        cur.push(it.clone());
+        roles.push(pages);
+        cur += 1;
         need += add;
     }
-    if !cur.is_empty() {
-        pages.push(cur);
+    if cur > 0 {
+        pages += 1;
     }
-    (pages, dividers)
+    IndexInsPlan { roles, pages }
 }
 
 /// Minimum page count for an index insert balance: the page count of
 /// the greedy divider-aware packing.
 #[cfg(feature = "indexes")]
 fn index_min_pages_ins(items: &[IndexCell], usable: usize, interior: bool) -> usize {
-    greedy_index_partition_ins(items, usable, interior).0.len()
+    greedy_index_plan_ins(index_ins_weights(items).as_slice(), usable, interior).pages
+}
+
+/// The trigger page's preset cells for a window gather: moved out
+/// unless the page appears again later in the window (`rest`),
+/// which then needs its own copy.
+#[cfg(feature = "indexes")]
+fn take_preset(preset: &mut AVec<IndexCell>, rest: &[u32], page: u32) -> AVec<IndexCell> {
+    if rest.contains(&page) {
+        preset.clone()
+    } else {
+        core::mem::take(preset)
+    }
 }
 
 /// Outcome of one insert-side window balance (index tree).
@@ -3517,7 +3583,7 @@ async fn ins_balance_index_leaf_window<S: Storage>(
     parent: u32,
     trigger: usize,
     preset_page: u32,
-    preset_cells: AVec<IndexCell>,
+    mut preset_cells: AVec<IndexCell>,
 ) -> Result<InsUpIdx, S::Error> {
     let usable = pager.usable() as usize;
     let (pcells, _rightmost, children) = index_children(pager, parent).await?;
@@ -3535,22 +3601,21 @@ async fn ins_balance_index_leaf_window<S: Storage>(
     for (wi, wp) in window_pages.iter().enumerate() {
         let wp = *wp;
         let cells = if wp == preset_page {
-            preset_cells.clone()
+            take_preset(&mut preset_cells, &window_pages.as_slice()[wi + 1..], wp)
         } else {
             let idx = pager.load(wp).await?;
             let snap = copy_bytes(pager.frame_data(idx));
             index_leaf_cells::<S::Error>(snap.as_slice(), wp, usable)?
         };
-        for c in cells.iter() {
-            all.push(c.clone());
+        for c in cells {
+            all.push(c);
         }
         if wi + 1 < window_pages.len() {
             all.push(recell(None, &pcells[start + wi], 4));
         }
     }
     let n_new = index_min_pages_ins(all.as_slice(), usable, false);
-    let (pages, dividers) =
-        partition_index_ins(all.as_slice(), n_new, usable, false, window_pages.len());
+    let (pages, dividers) = partition_index_ins(all, n_new, usable, false, window_pages.len());
     let n_new = pages.len();
     let mut pages_out: AVec<u32> = window_pages.clone();
     while pages_out.len() < n_new {
@@ -3611,7 +3676,7 @@ async fn ins_balance_index_interior_window<S: Storage>(
     parent: u32,
     trigger: usize,
     preset_page: u32,
-    preset_cells: AVec<IndexCell>,
+    mut preset_cells: AVec<IndexCell>,
     preset_rightmost: u32,
 ) -> Result<InsUpIdx, S::Error> {
     let usable = pager.usable() as usize;
@@ -3633,14 +3698,17 @@ async fn ins_balance_index_interior_window<S: Storage>(
     for (wi, wp) in window_pages.iter().enumerate() {
         let wp = *wp;
         let (cells, rightmost) = if wp == preset_page {
-            (preset_cells.clone(), preset_rightmost)
+            (
+                take_preset(&mut preset_cells, &window_pages.as_slice()[wi + 1..], wp),
+                preset_rightmost,
+            )
         } else {
             let idx = pager.load(wp).await?;
             let snap = copy_bytes(pager.frame_data(idx));
             index_interior_cells::<S::Error>(snap.as_slice(), wp, usable)?
         };
-        for c in cells.iter() {
-            all.push(c.clone());
+        for c in cells {
+            all.push(c);
         }
         if wi + 1 < window_pages.len() {
             let mut d = pcells[start + wi].clone();
@@ -3651,8 +3719,7 @@ async fn ins_balance_index_interior_window<S: Storage>(
         }
     }
     let n_new = index_min_pages_ins(all.as_slice(), usable, true);
-    let (pages, dividers) =
-        partition_index_ins(all.as_slice(), n_new, usable, true, window_pages.len());
+    let (pages, dividers) = partition_index_ins(all, n_new, usable, true, window_pages.len());
     let n_new = pages.len();
     let mut pages_out: AVec<u32> = window_pages.clone();
     while pages_out.len() < n_new {
@@ -3718,7 +3785,7 @@ async fn ins_root_index_interior<S: Storage>(
     rightmost: u32,
 ) -> Result<(), S::Error> {
     let usable = pager.usable() as usize;
-    let (pages, dividers) = partition_index_ins(cells.as_slice(), 2, usable, true, 1);
+    let (pages, dividers) = partition_index_ins(cells, 2, usable, true, 1);
     if pages.len() != 2 || dividers.len() != 1 {
         return Err(Error::Unsupported);
     }
@@ -4095,7 +4162,7 @@ pub async fn index_insert_core<S: Storage>(
     if path.is_empty() {
         // Root leaf: partition its entries over two fresh leaves;
         // the root becomes an interior holding the promoted key.
-        let (pages, dividers) = partition_index_ins(all.as_slice(), 2, usable, false, 1);
+        let (pages, dividers) = partition_index_ins(all, 2, usable, false, 1);
         if pages.len() != 2 || dividers.len() != 1 {
             return Err(Error::Unsupported);
         }
