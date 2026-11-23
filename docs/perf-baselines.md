@@ -548,3 +548,30 @@ dhat (n=1000): 429,827 -> 411,365 blocks (-4.30%), 106,617,844 ->
 
 Size gates on that base: tiny unchanged; full +400 B, max +632 B,
 xl +632 B; ratchets set to the measured figures.
+
+## index leaf balance clones every gathered cell ~5 times (baseline at 450a1a7)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). When an index
+leaf overflows (CREATE INDEX over 1000+ rows: `t_g` keys land
+mid-tree), `ins_balance_index_leaf_window` gathers the window's
+cells and copies each one (its own heap `bytes`) repeatedly: the
+trigger leaf's preset list is cloned, every gathered cell is cloned
+into `all`, `index_min_pages_ins` runs the greedy partition (cloning
+every cell) only to count its pages, `partition_index_ins`'s
+`distribute_insert` clones every cell into groups, and each group is
+then cloned again. The page count and every capacity check depend
+only on cell lengths.
+
+| n    | total Ir      | leaf balance inclusive Ir | calls | dhat blocks | under leaf balance |
+|------|---------------|---------------------------|-------|-------------|--------------------|
+| 500  | 175,293,229   | 0                         | 0     | 164,546     | 0                  |
+| 1000 | 417,936,209   | 26,875,004 (6.43%)        | 12    | 411,769     | 53,064 (12.89%)    |
+| 2000 | 1,064,276,249 | 176,896,238 (16.62%)      | 56    | 1,171,020   | 341,564 (29.17%)   |
+
+n=2000: `partition_index_ins` 49,250,091 (4.63%), `index_min_pages_ins`
+32,038,647 (3.01%). dhat bytes: 44,035,063 / 104,120,517 / 262,975,768;
+t-gmax 483,169 / 854,068 / 1,623,372 B.
+
+Reproduce: `valgrind --tool=callgrind target/release/examples/bolt_workload 2000`;
+`callgrind_annotate --inclusive=yes cg.out | grep ins_balance_index_leaf_window`;
+dhat: `valgrind --tool=dhat target/release/examples/bolt_workload 2000`
