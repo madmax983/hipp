@@ -606,3 +606,39 @@ dhat blocks: 164,546 -> 162,720 (-1.11%) / 411,769 -> 362,955
 
 Size gates: tiny unchanged; full +592 B, max +544 B, xl +544 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+## index-entry decode copies on the read path (baseline at 3387927)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every index
+entry an `IndexCursor` yields (`next_entry`: the `COUNT(*) WHERE g =
+?` scans, the join's `u_t` probes) is decoded by `LazyPage::fill`
+with three heap copies of the cell before a value is read --
+`parse_index_cell` copies the cell image, `index_cell_payload`
+copies its local part, `assemble_payload` copies that again (one
+byte at a time) -- then cached in the page's slot and cloned out
+(`next_entry`'s `.clone()`; the slot is never read again on a
+scan). Underneath, every `decode_record_into` (all record decodes,
+not only index entries) collects the header's serial types into a
+temporary heap list (`serials`) before walking the body.
+
+| n    | total Ir    | dhat blocks | dhat bytes  | t-gmax      |
+|------|-------------|-------------|-------------|-------------|
+| 500  | 175,161,140 | 162,720     | 43,969,516  | 483,169 B   |
+| 1000 | 397,647,237 | 362,955     | 101,598,375 | 854,068 B   |
+| 2000 | 933,981,509 | 874,766     | 246,747,554 | 1,623,372 B |
+
+n=2000: `IndexCursor::next_entry` inclusive 51,838,641 Ir (5.55%),
+`LazyPage::entry` 52,327,670 (5.60%, seeks included),
+`decode_record_into` 43,908,303 (4.70%). dhat blocks: the `serials`
+list (record.rs:271) 76,391 (8.73%), `next_entry`'s clone 18,441
+(2.11%), and per filled slot (21,528) one block each for the cell
+copy, the local copy and the assembled payload (~7.4%).
+
+Both binaries are run from one path (`./bw`) in one session:
+callgrind's count moves ~0.1% with the binary's path.
+
+Reproduce: `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example bolt_workload`;
+`cp target/release/examples/bolt_workload bw`;
+`valgrind --tool=callgrind --callgrind-out-file=cg.out ./bw 2000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'next_entry|decode_record_into'`;
+`valgrind --tool=dhat ./bw 2000`
