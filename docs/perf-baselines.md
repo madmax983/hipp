@@ -642,3 +642,46 @@ Reproduce: `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example bol
 `valgrind --tool=callgrind --callgrind-out-file=cg.out ./bw 2000`;
 `callgrind_annotate --inclusive=yes cg.out | grep -E 'next_entry|decode_record_into'`;
 `valgrind --tool=dhat ./bw 2000`
+
+### After: decode in place, take instead of clone, no serials list
+
+`LazyPage::decode` reads a cell whose payload is all on the page
+straight from the page image (`index_cell_layout`, then
+`decode_index_entry` over the borrowed local bytes, as
+`index_search_raw` compares it); a cell that spills to overflow
+pages, and every cell of a UTF-16 database, keeps the
+`parse_index_cell` / `index_cell_payload` path. `next_entry` takes
+the entry (`take_entry`: the decode a seek cached, or a fresh one
+left uncached) instead of cloning the slot. `decode_record_into`
+counts and checks the serial types in the same first pass, then
+reads them again from the header for the body instead of from a
+heap list. Workload checksums identical (176089 / 657610 / 4083309);
+an index-heavy script (overflow keys up to 1.4 KB, DESC / NOCASE /
+multi-column indexes, a WITHOUT ROWID table with a secondary index,
+ALTER TABLE ADD COLUMN, deletes, updates, joins, min / max) prints
+byte-identical results at UTF-8, UTF-16le and UTF-16be, and
+`PRAGMA integrity_check` is ok.
+
+| n    | total before | total after | Δ total | dhat blocks before | after   | Δ blocks    |
+|------|--------------|-------------|---------|--------------------|---------|-------------|
+| 500  | 175,161,140  | 169,833,321 | -3.04%  | 162,720            | 140,544 | **-13.63%** |
+| 1000 | 397,647,237  | 384,541,960 | -3.30%  | 362,955            | 306,207 | **-15.63%** |
+| 2000 | 933,981,509  | 893,806,518 | -4.30%  | 874,766            | 715,350 | **-18.22%** |
+
+n=2000: `next_entry` inclusive 51,838,641 -> 27,433,220 (-47.1%);
+`decode_record_into` 43,908,303 -> 30,771,218 (-29.9%). dhat bytes
+-1.31% / -1.44% / -1.61%; t-gmax +40 B (483,209 / 854,108 /
+1,623,412 B).
+
+Ablation at n=2000 (each part alone; run from the build path, base
+934,279,328 Ir / 874,766 blocks): the cursor path alone 906,631,225
+Ir (-2.96%), 791,741 blocks (-9.49%); the serials list alone
+920,472,065 Ir (-1.48%), 798,375 blocks (-8.73%). Neither clears the
+allocation floor alone; together they remove the decode chain's
+temporary blocks. A third candidate, bulk copies in
+place of byte-at-a-time `push` loops (`copy_vec`,
+`assemble_payload_into`, `OwnedValue::from_value`, `encode_with`),
+measured -1.97% Ir and -3.31% blocks: below the floor, not included.
+
+Size gates: tiny +24 B, full +344 B, max +272 B, xl +272 B;
+ratchets raised by those amounts (each well under `justify_over`).

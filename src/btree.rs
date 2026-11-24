@@ -4311,10 +4311,8 @@ impl LazyPage {
         nfields: usize,
         i: usize,
     ) -> Result<IndexEntry, S::Error> {
-        if let Some(slot) = self.slots.as_mut_slice().get_mut(i) {
-            if let Some(e) = slot.take() {
-                return Ok(e);
-            }
+        if let Some(e) = self.slots.as_mut_slice().get_mut(i).and_then(Option::take) {
+            return Ok(e);
         }
         let e = self.decode(pager, nfields, i).await?;
         if i >= self.slots.len() {
