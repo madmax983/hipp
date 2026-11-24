@@ -4260,18 +4260,7 @@ impl LazyPage {
         if matches!(self.slots.as_slice().get(i), Some(Some(_))) {
             return Ok(());
         }
-        let usable = pager.usable() as usize;
-        let h = head::<S::Error>(self.snap.as_slice(), self.page)?;
-        let ptr = cell_ptr::<S::Error>(self.snap.as_slice(), &h, i, self.page)?;
-        let cell = parse_index_cell::<S::Error>(
-            self.snap.as_slice(),
-            ptr,
-            usable,
-            self.page,
-            self.interior,
-        )?;
-        let p = index_cell_payload(pager, &cell).await?;
-        let e = decode_index_entry::<S::Error>(p.as_slice(), nfields)?;
+        let e = self.decode(pager, nfields, i).await?;
         let slot = self
             .slots
             .as_mut_slice()
@@ -4279,6 +4268,57 @@ impl LazyPage {
             .ok_or(Error::CorruptPage { page: self.page })?;
         *slot = Some(e);
         Ok(())
+    }
+
+    /// Decode entry `i` from the page image (not cached). A cell
+    /// whose payload is all on the page decodes in place from the
+    /// image, as `index_search_raw` compares it; one that spills to
+    /// overflow pages, and every cell of a UTF-16 database
+    /// (`assemble_payload` transcodes its record), is reassembled.
+    async fn decode<S: Storage>(
+        &self,
+        pager: &mut Pager<S>,
+        nfields: usize,
+        i: usize,
+    ) -> Result<IndexEntry, S::Error> {
+        let usable = pager.usable() as usize;
+        let snap = self.snap.as_slice();
+        let h = head::<S::Error>(snap, self.page)?;
+        let ptr = cell_ptr::<S::Error>(snap, &h, i, self.page)?;
+        #[cfg(feature = "utf16")]
+        let in_place = crate::utf16::byte_order(pager.text_enc()).is_none();
+        #[cfg(not(feature = "utf16"))]
+        let in_place = true;
+        let l = index_cell_layout::<S::Error>(snap, ptr, usable, self.page, self.interior)?;
+        if in_place && l.local_len == l.payload_len {
+            let at = ptr + l.payload_off;
+            let local = snap
+                .get(at..at + l.local_len)
+                .ok_or(Error::CorruptPage { page: self.page })?;
+            return decode_index_entry::<S::Error>(local, nfields);
+        }
+        let cell = parse_index_cell::<S::Error>(snap, ptr, usable, self.page, self.interior)?;
+        let p = index_cell_payload(pager, &cell).await?;
+        decode_index_entry::<S::Error>(p.as_slice(), nfields)
+    }
+
+    /// Entry `i` by value: the cached decode if a search left one
+    /// (the slot is emptied; a later `fill` decodes it again), else
+    /// a fresh decode that is not cached.
+    async fn take_entry<S: Storage>(
+        &mut self,
+        pager: &mut Pager<S>,
+        nfields: usize,
+        i: usize,
+    ) -> Result<IndexEntry, S::Error> {
+        if let Some(e) = self.slots.as_mut_slice().get_mut(i).and_then(Option::take) {
+            return Ok(e);
+        }
+        let e = self.decode(pager, nfields, i).await?;
+        if i >= self.slots.len() {
+            return Err(Error::CorruptPage { page: self.page });
+        }
+        Ok(e)
     }
 
     /// Entry `i`, decoded.
@@ -4559,7 +4599,7 @@ impl IndexCursor {
                         if next >= page.ncell {
                             continue;
                         }
-                        let e = page.entry(pager, self.nfields, next).await?.clone();
+                        let e = page.take_entry(pager, self.nfields, next).await?;
                         self.stack.push(IdxFrame::Leaf {
                             page,
                             next: next + 1,
@@ -4575,10 +4615,7 @@ impl IndexCursor {
                             continue; // frame exhausted
                         }
                         if seq % 2 == 1 {
-                            let e = page
-                                .entry(pager, self.nfields, (seq - 1) / 2)
-                                .await?
-                                .clone();
+                            let e = page.take_entry(pager, self.nfields, (seq - 1) / 2).await?;
                             self.stack.push(IdxFrame::Interior { page, seq: seq + 1 });
                             return self.yield_entry(pager, e);
                         }

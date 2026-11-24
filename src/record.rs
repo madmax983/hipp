@@ -264,13 +264,18 @@ pub fn decode_record_into<'a, E>(
     if hlen < n || hlen > payload.len() {
         return Err(Error::CorruptRecord);
     }
-    let mut serials = AVec::new();
+    // Pass 1 checks the serial types this record contributes (at
+    // most `max_cols`) and finds where they end; the body loop
+    // below reads them again from the header instead of from a
+    // heap-allocated list.
+    let mut ncols = 0usize;
     let mut off = n;
-    while off < hlen && serials.len() < max_cols {
-        let (s, used) = decode_varint::<E>(&payload[off..hlen])?;
-        serials.push(s);
+    while off < hlen && ncols < max_cols {
+        let (_, used) = decode_varint::<E>(&payload[off..hlen])?;
+        ncols += 1;
         off += used;
     }
+    let serials_end = off;
     if off != hlen {
         // More serial types in the header than the schema has
         // columns: a record from a wider table version. Trailing
@@ -284,8 +289,10 @@ pub fn decode_record_into<'a, E>(
         }
     }
     let mut body = hlen;
-    for s in serials.iter() {
-        let s = *s;
+    let mut at = n;
+    while at < serials_end {
+        let (s, used) = decode_varint::<E>(&payload[at..hlen])?;
+        at += used;
         let blen = serial_body_len::<E>(s)?;
         let end = body.checked_add(blen).ok_or(Error::CorruptRecord)?;
         if end > payload.len() {
