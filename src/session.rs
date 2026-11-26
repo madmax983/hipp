@@ -1613,6 +1613,10 @@ pub struct Connection<S: Storage> {
     /// with no `secure-delete` row, a rolled-back setting stays).
     #[cfg(feature = "fts5_delete")]
     fts_sd: AVec<(AVec<u8>, bool)>,
+    /// The last dropped statement's arena, when it stayed in its
+    /// first chunk: the next `prepare` takes it instead of allocating
+    /// (and zeroing) a new chunk (`HomedArena`).
+    spare_arena: crate::arena::ArenaSlot,
 }
 
 impl<S: Storage> Connection<S> {
@@ -1689,6 +1693,7 @@ impl<S: Storage> Connection<S> {
             fts_ver: AVec::new(),
             #[cfg(feature = "fts5_delete")]
             fts_sd: AVec::new(),
+            spare_arena: crate::arena::ArenaSlot::default(),
         };
         #[cfg(feature = "utf16")]
         conn.set_text_enc(conn.pager.text_enc());
@@ -1789,7 +1794,13 @@ impl<S: Storage> Connection<S> {
                 a.conn.pager.wr.clear_handles();
             }
         }
-        let arena = Arena::new(Scope::Statement, self.cfg.stmt_init, self.cfg.stmt_max);
+        let arena = crate::arena::HomedArena::take_or_new(
+            &self.spare_arena,
+            Scope::Statement,
+            self.cfg.stmt_init,
+            self.cfg.stmt_max,
+            sql.len(),
+        );
         // The original statement text, retained for CREATE TABLE:
         // it is what lands in `sqlite_schema.sql` (§5.5).
         let sql_text = arena.alloc_copy_handle(sql.as_bytes())?;
@@ -7037,7 +7048,7 @@ pub struct Statement<'c, S: Storage> {
     #[cfg(feature = "params")]
     binds: Binds,
     conn: &'c mut Connection<S>,
-    arena: Arena,
+    arena: crate::arena::HomedArena,
     sql_text: crate::arena::ABytes,
     ast: Ast,
     plan: Plan,
@@ -7894,6 +7905,7 @@ impl<'c, S: Storage> Statement<'c, S> {
         #[cfg(feature = "params")] binds: Binds,
     ) -> Statement<'c, S> {
         let row_ckpt = arena.checkpoint();
+        let arena = crate::arena::HomedArena::home(arena, &conn.spare_arena);
         Statement {
             // A program's statements share their trigger's instant.
             #[cfg(feature = "datetime")]
