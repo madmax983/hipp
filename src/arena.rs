@@ -111,6 +111,34 @@ pub struct Arena {
 
 const ALIGN: usize = 8;
 
+/// The size of the chunk `alloc_pos` adds for a `len`-byte allocation
+/// after a last chunk of `last_cap` bytes (0: none yet), with
+/// `capacity` bytes retained of the budget `max`; `None` when the
+/// budget cannot hold it.
+fn next_cap(last_cap: usize, capacity: usize, len: usize, max: usize) -> Option<usize> {
+    // Geometric growth from the last chunk size.
+    let mut new_cap = if last_cap == 0 {
+        4096usize
+    } else {
+        last_cap.saturating_mul(2)
+    };
+    if new_cap < len + ALIGN {
+        new_cap = len + ALIGN;
+    }
+    if capacity + new_cap > max {
+        // The rest of the budget as one last chunk might still fit
+        // where the geometric one did not (v0.17: a chunk of exactly
+        // the need left every later allocation a chunk of its own,
+        // each wasting its alignment, and a rewound arena could not
+        // reuse them).
+        new_cap = max.saturating_sub(capacity);
+        if new_cap < len + ALIGN {
+            return None;
+        }
+    }
+    Some(new_cap)
+}
+
 impl Arena {
     /// Global-backed arena. Memory is retained lazily: the first chunk
     /// is allocated on first use, sized `initial` (clamped to `max`).
@@ -176,7 +204,10 @@ impl Arena {
         }
     }
 
-    /// Allocate `len` zeroed bytes. The returned slice lives in one
+    /// Allocate `len` bytes (zero in a fresh chunk; a chunk reused
+    /// after `rewind`, `reset` or `renew` keeps its old bytes, so
+    /// every caller writes the slice before reading it). The returned
+    /// slice lives in one
     /// chunk (contiguity is guaranteed — this is what lets the
     /// statement arena address a stored row by logical position via
     /// `slice_at`).
@@ -216,30 +247,13 @@ impl Arena {
                 needed: len,
             });
         }
-        // Geometric growth from the last chunk size.
         let last_cap = inner.chunks.last().map_or(0, |c| c.len);
-        let mut new_cap = if last_cap == 0 {
-            4096usize
-        } else {
-            last_cap.saturating_mul(2)
+        let Some(new_cap) = next_cap(last_cap, inner.capacity, len, self.max) else {
+            return Err(ArenaError {
+                scope: self.scope,
+                needed: len,
+            });
         };
-        if new_cap < len + ALIGN {
-            new_cap = len + ALIGN;
-        }
-        if inner.capacity + new_cap > self.max {
-            // The rest of the budget as one last chunk might still fit
-            // where the geometric one did not (v0.17: a chunk of exactly
-            // the need left every later allocation a chunk of its own,
-            // each wasting its alignment, and a rewound arena could not
-            // reuse them).
-            new_cap = self.max.saturating_sub(inner.capacity);
-            if new_cap < len + ALIGN {
-                return Err(ArenaError {
-                    scope: self.scope,
-                    needed: len,
-                });
-            }
-        }
         let raw: *mut [u8] = Box::into_raw(alloc::vec![0u8; new_cap].into_boxed_slice());
         let ptr = raw.cast::<u8>();
         inner.owned.push(raw);
@@ -346,6 +360,35 @@ impl Arena {
         self.used.set(mark);
     }
 
+    /// Whether the arena holds exactly one chunk of its own: the
+    /// shape `renew` keeps for the next scope of its kind (an arena
+    /// that grew past its first chunk is dropped instead, so a large
+    /// statement's memory is not held after it ends).
+    pub fn reusable(&mut self) -> bool {
+        let inner = self.inner.get_mut();
+        inner.chunks.len() == 1 && inner.owned.len() == 1
+    }
+
+    /// Empty the arena for a new scope with the budget `max` whose
+    /// first allocation is `first` bytes: as a fresh
+    /// `Arena::new(scope, _, max)` (consumption and the high-water
+    /// mark forgotten). Only for an arena that is `reusable` and whose
+    /// chunk is exactly the one a fresh arena's first `alloc_pos(first)`
+    /// would add, so every later allocation, growth and exhaustion is
+    /// the fresh arena's; otherwise `None` (the caller builds a new one).
+    pub fn renew(mut self, max: usize, first: usize) -> Option<Arena> {
+        let have = self.inner.get_mut().chunks.first().map(|c| c.len);
+        if !self.reusable() || have != next_cap(0, 0, first, max) {
+            return None;
+        }
+        for off in self.inner.get_mut().offs.iter_mut() {
+            *off = 0;
+        }
+        self.used.set(0);
+        self.high.set(0);
+        Some(Arena { max, ..self })
+    }
+
     /// O(1) reset: all consumption forgotten, chunks retained.
     pub fn reset(&self) {
         let inner = unsafe { &mut *self.inner.get() };
@@ -372,6 +415,67 @@ impl Arena {
             base += used_here;
         }
         None
+    }
+}
+
+/// The slot one emptied arena waits in between two scopes of its kind
+/// (a connection's spare statement arena): the next scope takes it
+/// instead of allocating, and zeroing, a new first chunk. Shared
+/// between the connection and its live statements' `HomedArena`s.
+#[derive(Clone, Default)]
+pub struct ArenaSlot(alloc::rc::Rc<Cell<Option<Arena>>>);
+
+/// An arena that parks itself in its `ArenaSlot` when it drops, if it
+/// is `reusable` (one chunk of its own). Derefs to the arena. It holds
+/// no borrow, so dropping it constrains no lifetime of its owner.
+pub struct HomedArena {
+    arena: Arena,
+    slot: ArenaSlot,
+}
+
+impl HomedArena {
+    /// The arena waiting in `slot` emptied for a scope of budget `max`
+    /// whose first allocation is `first` bytes (`Arena::renew`), else
+    /// `Arena::new(scope, initial, max)`.
+    pub fn take_or_new(
+        slot: &ArenaSlot,
+        scope: Scope,
+        initial: usize,
+        max: usize,
+        first: usize,
+    ) -> HomedArena {
+        let arena = slot
+            .0
+            .take()
+            .and_then(|a| a.renew(max, first))
+            .unwrap_or_else(|| Arena::new(scope, initial, max));
+        HomedArena::home(arena, slot)
+    }
+
+    /// `arena`, parked in `slot` when it drops.
+    pub fn home(arena: Arena, slot: &ArenaSlot) -> HomedArena {
+        HomedArena {
+            arena,
+            slot: slot.clone(),
+        }
+    }
+}
+
+impl core::ops::Deref for HomedArena {
+    type Target = Arena;
+    fn deref(&self) -> &Arena {
+        &self.arena
+    }
+}
+
+impl Drop for HomedArena {
+    fn drop(&mut self) {
+        if self.arena.reusable() {
+            let empty = Arena::new(self.arena.scope, 0, 0);
+            self.slot
+                .0
+                .set(Some(core::mem::replace(&mut self.arena, empty)));
+        }
     }
 }
 
@@ -733,6 +837,57 @@ pub(crate) fn sort_by<T>(v: &mut [T], cmp: &mut dyn FnMut(&T, &T) -> core::cmp::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renew_keeps_only_a_fresh_first_chunk() {
+        // A one-chunk arena renews: emptied, high-water forgotten, and
+        // its chunk serves the next scope's allocations.
+        let mut a = Arena::new(Scope::Statement, 0, 1 << 20);
+        let _ = a.alloc_copy(b"first statement").expect("alloc");
+        assert!(a.reusable());
+        let b = a.renew(1 << 20, 10).expect("renew");
+        assert_eq!((b.used(), b.high_water()), (0, 0));
+        let h = b.alloc_copy_handle(b"second").expect("alloc");
+        assert_eq!(h.pos, 0);
+        assert_eq!(b.slice_at(0, 6), Some(&b"second"[..]));
+        // A first allocation a fresh arena would give a larger chunk,
+        // or a budget a fresh arena would cap, refuses it.
+        let mut c = Arena::new(Scope::Statement, 0, 1 << 20);
+        let _ = c.alloc(8).expect("alloc");
+        assert!(c.reusable());
+        assert!(
+            Arena::new(Scope::Statement, 0, 1 << 20)
+                .renew(1 << 20, 0)
+                .is_none()
+        );
+        let c = c.renew(1 << 20, 5000);
+        assert!(c.is_none());
+        let d = Arena::new(Scope::Statement, 0, 1 << 20);
+        let _ = d.alloc(8).expect("alloc");
+        assert!(d.renew(1024, 8).is_none());
+        // An arena that grew past its first chunk is not kept.
+        let mut e = Arena::new(Scope::Statement, 0, 1 << 20);
+        let _ = e.alloc(4000).expect("alloc");
+        let _ = e.alloc(4000).expect("grow");
+        assert!(!e.reusable());
+        assert!(e.renew(1 << 20, 8).is_none());
+    }
+
+    #[test]
+    fn homed_arena_parks_itself() {
+        let slot = ArenaSlot::default();
+        let a = HomedArena::take_or_new(&slot, Scope::Statement, 0, 1 << 20, 3);
+        let _ = a.alloc_copy(b"one").expect("alloc");
+        drop(a);
+        let parked = slot.0.take().expect("parked on drop");
+        slot.0.set(Some(parked));
+        let b = HomedArena::take_or_new(&slot, Scope::Statement, 0, 1 << 20, 3);
+        // The parked arena came back, emptied.
+        assert!(slot.0.take().is_none());
+        assert_eq!(b.used(), 0);
+        let h = b.alloc_copy_handle(b"two").expect("alloc");
+        assert_eq!(b.slice_at(h.pos as usize, 3), Some(&b"two"[..]));
+    }
 
     #[test]
     fn bump_and_reset() {

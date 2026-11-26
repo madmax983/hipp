@@ -685,3 +685,80 @@ measured -1.97% Ir and -3.31% blocks: below the floor, not included.
 
 Size gates: tiny +24 B, full +344 B, max +272 B, xl +272 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+## statement arena first chunk (baseline at b58ac93)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every
+`Connection::prepare` builds a new statement `Arena`. Its first
+`alloc_copy_handle` (the statement text) allocates the arena's
+first chunk, 4096 B, through `vec![0u8; 4096]`: a `calloc` that
+glibc must `memset`, because the block is a recycled one. It also
+allocates the arena's three bookkeeping lists (`chunks`, `owned`,
+`offs`). The `Statement` frees all of it when it drops, and the
+next `prepare` allocates it again. In this workload almost every
+statement fits in that one chunk: 4,816 zeroed chunk allocations
+for 4,810 prepares at n=2000.
+
+| n    | total Ir    | `prepare` inclusive  | `alloc_copy_handle` from `prepare` | dhat blocks | dhat bytes  | t-gmax      |
+|------|-------------|----------------------|------------------------------------|-------------|-------------|-------------|
+| 500  | 169,843,764 | 39,768,113 (23.41%)  | 6,602,261 (3.89%), 1,210 calls     | 140,544     | 43,393,950  | 483,209 B   |
+| 1000 | 384,541,425 | 79,490,294 (20.67%)  | 12,885,725 (3.35%), 2,410 calls    | 306,207     | 100,138,649 | 854,108 B   |
+| 2000 | 893,809,665 | 158,066,910 (17.68%) | 26,186,058 (2.93%), 4,810 calls    | 715,350     | 242,771,890 | 1,623,412 B |
+
+n=2000, by self cost: memset is 6.05% of all Ir. Of that, 4.19% is
+called from `calloc` (9,086 calls). `__rust_alloc_zeroed` callers:
+`Arena::alloc_pos` 23,765,355 Ir (2.66%, 4,816 calls), then
+`build_leaf_image_inserted` 2.00%. The statement chunks are
+4,810 × 4,096 B = 19.7 MB of the 242.8 MB that dhat counts (8.1%):
+11.4% at n=500 and 9.9% at n=1000.
+
+Reproduce: `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example bolt_workload`;
+`cp target/release/examples/bolt_workload bw`;
+`valgrind --tool=callgrind --callgrind-out-file=cg.out ./bw 2000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'Connection<.*>>::prepare::|alloc_copy_handle'`;
+`valgrind --tool=dhat ./bw 2000`
+
+### After: a dropped statement's arena waits for the next prepare
+
+The `Connection` holds an `ArenaSlot` (`Rc<Cell<Option<Arena>>>`). A
+`Statement`'s arena is a `HomedArena`: it derefs to the `Arena`, and
+when it drops it parks the arena in the slot if the arena kept to its
+first chunk. An arena that grew is freed as before. `prepare` takes
+the parked arena when it has exactly the chunk that a fresh arena's
+first allocation (the statement text) would add (`Arena::renew`,
+through the `next_cap` growth rule that `alloc_pos` now shares).
+Allocations, growth, `ArenaExhausted` and the high-water stat are
+therefore those of a fresh arena; only the chunk's stale bytes
+differ, and every arena allocation writes its slice before reading
+it.
+
+The drop logic sits on the lifetime-free field, not on `Statement`.
+A `Drop` impl on `Statement` would keep its `&mut Connection` borrow
+live to the end of scope. That fails to compile existing callers
+(E0499 in `tests/dialect.rs` and others), so it would be an API
+break. No new `unsafe`: `reusable` and `renew` reach the arena's
+state through `UnsafeCell::get_mut`.
+
+Workload checksums are identical (176089 / 657610 / 4083309).
+
+| n    | total before | total after | Δ total | `prepare` before | `prepare` after | Δ prepare   |
+|------|--------------|-------------|---------|------------------|-----------------|-------------|
+| 500  | 169,843,764  | 162,959,071 | -4.05%  | 39,768,113       | 33,560,466      | **-15.61%** |
+| 1000 | 384,541,425  | 370,415,783 | -3.67%  | 79,490,294       | 66,833,272      | **-15.92%** |
+| 2000 | 893,809,665  | 867,463,500 | -2.95%  | 158,066,910      | 134,114,303     | **-15.15%** |
+
+dhat:
+
+| n    | bytes before | bytes after | Δ bytes     | blocks before | blocks after | Δ blocks |
+|------|--------------|-------------|-------------|---------------|--------------|----------|
+| 500  | 43,393,950   | 38,248,574  | **-11.86%** | 140,544       | 135,709      | -3.44%   |
+| 1000 | 100,138,649  | 89,886,073  | **-10.24%** | 306,207       | 296,572      | -3.15%   |
+| 2000 | 242,771,890  | 222,304,914 | -8.43%      | 715,350       | 696,115      | -2.69%   |
+
+That is 4 blocks fewer per prepare: the chunk and the arena's three
+bookkeeping lists. t-gmax is +128 B (483,337 / 854,236 / 1,623,540 B):
+the slot's `Rc` and the parked chunk while it waits. memset falls
+from 6.05% to 3.95% of all Ir at n=2000 (54.0 M -> 34.3 M).
+
+Size gates: tiny +556 B, full +744 B, max +296 B, xl +376 B. Ratchets
+are raised by those amounts, each well under `justify_over`.

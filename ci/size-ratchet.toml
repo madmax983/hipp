@@ -18,7 +18,10 @@
 # +24 B (Bolt): index entries decode in place on the cursor read
 # path; record serial types read from the header (dhat blocks -18.2%
 # on bolt_workload).
-ratchet = 76952
+# +556 B (Bolt): a dropped statement's one-chunk arena is kept for
+# the next prepare (`HomedArena`; dhat bytes -10.2% on bolt_workload
+# at n=1000, prepare instructions -15.9%).
+ratchet = 77508
 # Hard gate (SPEC §4.1): 128 KiB.
 budget = 131072
 # Engine statics (.data + .bss, minus the demo's caller-supplied heap).
@@ -152,7 +155,10 @@ justify_over = 4096
 # +344 B (Bolt): index entries decode in place on the cursor read
 # path; record serial types read from the header (dhat blocks -18.2%
 # on bolt_workload).
-ratchet = 497444
+# +744 B (Bolt): a dropped statement's one-chunk arena is kept for
+# the next prepare (`HomedArena`; dhat bytes -10.2% on bolt_workload
+# at n=1000, prepare instructions -15.9%).
+ratchet = 498188
 budget = 524288
 statics_budget = 8192
 justify_over = 16384
@@ -292,7 +298,10 @@ justify_over = 16384
 # +272 B (Bolt): index entries decode in place on the cursor read
 # path; record serial types read from the header (dhat blocks -18.2%
 # on bolt_workload).
-ratchet = 1002028
+# +296 B (Bolt): a dropped statement's one-chunk arena is kept for
+# the next prepare (`HomedArena`; dhat bytes -10.2% on bolt_workload
+# at n=1000, prepare instructions -15.9%).
+ratchet = 1002324
 budget = 1048576
 statics_budget = 8192
 justify_over = 32768
@@ -413,7 +422,10 @@ justify_over = 32768
 # +272 B (Bolt): index entries decode in place on the cursor read
 # path; record serial types read from the header (dhat blocks -18.2%
 # on bolt_workload).
-ratchet = 1106288
+# +376 B (Bolt): a dropped statement's one-chunk arena is kept for
+# the next prepare (`HomedArena`; dhat bytes -10.2% on bolt_workload
+# at n=1000, prepare instructions -15.9%).
+ratchet = 1106664
 budget = 1310720
 statics_budget = 8192
 justify_over = 32768
