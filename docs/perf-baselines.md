@@ -685,3 +685,35 @@ measured -1.97% Ir and -3.31% blocks: below the floor, not included.
 
 Size gates: tiny +24 B, full +344 B, max +272 B, xl +272 B;
 ratchets raised by those amounts (each well under `justify_over`).
+
+## statement arena first chunk (baseline at b58ac93)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every
+`Connection::prepare` builds a new statement `Arena`. Its first
+`alloc_copy_handle` (the statement text) allocates the arena's
+first chunk, 4096 B, through `vec![0u8; 4096]`: a `calloc` that
+glibc must `memset`, because the block is a recycled one. It also
+allocates the arena's three bookkeeping lists (`chunks`, `owned`,
+`offs`). The `Statement` frees all of it when it drops, and the
+next `prepare` allocates it again. In this workload almost every
+statement fits in that one chunk: 4,816 zeroed chunk allocations
+for 4,810 prepares at n=2000.
+
+| n    | total Ir    | `prepare` inclusive  | `alloc_copy_handle` from `prepare` | dhat blocks | dhat bytes  | t-gmax      |
+|------|-------------|----------------------|------------------------------------|-------------|-------------|-------------|
+| 500  | 169,843,764 | 39,768,113 (23.41%)  | 6,602,261 (3.89%), 1,210 calls     | 140,544     | 43,393,950  | 483,209 B   |
+| 1000 | 384,541,425 | 79,490,294 (20.67%)  | 12,885,725 (3.35%), 2,410 calls    | 306,207     | 100,138,649 | 854,108 B   |
+| 2000 | 893,809,665 | 158,066,910 (17.68%) | 26,186,058 (2.93%), 4,810 calls    | 715,350     | 242,771,890 | 1,623,412 B |
+
+n=2000, by self cost: memset is 6.05% of all Ir. Of that, 4.19% is
+called from `calloc` (9,086 calls). `__rust_alloc_zeroed` callers:
+`Arena::alloc_pos` 23,765,355 Ir (2.66%, 4,816 calls), then
+`build_leaf_image_inserted` 2.00%. The statement chunks are
+4,810 × 4,096 B = 19.7 MB of the 242.8 MB that dhat counts (8.1%):
+11.4% at n=500 and 9.9% at n=1000.
+
+Reproduce: `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example bolt_workload`;
+`cp target/release/examples/bolt_workload bw`;
+`valgrind --tool=callgrind --callgrind-out-file=cg.out ./bw 2000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'Connection<.*>>::prepare::|alloc_copy_handle'`;
+`valgrind --tool=dhat ./bw 2000`
