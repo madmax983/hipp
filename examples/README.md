@@ -13,6 +13,15 @@
 | [`bolt_workload.rs`](bolt_workload.rs) | full | the profiling workload behind [`docs/perf-baselines.md`](../docs/perf-baselines.md) |
 | [`crash_writer.rs`](crash_writer.rs) | `std` | the crash-injection harness `tests/crash.rs` drives |
 
+The async-runtime examples live in their own crate, [`../runtimes`](../runtimes),
+so the core library keeps zero dependencies:
+
+| example | what it shows |
+|---|---|
+| [`tokio.rs`](../runtimes/examples/tokio.rs) | an async `Storage` over `tokio::fs`; tasks sharing a connection on a `LocalSet`; a database thread serving a multi-threaded runtime through a `Send + Clone` handle |
+| [`smol.rs`](../runtimes/examples/smol.rs) | a `Storage` over `std::fs` run on smol's blocking pool (`smol::unblock`); tasks sharing a connection on a `LocalExecutor` |
+| [`embassy.rs`](../runtimes/examples/embassy.rs) | embassy's executor; a simulated DMA flash `Storage` that yields while it programs; sensor and database tasks |
+
 Run one in its profile:
 
 ```bash
@@ -32,7 +41,8 @@ cargo run --example xl --no-default-features --features xl
 ```
 
 The profile examples check every answer they print, and panic on a wrong
-one. CI runs each example in its own profile and in every larger one:
+one. CI runs each example in its own profile and in every larger one, and
+the runtime examples too:
 
 ```bash
 ci/run-examples.sh

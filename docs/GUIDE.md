@@ -373,18 +373,42 @@ How memory works:
 ## 9. Async: executors, cancellation, threads
 
 hipp ships no executor and spawns nothing. Its futures advance state machines
-stored in the `Connection` and `Statement`, so they can be driven by anything:
+stored in the `Connection` and `Statement`, so they can be driven by anything.
+Two facts shape how:
 
-- **Always-ready storage** (RAM, a memory-mapped flash, a blocking file):
-  `hipp::storage::block_on(fut)`, a no-op-waker poll loop. This is what the
-  examples use, and `FileStorage` is built for it.
-- **tokio / smol / async-std:** `.await` hipp's futures from a task. The
-  futures and `Connection` are **not `Send`** (the engine uses `Rc`
-  internally), so keep a connection on one thread: a current-thread runtime, a
-  `LocalSet`, or a dedicated thread that owns the connection and receives
-  work over a channel.
-- **embassy / firmware loops:** await from a task, with your `Storage`
-  returning `Pending` while a DMA transfer runs.
+- **A `Connection` and its futures are not `Send`** (the engine uses `Rc`
+  internally). A connection stays on the thread that opened it.
+- **One statement at a time.** A `Statement` borrows its connection mutably.
+  To share a connection between tasks on one thread, put it behind an *async*
+  mutex, and hold the lock for a statement (or a whole transaction).
+
+| runtime | how | example |
+|---|---|---|
+| none (always-ready storage: RAM, memory-mapped flash, blocking files) | `hipp::storage::block_on(fut)`, a no-op-waker poll loop. `FileStorage` is built for it. | every program in [`examples/`](../examples) |
+| **tokio** | Implement `Storage` over `tokio::fs` so file I/O never blocks a worker. On one thread, use a current-thread runtime or a `LocalSet`, with `Rc<tokio::sync::Mutex<Connection<_>>>` shared between `spawn_local` tasks. From a multi-threaded runtime (axum, tonic, ...), give the connection a thread of its own and send it requests over an `mpsc` channel with a `oneshot` reply. The handle is `Send + Clone`. | [`runtimes/examples/tokio.rs`](../runtimes/examples/tokio.rs) |
+| **smol** | Implement `Storage` over `std::fs`, running each call on smol's blocking pool with `smol::unblock`. Run the connection on a `LocalExecutor`, shared through `smol::lock::Mutex`. | [`runtimes/examples/smol.rs`](../runtimes/examples/smol.rs) |
+| **embassy** | Await hipp from a task. Your `Storage` returns `Pending` while a DMA transfer or flash program runs, so other tasks keep running. Box hipp's work inside the task (`Box::pin(work).await`) to keep the task's static small (the example's database future is about 11 KB in a debug build). | [`runtimes/examples/embassy.rs`](../runtimes/examples/embassy.rs) |
+
+The runtime examples live in their own workspace crate,
+[`runtimes/`](../runtimes), so the core library keeps zero dependencies,
+dev-dependencies included:
+
+```bash
+cargo run -p hipp-runtimes --example tokio
+```
+
+```bash
+cargo run -p hipp-runtimes --example smol
+```
+
+```bash
+cargo run -p hipp-runtimes --example embassy
+```
+
+hipp's futures nest deeply. If rustc reports "queries overflow the depth
+limit" while computing the layout of an executor's future, box the future you
+hand the executor (`ex.run(Box::pin(app()))`), as the smol example does,
+rather than raising `recursion_limit`.
 
 **Cancellation is safe.** You can drop any hipp future at an await point:
 

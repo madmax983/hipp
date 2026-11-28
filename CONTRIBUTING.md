@@ -33,7 +33,7 @@ them locally in order (`--quick` skips the full test suite):
 | format | `cargo fmt --all -- --check` |
 | lint | `cargo clippy --workspace --all-targets -- -D warnings`, also with `--all-features` |
 | feature matrix | every line of `ci/feature-sets.txt` builds warning-free with `--no-default-features --features <set>`, and the lib unit tests run in tiny / full / max / xl |
-| examples | `ci/run-examples.sh`: every example in its own profile and every larger one |
+| examples | `ci/run-examples.sh`: every example in its own profile and every larger one, plus the tokio / smol / embassy examples in `runtimes/` |
 | tests | `cargo test --workspace` against the oracle, and again with `--features vm` |
 | no_std | the library builds for thumbv7em, thumbv6m, riscv32imac and wasm32 in every profile |
 | size | `ci/size_gate.py` checks each profile's `hipp_thumb_demo` against its ratchet and budget |

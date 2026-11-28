@@ -24,8 +24,9 @@ your code ──► hipp (Rust API, async, no runtime) ──► Storage trait �
   functions, triggers, foreign keys, JSON, FTS5, R*Tree, WAL, ATTACH and
   SQLite's query planner.
 - **Async without a runtime.** The storage trait and the API are `async fn`.
-  You bring the executor (tokio, embassy, smol) or use the bundled `block_on`
-  for storage that never blocks.
+  You bring the executor or use the bundled `block_on` for storage that never
+  blocks. There are runnable [tokio, smol and embassy examples](runtimes),
+  including async `Storage` implementations for each.
 - **No panics on bad input or full memory.** Every failure is a named
   `hipp::Error` variant. Arena exhaustion is `Error::ArenaExhausted`, not an
   abort.
@@ -182,6 +183,7 @@ Known gaps in SQLite parity are tracked unit by unit in
 | [Usage guide](docs/GUIDE.md) | How to use the library, start to finish |
 | [Profiles](docs/profiles/README.md) | [`tiny`](docs/profiles/tiny.md), [`full`](docs/profiles/full.md), [`max`](docs/profiles/max.md), [`xl`](docs/profiles/xl.md): every capability, with tested examples |
 | [`examples/`](examples) | Runnable programs: one per profile, plus custom storage, files, parameters |
+| [`runtimes/`](runtimes) | hipp under tokio, smol and embassy |
 | [CLI](hipp-cli/README.md) | The `hipp` shell |
 | [Architecture](docs/ARCHITECTURE.md) | How the engine is put together, module by module |
 | [Design spec](docs/SPEC.md), [risks](docs/RISKS.md), [ADRs](docs/adr) | Why it is built this way |

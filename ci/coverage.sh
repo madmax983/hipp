@@ -49,7 +49,7 @@ for line in sys.stdin:
     if m.get("reason")=="compiler-artifact" and exe and exe not in seen:
         seen.add(exe); print(exe)')
 
-ignore='(/\.cargo/|/rustc/|/rustlib/|/tests/|/examples/|hipp-cli/|src/bin/)'
+ignore='(/\.cargo/|/rustc/|/rustlib/|/tests/|/examples/|hipp-cli/|runtimes/|src/bin/)'
 "${tools}/llvm-cov" report --summary-only --instr-profile "${out}/hipp.profdata" \
   --ignore-filename-regex="${ignore}" "${objects[@]}" | tee "${out}/summary.txt"
 "${tools}/llvm-cov" export --format=lcov --instr-profile "${out}/hipp.profdata" \
