@@ -3213,11 +3213,21 @@ fn entry_fields<S: Storage>(pager: &Pager<S>, root: u32, desc: &[KeyOrder]) -> u
 /// `entry_fields`).
 #[cfg(feature = "indexes")]
 pub fn decode_index_entry<E>(payload: &[u8], nfields: usize) -> Result<IndexEntry, E> {
-    let mut vals = AVec::new();
-    decode_index_values_into::<E>(payload, nfields, &mut vals)?;
+    // The fields go straight into the owned list (no borrowed one
+    // first); the checks are `decode_index_values_into`'s.
+    // A raw entry (`nfields == 0`, `without_rowid`) is a record of
+    // any length with no rowid.
+    let raw = cfg!(feature = "without_rowid") && nfields == 0;
+    let max = if raw { usize::MAX } else { nfields };
     let mut out = AVec::new();
-    for v in vals.iter() {
-        out.push(OwnedValue::from_value(*v));
+    crate::record::decode_record_each::<E>(payload, max, &mut |v| {
+        out.push(OwnedValue::from_value(v))
+    })?;
+    // The trailing field is the rowid and must be an integer.
+    if !raw
+        && (out.len() != nfields || !matches!(out.as_slice().last(), Some(OwnedValue::Integer(_))))
+    {
+        return Err(Error::CorruptRecord);
     }
     Ok(IndexEntry { values: out })
 }

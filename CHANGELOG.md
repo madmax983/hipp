@@ -5,6 +5,19 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Performance: fewer row copies on the read path
+
+- Index entries, table rows read through an index, and the join's scan
+  rows are decoded straight into their owned value list, instead of
+  being decoded into a borrowed list and then copied
+  (`record::decode_record_each`). Rows read through an index have the
+  rowid alias and REAL forcing applied in place (`rules::eval_vals`),
+  without a second copy of the row. Answers are unchanged. On
+  `examples/bolt_workload` at n=2000 the change makes 11.4% fewer
+  heap allocations and runs 2.4% fewer instructions
+  (`docs/perf-baselines.md`). Size: full +680 B, max +696 B, xl +584 B,
+  tiny unchanged.
+
 ### Examples: tokio, smol and embassy
 
 - New workspace crate `runtimes/` (`hipp-runtimes`, unpublished) with

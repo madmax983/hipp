@@ -382,6 +382,28 @@ pub fn eval_row(
     RowData { vals, rowids }
 }
 
+/// `eval_row`'s values built in place from an owned record (the
+/// read path keeps only the values): no second list, no `rowids`
+/// list, no copy of a text or blob value.
+pub fn eval_vals(
+    rowid_alias: Option<usize>,
+    affs: &[Affinity],
+    mut rec: AVec<OwnedValue>,
+    rowid: i64,
+) -> AVec<OwnedValue> {
+    for (i, v) in rec.as_mut_slice().iter_mut().enumerate() {
+        if Some(i) == rowid_alias {
+            *v = OwnedValue::Integer(rowid);
+        }
+        if affs.get(i) == Some(&Affinity::Real)
+            && let OwnedValue::Integer(x) = *v
+        {
+            *v = OwnedValue::Real(x as f64);
+        }
+    }
+    rec
+}
+
 /// Decode a stored record into record form: one value per table
 /// column, in table order; a missing trailing field (a column
 /// added by ALTER TABLE) takes its default; a VIRTUAL column
@@ -393,20 +415,25 @@ pub fn decode_rec<E>(
     defaults: &[OwnedValue],
     virt: Option<&[bool]>,
 ) -> Result<AVec<OwnedValue>, E> {
-    let mut dec: AVec<Value<'_>> = AVec::new();
-    crate::record::decode_record_into::<E>(payload, ncols, &mut dec)?;
-    let mut out = AVec::new();
-    let mut k = 0usize;
-    for i in 0..ncols {
-        if virt.is_some_and(|m| m.get(i).copied().unwrap_or(false)) {
+    let is_virt = |i: usize| virt.is_some_and(|m| m.get(i).copied().unwrap_or(false));
+    // Each stored field goes straight to the next stored column (no
+    // borrowed list first); a field past the last is not ours.
+    let mut out: AVec<OwnedValue> = AVec::new();
+    crate::record::decode_record_each::<E>(payload, ncols, &mut |v| {
+        while out.len() < ncols && is_virt(out.len()) {
             out.push(OwnedValue::Null);
-            continue;
         }
-        out.push(match dec.as_slice().get(k) {
-            Some(v) => OwnedValue::from_value(*v),
-            None => defaults.get(i).cloned().unwrap_or(OwnedValue::Null),
+        if out.len() < ncols {
+            out.push(OwnedValue::from_value(v));
+        }
+    })?;
+    while out.len() < ncols {
+        let i = out.len();
+        out.push(if is_virt(i) {
+            OwnedValue::Null
+        } else {
+            defaults.get(i).cloned().unwrap_or(OwnedValue::Null)
         });
-        k += 1;
     }
     Ok(out)
 }

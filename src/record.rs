@@ -259,6 +259,27 @@ pub fn decode_record_into<'a, E>(
     out: &mut AVec<Value<'a>>,
 ) -> Result<(), E> {
     out.clear();
+    decode_fields(payload, max_cols, |v| out.push(v))
+}
+
+/// `decode_record_into`'s decode and checks, handing each field to
+/// `each` in order instead of collecting them: a caller that owns
+/// the values builds its own list without a borrowed one first.
+/// One shared copy of the decoder (a `dyn` callback) serves every
+/// such caller; `decode_record_into` keeps its own inlined one.
+pub fn decode_record_each<'a, E>(
+    payload: &'a [u8],
+    max_cols: usize,
+    each: &mut dyn FnMut(Value<'a>),
+) -> Result<(), E> {
+    decode_fields(payload, max_cols, each)
+}
+
+fn decode_fields<'a, E>(
+    payload: &'a [u8],
+    max_cols: usize,
+    mut each: impl FnMut(Value<'a>),
+) -> Result<(), E> {
     let (hlen, n) = decode_varint::<E>(payload)?;
     let hlen = hlen as usize;
     if hlen < n || hlen > payload.len() {
@@ -318,7 +339,7 @@ pub fn decode_record_into<'a, E>(
             n if n >= 12 && n % 2 == 0 => Value::Blob(bytes),
             _ => Value::Text(bytes),
         };
-        out.push(v);
+        each(v);
         body = end;
     }
     Ok(())

@@ -762,3 +762,83 @@ from 6.05% to 3.95% of all Ir at n=2000 (54.0 M -> 34.3 M).
 
 Size gates: tiny +556 B, full +744 B, max +296 B, xl +376 B. Ratchets
 are raised by those amounts, each well under `justify_over`.
+
+## read-path row copies (baseline at 0f7551a)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every row a
+query reads is built in three or four heap lists, each copied from the
+last. `decode_record_into` borrows the fields into a `Value` list,
+then `decode_index_entry` (index entries) or `decode_rec` (table rows)
+copies them into an `OwnedValue` list. Then `eval_row` clones that list
+into a third one, with a one-entry `rowids` list. The two read-path
+callers (`source_row`, and the covering-index rows of `access_rows`)
+keep only `vals`, so the source list and `rowids` are freed straight
+away.
+
+| n    | total Ir    | dhat blocks | dhat bytes  | t-gmax      |
+|------|-------------|-------------|-------------|-------------|
+| 500  | 162,960,856 | 135,709     | 38,248,574  | 483,337 B   |
+| 1000 | 370,414,066 | 296,572     | 89,886,073  | 854,236 B   |
+| 2000 | 867,461,587 | 696,115     | 222,304,914 | 1,623,540 B |
+
+n=2000 dhat blocks by first hipp frame: `decode_record_into`'s
+`Value` list 45,089 (6.48%; 25,528 of them under
+`decode_index_entry`), `decode_index_entry`'s `OwnedValue` list
+25,528 (3.67%), `eval_row`'s `vals` 20,400 (2.93%) and `rowids`
+20,400 (2.93%), `decode_rec`'s list 4,440 (0.64%). Inclusive Ir:
+`decode_index_entry` 23,893,531 (2.75%), `eval_row` 12,817,068
+(1.48%), `decode_rec` from `source_row` 5,953,924 (0.69%).
+
+Reproduce: `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example bolt_workload`;
+`cp target/release/examples/bolt_workload bw`;
+`valgrind --tool=callgrind --callgrind-out-file=cg.out ./bw 2000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'decode_index_entry|rules::eval_row|decode_rec'`;
+`valgrind --tool=dhat ./bw 2000`
+
+### After: decode into the owned list, force the values in place
+
+`record::decode_record_each` runs `decode_record_into`'s decode and
+checks but hands each field to a callback instead of collecting a
+borrowed list. `decode_index_entry`, `decode_rec` and
+`session::decode_source_row` (the join's scan rows) push the owned
+values straight from it. The callback is a `&mut dyn FnMut`, so those
+three share one copy of the decoder; `decode_record_into` (every table
+scan) keeps its own inlined copy and is unchanged. `rules::eval_vals`
+is `eval_row` on an owned record: it sets the rowid alias and forces
+REAL in place, so it makes no second list, no `rowids` list and no
+copy of a text value. `source_row` and the covering-index rows of
+`access_rows` use it. The other `eval_row` callers, which need the
+`RowData`, are unchanged.
+
+Workload checksums are identical (176089 / 657610 / 4083309). A script
+that exercises VIRTUAL and STORED generated columns, ALTER TABLE ADD
+COLUMN defaults, the rowid alias, REAL forcing, covering and DESC
+indexes, a WITHOUT ROWID table with a secondary index, inner and LEFT
+joins, and UPDATE gives byte-identical output and `.db` files from
+`hipp` before and after, at UTF-8, UTF-16le and UTF-16be. Its output
+also matches Python's sqlite3 (3.45, not the pin).
+
+| n    | blocks before | blocks after | Δ blocks    | total Ir before | total Ir after | Δ Ir   |
+|------|---------------|--------------|-------------|-----------------|----------------|--------|
+| 500  | 135,709       | 125,071      | -7.84%      | 162,960,856     | 160,264,343    | -1.65% |
+| 1000 | 296,572       | 269,206      | -9.23%      | 370,414,066     | 363,344,545    | -1.91% |
+| 2000 | 696,115       | 616,947      | **-11.37%** | 867,461,587     | 846,879,088    | -2.37% |
+
+dhat bytes -2.42% / -2.71% / -3.25% (37,324,364 / 87,452,773 /
+215,090,022). t-gmax is +108 / +115 / +7,115 B (483,445 / 854,351 /
+1,630,655 B). The allocation floor (10%) is cleared at n=2000 only.
+The share grows with n because the covering-index `COUNT(*)` scans and
+the join probes grow faster than the per-statement work.
+
+n=2000 inclusive Ir: `decode_index_entry` 23,893,531 -> 17,466,041
+(-26.9%); `eval_row` 12,817,068 -> `eval_vals` 1,713,600 (-86.6%);
+`source_row` 10,804,464 -> 6,353,957 (-41.2%); `access_rows`
+114,085,533 -> 95,390,083 (-16.4%).
+
+A first version made `decode_record_each` generic over the callback.
+That inlined three more copies of the decoder: full +1,656 B, max
++1,664 B, xl +1,520 B. The shared `dyn` copy costs +0.13% Ir at n=2000
+against it (846,879,088 vs 845,797,900) and saves about 1 KB of code.
+
+Size gates: tiny unchanged; full +680 B, max +696 B, xl +584 B. Ratchets
+are raised by those amounts, each well under `justify_over`.
