@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the CI gates locally, in CI order:
-#   fmt -> clippy -> feature matrix -> tests -> no_std targets -> size ratchet
+#   fmt -> clippy -> feature matrix -> examples -> tests -> no_std targets -> size ratchet
 #
 #   ci/local-gates.sh            all gates
 #   ci/local-gates.sh --quick    skip the full test suite
@@ -33,6 +33,9 @@ cargo test -q --lib --no-default-features
 cargo test -q --lib --no-default-features --features full
 cargo test -q --lib --no-default-features --features max
 cargo test -q --lib --no-default-features --features xl
+
+step "examples (every profile)"
+ci/run-examples.sh
 
 if [[ "${quick}" == 0 ]]; then
   step "tests (workspace)"

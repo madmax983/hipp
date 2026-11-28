@@ -5405,7 +5405,7 @@ fn bool_val(b: bool) -> OwnedValue {
     OwnedValue::Integer(if b { 1 } else { 0 })
 }
 
-/// CAST(x AS <affinity type>) — SQLite's dedicated conversion
+/// `CAST(x AS <affinity type>)` — SQLite's dedicated conversion
 /// rules (prefix parses for text, clamping for reals), which
 /// differ from INSERT affinity's whole-string rule.
 pub fn cast_value(v: &OwnedValue, aff: Affinity) -> OwnedValue {

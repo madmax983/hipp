@@ -28,7 +28,7 @@ pub enum Tok {
     Minus,
     Plus,
     Dot,
-    /// `=` (v0.2: WHERE rowid = <literal>).
+    /// `=` (v0.2: WHERE rowid = `<literal>`).
     Eq,
     /// `<`, `>`, `<=`, `>=`, `!=`/`<>` (v0.4 expressions).
     Lt,

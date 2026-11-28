@@ -1,5 +1,13 @@
 # hipp — SPEC v0.1 (design foundation) — rev. 0.3, 2026-10-16 (D1–D5 applied; D2 corrected)
 
+> **Reading this today (0.17):** this is the original design foundation,
+> written before any code, and kept as the record of why hipp is built the way
+> it is. Its "status" and "phase" notes are historical. For the current state
+> see [`README.md`](../README.md), [`GUIDE.md`](GUIDE.md),
+> [`profiles/`](profiles/README.md), [`ARCHITECTURE.md`](ARCHITECTURE.md),
+> the [ADRs](adr) (which refine and supersede parts of it) and
+> [`STATUS.md`](../STATUS.md).
+
 > **Status:** design only, local, pre-code. Repo: <https://github.com/madmax983/hipp>
 > (public, created 2026-10-16, seed only: `.gitignore` + Apache-2.0 `LICENSE`,
 > default branch `main`). Nothing in this spec has been pushed anywhere.

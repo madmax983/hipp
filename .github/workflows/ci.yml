@@ -128,6 +128,23 @@ jobs:
       - name: cargo test --workspace --features vm
         run: cargo test --workspace --no-fail-fast --features vm
 
+  examples:
+    # Every example runs in its own profile and in every larger one
+    # (ci/run-examples.sh). The profile examples check each answer
+    # they print, so docs/profiles/*.md cannot drift from the code.
+    name: examples (tiny / full / max / xl / default)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: examples
+      - name: Run every example in every profile
+        run: ci/run-examples.sh
+
   no_std:
     name: no_std build (${{ matrix.target }})
     needs: fmt

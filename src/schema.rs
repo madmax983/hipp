@@ -664,7 +664,7 @@ fn place_clustered_keys(
 ///
 /// The future only reads the schema rows; decoding a row and
 /// building the catalog from the collected rows are sync
-/// ([`collect_schema_row`], [`catalog_from_rows`]), so that code is
+/// (`collect_schema_row`, `catalog_from_rows`), so that code is
 /// not carried inside the state machine (ADR 0005 Stage 1).
 pub async fn build_catalog<S: Storage>(
     pager: &mut Pager<S>,

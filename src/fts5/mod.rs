@@ -12,11 +12,11 @@
 //!   prefix-compressed, doclists of rowid deltas and position lists,
 //!   the page-index footer), doclist-index pages, keyed as the pin's
 //!   `FTS5_SEGMENT_ROWID` / `FTS5_DLIDX_ROWID`.
-//! - **The pending terms** ([`Hash`], `fts5_hash.c`): what a
+//! - **The pending terms** ([`Hash`](struct@Hash), `fts5_hash.c`): what a
 //!   transaction wrote, in the pin's in-memory doclist format, flushed
 //!   into a new level-0 segment exactly where the pin flushes
 //!   ([`flush`], `fts5FlushOneHash`).
-//! - **Segment writing** ([`Writer`], `Fts5SegWriter`): both of the
+//! - **Segment writing** (`Writer`, `Fts5SegWriter`): both of the
 //!   pin's page-filling rules (the flush path splits a position list
 //!   at the last varint that fits, the merge path at the first that
 //!   overflows), the `%_idx` separator terms and doclist indexes.
@@ -403,7 +403,7 @@ impl Store {
     }
 
     /// A store holding only an empty structure record (to read a
-    /// [`Hash`] alone).
+    /// [`Hash`](struct@Hash) alone).
     pub fn with_empty() -> Store {
         let mut s = Store::default();
         s.load(STRUCTURE_ROWID, Structure::empty(false).encode());
