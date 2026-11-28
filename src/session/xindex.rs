@@ -335,7 +335,12 @@ pub(super) fn source_row<E>(
     if let Some(g) = &sp.gcols {
         g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
     }
-    Ok(crate::rules::eval_row(sp.rowid_alias, sp.affs.as_slice(), rec.as_slice(), rowid).vals)
+    Ok(crate::rules::eval_vals(
+        sp.rowid_alias,
+        sp.affs.as_slice(),
+        rec,
+        rowid,
+    ))
 }
 
 /// `row` with one source's row put at its place (v0.17,
@@ -589,13 +594,8 @@ impl<'c, S: Storage> Statement<'c, S> {
                         *slot = v.clone();
                     }
                 }
-                let rd = crate::rules::eval_row(
-                    sp.rowid_alias,
-                    sp.affs.as_slice(),
-                    rec.as_slice(),
-                    *rowid,
-                );
-                out.push((rd.vals, Some(*rowid)));
+                let vals = crate::rules::eval_vals(sp.rowid_alias, sp.affs.as_slice(), rec, *rowid);
+                out.push((vals, Some(*rowid)));
             }
             return Ok(out);
         }

@@ -17383,19 +17383,39 @@ fn decode_source_row<E>(
             Some(g.virt.as_slice()),
         )?;
         g.fill::<E>(rec.as_mut_slice(), rowid, true)?;
-        let rd = crate::rules::eval_row(sp.rowid_alias, sp.affs.as_slice(), rec.as_slice(), rowid);
-        for v in rd.vals {
+        for v in crate::rules::eval_vals(sp.rowid_alias, sp.affs.as_slice(), rec, rowid) {
             out.push(v);
         }
         return Ok(());
     }
-    let mut dec: AVec<Value<'_>> = AVec::new();
-    crate::record::decode_record_into::<E>(payload, sp.ncols, &mut dec)?;
-    for i in 0..sp.ncols {
-        let mut v = if Some(i) == sp.rowid_alias {
+    // Each field goes straight to `out` (no borrowed list first).
+    let real = |i: usize, v: OwnedValue| match v {
+        OwnedValue::Integer(x)
+            if sp.affs.as_slice().get(i) == Some(&crate::record::Affinity::Real) =>
+        {
+            OwnedValue::Real(x as f64)
+        }
+        v => v,
+    };
+    let base = out.len();
+    let r = crate::record::decode_record_each::<E>(payload, sp.ncols, &mut |d| {
+        let i = out.len() - base;
+        let v = if Some(i) == sp.rowid_alias {
             OwnedValue::Integer(rowid)
-        } else if let Some(d) = dec.as_slice().get(i) {
-            OwnedValue::from_value(*d)
+        } else {
+            OwnedValue::from_value(d)
+        };
+        out.push(real(i, v));
+    });
+    if let Err(e) = r {
+        // A corrupt record leaves `out` as it was.
+        out.truncate(base);
+        return Err(e);
+    }
+    while out.len() - base < sp.ncols {
+        let i = out.len() - base;
+        let v = if Some(i) == sp.rowid_alias {
+            OwnedValue::Integer(rowid)
         } else {
             sp.defaults
                 .as_slice()
@@ -17403,12 +17423,7 @@ fn decode_source_row<E>(
                 .cloned()
                 .unwrap_or(OwnedValue::Null)
         };
-        if sp.affs.as_slice().get(i) == Some(&crate::record::Affinity::Real)
-            && let OwnedValue::Integer(x) = v
-        {
-            v = OwnedValue::Real(x as f64);
-        }
-        out.push(v);
+        out.push(real(i, v));
     }
     Ok(())
 }
