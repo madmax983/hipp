@@ -762,3 +762,35 @@ from 6.05% to 3.95% of all Ir at n=2000 (54.0 M -> 34.3 M).
 
 Size gates: tiny +556 B, full +744 B, max +296 B, xl +376 B. Ratchets
 are raised by those amounts, each well under `justify_over`.
+
+## read-path row copies (baseline at 0f7551a)
+
+`bolt_workload` (callgrind, release + debuginfo; dhat). Every row a
+query reads is built in three or four heap lists, each copied from the
+last. `decode_record_into` borrows the fields into a `Value` list,
+then `decode_index_entry` (index entries) or `decode_rec` (table rows)
+copies them into an `OwnedValue` list. Then `eval_row` clones that list
+into a third one, with a one-entry `rowids` list. The two read-path
+callers (`source_row`, and the covering-index rows of `access_rows`)
+keep only `vals`, so the source list and `rowids` are freed straight
+away.
+
+| n    | total Ir    | dhat blocks | dhat bytes  | t-gmax      |
+|------|-------------|-------------|-------------|-------------|
+| 500  | 162,960,856 | 135,709     | 38,248,574  | 483,337 B   |
+| 1000 | 370,414,066 | 296,572     | 89,886,073  | 854,236 B   |
+| 2000 | 867,461,587 | 696,115     | 222,304,914 | 1,623,540 B |
+
+n=2000 dhat blocks by first hipp frame: `decode_record_into`'s
+`Value` list 45,089 (6.48%; 25,528 of them under
+`decode_index_entry`), `decode_index_entry`'s `OwnedValue` list
+25,528 (3.67%), `eval_row`'s `vals` 20,400 (2.93%) and `rowids`
+20,400 (2.93%), `decode_rec`'s list 4,440 (0.64%). Inclusive Ir:
+`decode_index_entry` 23,893,531 (2.75%), `eval_row` 12,817,068
+(1.48%), `decode_rec` from `source_row` 5,953,924 (0.69%).
+
+Reproduce: `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release --example bolt_workload`;
+`cp target/release/examples/bolt_workload bw`;
+`valgrind --tool=callgrind --callgrind-out-file=cg.out ./bw 2000`;
+`callgrind_annotate --inclusive=yes cg.out | grep -E 'decode_index_entry|rules::eval_row|decode_rec'`;
+`valgrind --tool=dhat ./bw 2000`
