@@ -5,6 +5,35 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Documentation: a real README, a usage guide, and tested per-profile examples
+
+- `README.md` rewritten as a front page: what hipp is, a quick start, the
+  profile table, limits, and a documentation map. The per-version
+  "What vX does" notes moved verbatim to `docs/HISTORY.md`.
+- New `docs/GUIDE.md`: the library from start to finish (storage,
+  statements, parameters, transactions and crash safety, errors,
+  configuration and memory, async and cancellation, implementing `Storage`,
+  embedded targets, clocks / VACUUM INTO / ATTACH hooks, introspection,
+  interoperability, recipes).
+- New `docs/profiles/` (`tiny`, `full`, `max`, `xl`): every capability of
+  each profile with SQL and its exact output, plus a capability matrix.
+- New self-checking examples `examples/{tiny,full,max,xl}.rs`, plus
+  `custom_storage.rs` (a power-loss `Storage` cutting a commit at every
+  point) and `file_db.rs` (`FileStorage`). `examples/README.md` indexes them.
+- CI: a new `examples` job (`ci/run-examples.sh`, also in
+  `ci/local-gates.sh`) runs every example in its own profile and in every
+  larger one, so the documented outputs are tested. Examples that need
+  features declare `required-features`.
+- New `docs/ARCHITECTURE.md` (module map and Mermaid layer diagram),
+  `CONTRIBUTING.md`, `hipp-cli/README.md` and `CLAUDE.md`. Historical
+  banners added to `docs/SPEC.md` and `docs/RISKS.md`. The crate-level
+  rustdoc is a quick start (a doctest), and `cargo doc` is warning-free.
+- Corrected: the README claimed the tiny profile filters on
+  `WHERE col = literal`. Tiny filters only on the rowid (or its INTEGER
+  PRIMARY KEY alias), and other columns need `full` (or `indexes` for an
+  indexed column).
+
+
 ### Review fixes: ORDER BY / LIMIT answers and plan lines (wave 21, unit `order_eqp`)
 
 - Regression fix (`planner`): a row-value IN whose field the reader's

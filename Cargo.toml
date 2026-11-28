@@ -440,6 +440,33 @@ panic = "abort"
 
 [dev-dependencies]
 
+# The profile examples (ci/run-examples.sh runs each in its own
+# profile and in every larger one). `tiny`, `custom_storage` and
+# `mem_demo` need no features.
+[[example]]
+name = "full"
+required-features = ["full"]
+
+[[example]]
+name = "max"
+required-features = ["max"]
+
+[[example]]
+name = "xl"
+required-features = ["xl"]
+
+[[example]]
+name = "file_db"
+required-features = ["std", "sql"]
+
 [[example]]
 name = "params"
 required-features = ["params"]
+
+[[example]]
+name = "bolt_workload"
+required-features = ["full"]
+
+[[example]]
+name = "crash_writer"
+required-features = ["std"]

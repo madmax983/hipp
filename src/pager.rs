@@ -2204,7 +2204,7 @@ impl<S: Storage> Pager<S> {
     /// transaction cut off (`PRAGMA incremental_vacuum`) still holds
     /// what a rollback or `ROLLBACK TO` restores, so it is journaled
     /// and recorded for the savepoints before it is reused
-    /// ([`Pager::grow_frame`]).
+    /// (`Pager::grow_frame`).
     #[cfg(feature = "autovacuum")]
     pub async fn grow_page(&mut self) -> Result<(u32, usize), S::Error> {
         self.begin_write().await?;

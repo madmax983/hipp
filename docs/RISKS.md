@@ -1,5 +1,10 @@
 # hipp — RISKS & UNKNOWNS (v0.1 design pass, 2026-10-16; rev. 0.3, 2026-10-16 evening)
 
+> **Reading this today (0.17):** this is the v0.1 design-time risk register,
+> kept as a record. Several risks have since been retired or narrowed by
+> implementation; [`STATUS.md`](../STATUS.md) and the [ADRs](adr) record what
+> happened to them. The current limits are in [`README.md`](../README.md#limits).
+
 **Revision (2026-10-16 evening):** Mark's D1–D5 decisions (SPEC §11) applied —
 D1 pin is SQLite **3.54.1** (R5, R12 updated); D2 (poll-async over sync)
 **overrules** the spec's sync choice and adds **R15**, the

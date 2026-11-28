@@ -902,7 +902,7 @@ pub enum ParseKind {
     /// A join operator whose keywords do not form a join type
     /// (v0.16): `OUTER JOIN` alone, `INNER OUTER JOIN`, `LEFT
     /// CROSS JOIN`, more than three keywords — the pin's
-    /// "unknown join type". Write LEFT / RIGHT / FULL [OUTER],
+    /// "unknown join type". Write LEFT / RIGHT / FULL \[OUTER\],
     /// [INNER | CROSS], optionally after NATURAL.
     UnknownJoinType,
     /// A NATURAL join that also has an ON or USING clause

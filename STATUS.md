@@ -1,5 +1,9 @@
 # hipp — build status
 
+> The build log: per-unit evidence, size deltas and honest gaps, newest
+> first. For what hipp does and how to use it, start at
+> [`README.md`](README.md) and [`docs/GUIDE.md`](docs/GUIDE.md).
+
 Spec: `docs/SPEC.md` rev. 0.3. Oracle pin (D1): SQLite **3.54.1**
 (official amalgamation 3540100, `~/workspace/hipp-design/oracle/sqlite3`,
 `--version` verified). All differential results are against the pin.
