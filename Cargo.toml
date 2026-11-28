@@ -1,5 +1,5 @@
 [workspace]
-members = ["hipp-cli"]
+members = ["hipp-cli", "runtimes"]
 resolver = "2"
 
 [package]

@@ -5,6 +5,25 @@ All notable changes to hipp. Versions follow the milestones in
 
 ## Unreleased (0.17)
 
+### Examples: tokio, smol and embassy
+
+- New workspace crate `runtimes/` (`hipp-runtimes`, unpublished) with
+  three examples. It is a crate of its own so the core keeps zero
+  dependencies, dev-dependencies included.
+  - `tokio.rs`: `TokioFile`, a `Storage` over `tokio::fs`. Tasks share a
+    connection on a `LocalSet`, and a database thread serves a
+    multi-threaded runtime through a `Send + Clone` handle.
+  - `smol.rs`: `UnblockFile`, a `Storage` over `std::fs` on smol's
+    blocking pool. Tasks share a connection on a `LocalExecutor`.
+  - `embassy.rs`: a simulated DMA flash `Storage`, with sensor and
+    database tasks on embassy's executor (std platform).
+- `ci/run-examples.sh` runs them (profile `runtimes`, part of the CI
+  `examples` job). `ci/coverage.sh` leaves the crate out of the core's
+  coverage figure.
+- `docs/GUIDE.md` §9 now has a per-runtime table, `runtimes/README.md` is
+  new, and the README and `examples/README.md` link to them.
+
+
 ### Documentation: a real README, a usage guide, and tested per-profile examples
 
 - `README.md` rewritten as a front page: what hipp is, a quick start, the

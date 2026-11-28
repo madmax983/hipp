@@ -73,7 +73,9 @@ and writes pages through the caller's `Storage`.
 | `vm` | an experimental register VM (ADR 0005 / 0007). It is hidden, in no profile, and frozen: it measured larger than the tree executor in every profile. | `vm` (hidden) |
 | `bin/hipp_thumb_demo` | the bare-metal program the size gates measure | — |
 
-`hipp-cli/` is a separate crate: the `sqlite3`-compatible shell.
+`hipp-cli/` is a separate crate: the `sqlite3`-compatible shell. `runtimes/`
+is another: the tokio, smol and embassy examples. It is kept apart so the core
+crate has no dependencies, not even dev-dependencies.
 
 ## Key decisions
 
@@ -104,5 +106,5 @@ and writes pages through the caller's `Storage`.
 | `tests/gates.rs`, `tests/size_v17.rs` | the RAM and allocation gates |
 | `tests/crash.rs` | crash injection at every write of a commit, plus real SQLite recovering hipp's journals |
 | `hipp-cli/tests/` | the CLI diffed byte for byte against the `sqlite3` shell |
-| `examples/` | the profile examples, run in every profile by `ci/run-examples.sh` |
+| `examples/`, `runtimes/examples/` | the profile examples, run in every profile by `ci/run-examples.sh`, and the async-runtime examples |
 | miri (CI) | the arena's `unsafe` and an end-to-end engine run |

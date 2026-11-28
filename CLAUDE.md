@@ -13,6 +13,9 @@ reference is [`docs/profiles/`](docs/profiles/README.md).
   executor) is the centre, and `src/session/*` holds its feature-gated parts.
 - `hipp-cli/`: the `sqlite3`-compatible shell (`hipp` binary), used for
   differential tests.
+- `runtimes/`: `hipp-runtimes`, the tokio / smol / embassy examples. It is a
+  separate crate so the core stays dependency-free. Don't add dependencies
+  (dev-dependencies included) to the root `hipp` package.
 - `tests/`: integration and differential tests, one file per unit
   (`*_v16.rs`, `*_v17.rs`). `tests/common` drives the oracle.
 - `examples/`: `tiny.rs`, `full.rs`, `max.rs`, `xl.rs` (one per profile,
